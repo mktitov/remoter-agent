@@ -1,0 +1,3 @@
+[workspace]
+members = ["agent-runner", "mcp-server"]
+resolver = "3"

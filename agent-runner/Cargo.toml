@@ -1,0 +1,45 @@
+[package]
+name = "remoter-agent"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Headless daemon that executes Remoter tickets with a dev-agent (kimi/opencode over ACP)"
+repository = "https://github.com/mktitov/remoter-agent"
+homepage = "https://github.com/mktitov/remoter-agent"
+readme = "README.md"
+
+# The daemon is an HTTP client of the backend only: no sqlx, no repo code —
+# it cannot bypass the backend even in principle.
+[dependencies]
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# WebSocket client for the backend event stream (spec §4.5); reqwest has no
+# `websocket` feature in 0.12, so the daemon speaks WS directly. Same rustls
+# TLS stack as reqwest.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Timestamps for shipped log lines (RFC 3339, matching the backend's chrono).
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+anyhow = "1"
+async-trait = "0.1"
+# ACP SDK, pinned (spec §5.5: one protocol, one code path). The agent-client-protocol
+# 2.x crate carries the stable `schema::v1` API; the two unstable features give us
+# end-turn token usage (§4.1) and elicitation auto-answering (§5.5).
+agent-client-protocol = { version = "=2.0.0", features = [
+    "unstable_end_turn_token_usage",
+    "unstable_elicitation",
+] }
+# The ACP crate is futures-based (not tokio); we spawn the agent via async-process
+# to keep std::process::Command control (cwd, env, process group) that
+# `AcpAgentConfig` does not expose.
+async-process = "2"
+futures = "0.3"
+libc = "0.2"
+# Content-hash of the project's `.remoter/` image inputs for image tags.
+sha2 = "0.10"

@@ -1,0 +1,74 @@
+# remoter-agent dev default (docs/specs/remoter-agent.md §5.1).
+# The agent token is NOT here — use the REMOTER_AGENT_TOKEN env var.
+# (A `token = "…"` key is allowed — env wins — but never commit it;
+# chmod 600 any file carrying it.)
+
+api_url            = "http://localhost:8181"   # REMOTER_API_URL overrides
+poll_interval_secs = 30
+# WebSocket event stream (spec §4.5): push wake-ups on top of the poll.
+# Set to false only if a proxy in front of the backend breaks WS upgrades.
+events_enabled     = true
+workspace_root     = "~/.local/share/remoter-agent"
+max_concurrent_runs = 4
+max_concurrent_runs_per_project = 0            # 0 = unlimited; set 1 for hardcoded-port projects
+run_timeout_minutes = 60
+max_attempts        = 3
+
+# Execution environment (docs/specs/remoter-agent-containers.md). Default is
+# host mode — the agent runs on this host via `devenv shell --`. In container
+# mode every attempt runs inside a per-run docker container with postgres/minio
+# sidecars sharing its network namespace (127.0.0.1:5432 / 127.0.0.1:9000 — no
+# REMOTER_AGENT_PORT_BASE inside); the daemon checks `docker info` at startup
+# and fails to boot without it.
+# [execution]
+# mode = "container"               # "host" | "container"
+# docker_binary = "docker"
+# image_tag_prefix = "remoter-agent"   # tags: <prefix>:p<project_id>-<sha256-16>
+#                                      # over the project's .remoter/agent.Dockerfile
+#                                      # (+ agent-init.sh); keep current+previous
+#                                      # image per project when pruning (spec §9)
+# postgres_image = "postgres:17.6-alpine3.22"
+# minio_image    = "minio/minio:RELEASE.2025-09-07T16-13-09Z"
+# mc_image       = "minio/mc:RELEASE.2025-08-13T08-35-41Z"
+# agent_home = "~/.local/share/remoter-agent/agent-home"
+#                                      # mounted as the container user's $HOME
+#                                      # (/root): agent config/credentials and
+#                                      # ~/.kimi-code/sessions survive runs here
+# Container mode: kimi auth comes from the project's .remoter/kimi-config.toml,
+# rendered into <agent_home>/.kimi-code/config.toml at every container start —
+# ${KIMI_API_KEY} is substituted from the daemon's own environment, so export
+# the key in the systemd unit (Environment=/EnvironmentFile=).
+
+[driver]
+kind = "kimi-acp"    # dry-run = "stub"; real ACP agents = "kimi-acp" or "opencode-acp"
+# simulate_delay_ms = 0          # stub only: artificial run duration
+# ACP drivers (defaults shown for kimi-acp):
+# agent_program = "kimi"        # opencode-acp defaults to "opencode"
+# agent_args = ["acp"]
+# Per-kind model/thinking selection via ACP `session/set_config_option` (spec §5.5).
+# Values must match the ids advertised by the agent CLI (the permanent error
+# names the advertised choices on mismatch); empty or absent keys
+# leave the agent's default in place. With a provisioned config.toml
+# (container mode: the project's .remoter/kimi-config.toml rendered into the
+# agent home, KIMI_API_KEY substituted from the daemon's environment) the ids
+# are the catalog keys from that file. Recommended pairing for cost/speed:
+#   plan = K3 + max reasoning, implement = K2.7 Coding.
+# Note: kimi's thinking values are model-dependent — kimi-for-coding accepts
+# only "on" (Thinking On / Off (unsupported) in the console).
+# plan_model = "kimi-code/k3"
+# plan_thinking = "max"
+# implement_model = "kimi-code/kimi-for-coding"
+# implement_thinking = "on"
+# remoter_mcp_command = "remoter-mcp"   # injected into every session (spec §5.6); a bare name
+                                       # is resolved against the daemon's PATH at startup
+# sessions_dir = "~/.kimi-code/sessions"  # where kimi writes session wire.jsonl; default is ~/.kimi-code/sessions
+
+# Per-run ACP logs (spec §7.1): structured JSONL files written by the daemon.
+# The backend streams them to humans over WebSocket; nothing is shipped to Postgres.
+[logs]
+# dir = "~/.local/share/remoter-agent/logs"   # default: <workspace_root>/logs
+# retention_days = 7                          # default: 7
+
+# There is deliberately no project list here: which projects the agent works on
+# is backend-owned metadata (projects.repo_url / base_branch, spec §4.4) edited
+# from the Flutter UI and fetched over the API each poll cycle.

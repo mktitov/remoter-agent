@@ -1,0 +1,8 @@
+# Run with: cargo fmt
+# Stable rustfmt options only. (planner uses nightly-only options like
+# `imports_granularity` / `fn_single_line` / `blank_lines_upper_bound` — those require
+# `cargo +nightly fmt`. Keep this config stable-compatible for dev convenience.)
+
+max_width = 120
+use_field_init_shorthand = true
+use_try_shorthand = true

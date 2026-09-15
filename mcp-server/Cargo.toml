@@ -1,0 +1,28 @@
+[package]
+name = "remoter-mcp"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "MCP server exposing the Remoter task board to AI agents and MCP clients over stdio"
+repository = "https://github.com/mktitov/remoter-agent"
+homepage = "https://github.com/mktitov/remoter-agent"
+readme = "README.md"
+
+[dependencies]
+rmcp = { version = "0.6", features = ["server", "transport-io"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+schemars = "0.8"
+anyhow = "1"
+# Base64 for attachment payloads (add_attachment input, read_attachment binary
+# output) — same crate as the main backend.
+base64ct = { version = "1", features = ["alloc"] }
+# MIME type guessing for filePath-based attachment uploads.
+mime_guess = "2"
+
+[dev-dependencies]
+tempfile = "3"
+# HTTP mock server for the tool-level integration tests (http_tests.rs).
+wiremock = "0.6"
