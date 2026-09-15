@@ -154,6 +154,14 @@ pub struct Config {
     /// Attempts per claim before the ticket escalates out of the claimable
     /// queue (spec §5.7).
     pub max_attempts: u32,
+    /// Idle limit for one ACP turn: no session updates, permission/elicitation
+    /// callbacks, or agent stderr for this long marks the run stalled — the
+    /// driver sends `session/cancel` and the attempt is retried without
+    /// waiting for `run_timeout_minutes` (spec §5.7).
+    pub stall_idle_secs: u64,
+    /// Grace between the stall cancel and the hard kill of a still-wedged
+    /// agent process (the ChildGuard's SIGTERM → SIGKILL escalation).
+    pub stall_grace_secs: u64,
     /// Base delay between attempts of one claim (doubles per attempt).
     pub retry_backoff_secs: u64,
     /// Grace period after a cancel before a wedged run is hard-aborted
@@ -288,6 +296,10 @@ struct FileConfig {
     run_timeout_minutes: u64,
     #[serde(default = "default_max_attempts")]
     max_attempts: u32,
+    #[serde(default = "default_stall_idle")]
+    stall_idle_secs: u64,
+    #[serde(default = "default_stall_grace")]
+    stall_grace_secs: u64,
     #[serde(default = "default_retry_backoff")]
     retry_backoff_secs: u64,
     #[serde(default = "default_cancel_grace")]
@@ -316,6 +328,12 @@ fn default_run_timeout() -> u64 {
 }
 fn default_max_attempts() -> u32 {
     3
+}
+fn default_stall_idle() -> u64 {
+    300
+}
+fn default_stall_grace() -> u64 {
+    30
 }
 fn default_retry_backoff() -> u64 {
     5
@@ -463,6 +481,8 @@ impl Config {
             max_concurrent_runs_per_project: file.max_concurrent_runs_per_project,
             run_timeout_minutes: file.run_timeout_minutes,
             max_attempts: file.max_attempts.max(1),
+            stall_idle_secs: file.stall_idle_secs.max(1),
+            stall_grace_secs: file.stall_grace_secs,
             retry_backoff_secs: file.retry_backoff_secs,
             cancel_grace_secs: file.cancel_grace_secs,
             logs: LogsConfig {
@@ -747,6 +767,8 @@ agent_home = "/var/lib/remoter-agent-home"
         assert_eq!(cfg.run_timeout_minutes, 60);
         assert_eq!(cfg.max_attempts, 3);
         assert_eq!(cfg.cancel_grace_secs, 120);
+        assert_eq!(cfg.stall_idle_secs, 300);
+        assert_eq!(cfg.stall_grace_secs, 30);
         assert!(cfg.workspace_root.ends_with(".local/share/remoter-agent"));
         assert!(!cfg.workspace_root.starts_with("~"));
         assert_eq!(cfg.workspace_id, None);
@@ -871,6 +893,26 @@ review_model = "kimi-code/k3-reasoning""#,
         assert!(cfg.driver.config_options_for("implement").is_empty());
         assert!(cfg.driver.config_options_for("supervise").is_empty());
         assert!(cfg.driver.config_options_for("review").is_empty());
+    }
+
+    #[test]
+    fn stall_knobs_parse_explicit_values_and_clamp_zero_idle() {
+        // SAFETY: single-threaded test process env tweak; removed immediately.
+        unsafe { std::env::remove_var(API_URL_ENV) };
+        let toml = TOML.replace(
+            "workspace_root",
+            "stall_idle_secs = 120\nstall_grace_secs = 5\nworkspace_root",
+        );
+        let cfg = Config::from_toml_str(&toml, Some("tok".to_string())).unwrap();
+        assert_eq!(cfg.stall_idle_secs, 120);
+        assert_eq!(cfg.stall_grace_secs, 5);
+        // A zero idle limit would stall every run instantly — clamped to 1s.
+        let zero = Config::from_toml_str(
+            &TOML.replace("workspace_root", "stall_idle_secs = 0\nworkspace_root"),
+            Some("tok".to_string()),
+        )
+        .unwrap();
+        assert_eq!(zero.stall_idle_secs, 1);
     }
 
     #[test]

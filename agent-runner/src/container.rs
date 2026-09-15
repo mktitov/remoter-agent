@@ -588,6 +588,7 @@ impl Context for DriverError {
         match self {
             DriverError::Transient(e) => DriverError::Transient(format!("{what}: {e}")),
             DriverError::Permanent(e) => DriverError::Permanent(format!("{what}: {e}")),
+            DriverError::Stalled(e) => DriverError::Stalled(format!("{what}: {e}")),
         }
     }
 }

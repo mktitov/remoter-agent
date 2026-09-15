@@ -20,6 +20,10 @@ fn test_dir(tag: &str) -> PathBuf {
 }
 
 fn driver() -> AcpDriver {
+    driver_with_stall(300, 30)
+}
+
+fn driver_with_stall(stall_idle_secs: u64, stall_grace_secs: u64) -> AcpDriver {
     let cfg = DriverConfig {
         kind: "kimi-acp".to_string(),
         simulate_delay_ms: 0,
@@ -37,7 +41,7 @@ fn driver() -> AcpDriver {
         review_thinking: None,
         sessions_dir: None,
     };
-    AcpDriver::new(&cfg, "http://api.test", "tok", None)
+    AcpDriver::new(&cfg, "http://api.test", "tok", None, stall_idle_secs, stall_grace_secs)
 }
 
 fn driver_with_config() -> AcpDriver {
@@ -58,7 +62,7 @@ fn driver_with_config() -> AcpDriver {
         review_thinking: None,
         sessions_dir: None,
     };
-    AcpDriver::new(&cfg, "http://api.test", "tok", None)
+    AcpDriver::new(&cfg, "http://api.test", "tok", None, 300, 30)
 }
 
 fn spec(
@@ -80,6 +84,7 @@ fn spec(
         exec: remoter_agent::workspace::ExecEnv::host(false),
         config_options,
         logger: remoter_agent::session_log::SessionLogger::noop(),
+        phase_tx: None,
     }
 }
 
@@ -447,9 +452,154 @@ async fn missing_agent_binary_is_permanent() {
         review_thinking: None,
         sessions_dir: None,
     };
-    let driver = AcpDriver::new(&cfg, "http://api.test", "tok", None);
+    let driver = AcpDriver::new(&cfg, "http://api.test", "tok", None, 300, 30);
     let err = driver.run(spec(&dir, "plan", None, vec![], vec![])).await.unwrap_err();
     assert!(matches!(err.source, DriverError::Permanent(_)), "{err}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Stall detection (#154): a hung turn with no ACP activity is detected after
+/// `stall_idle_secs`, cancelled via `session/cancel`, and — the fake agent
+/// honors the cancel and ends the turn inside the grace window — the attempt
+/// fails Stalled, far short of any run timeout.
+#[tokio::test]
+async fn idle_turn_is_stalled_cancelled_and_fails_fast() {
+    let dir = test_dir("stall");
+    let capture = dir.join("capture.jsonl");
+
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        driver_with_stall(2, 2).run(spec(
+            &dir,
+            "plan",
+            None,
+            vec![
+                ("FAKE_AGENT_CAPTURE".to_string(), capture.to_string_lossy().to_string()),
+                ("FAKE_AGENT_HANG".to_string(), "1".to_string()),
+            ],
+            vec![],
+        )),
+    )
+    .await
+    .expect("driver hung past the stall watchdog");
+    let elapsed = started.elapsed();
+
+    let err = result.unwrap_err();
+    assert!(matches!(err.source, DriverError::Stalled(_)), "{err}");
+    assert!(err.to_string().contains("grace"), "{err}");
+    // idle (~2s, 1s poll granularity) + honored cancel — orders of magnitude
+    // below the default 300s idle limit / 60min run timeout.
+    assert!(elapsed < Duration::from_secs(30), "took {elapsed:?}");
+
+    let events = read_capture(&capture);
+    assert!(events.iter().any(|e| e.get("prompt_hang").is_some()));
+    assert!(
+        events.iter().any(|e| e.get("cancel").is_some()),
+        "watchdog must send session/cancel: {events:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Stall with an agent that ignores `session/cancel` (#154): after the grace
+/// window the driver drops the connection and the ChildGuard's
+/// SIGTERM → SIGKILL escalation removes the whole process group — the hung
+/// agent AND its grandchild holding the stdout pipe.
+#[tokio::test]
+async fn stalled_agent_ignoring_cancel_is_killed_with_its_process_group() {
+    let dir = test_dir("stall-kill");
+    let capture = dir.join("capture.jsonl");
+    let pidfile = dir.join("agent.pid");
+
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        driver_with_stall(2, 2).run(spec(
+            &dir,
+            "plan",
+            None,
+            vec![
+                ("FAKE_AGENT_CAPTURE".to_string(), capture.to_string_lossy().to_string()),
+                ("FAKE_AGENT_PIDFILE".to_string(), pidfile.to_string_lossy().to_string()),
+                ("FAKE_AGENT_HANG".to_string(), "1".to_string()),
+                ("FAKE_AGENT_IGNORE_CANCEL".to_string(), "1".to_string()),
+                ("FAKE_AGENT_HANG_GRANDCHILD".to_string(), "1".to_string()),
+            ],
+            vec![],
+        )),
+    )
+    .await
+    .expect("driver hung past the stall watchdog + grace");
+    let elapsed = started.elapsed();
+
+    let err = result.unwrap_err();
+    assert!(matches!(err.source, DriverError::Stalled(_)), "{err}");
+    // idle (~2s) + grace (2s) — the turn never ends on its own.
+    assert!(elapsed < Duration::from_secs(30), "took {elapsed:?}");
+
+    let events = read_capture(&capture);
+    // The cancel was sent and observed — and deliberately ignored.
+    assert!(events.iter().any(|e| e.get("cancel").is_some()), "{events:?}");
+
+    // Agent pid on line 1, grandchild pid on line 2 (FAKE_AGENT_HANG_GRANDCHILD).
+    let pids: Vec<i32> = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .lines()
+        .map(|l| l.trim().parse().unwrap())
+        .collect();
+    assert_eq!(pids.len(), 2, "agent + grandchild pids: {pids:?}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if pids.iter().all(|pid| process_dead(*pid)) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "process group survived the ChildGuard TERM→KILL escalation: {pids:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// kill(pid, 0) existence check that also treats zombies as dead: the
+/// grandchild is orphaned when the agent dies, and a minimal init (containers,
+/// CI) may not reap it — a zombie proves the TERM→KILL escalation worked.
+#[cfg(unix)]
+fn process_dead(pid: i32) -> bool {
+    // SAFETY: signal 0 is a pure existence check.
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return true;
+    }
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map(|stat| {
+            stat.rsplit(')')
+                .next()
+                .is_some_and(|rest| rest.trim_start().starts_with('Z'))
+        })
+        .unwrap_or(true)
+}
+
+/// A provider quota rejection (#154) is permanent: no retry budget is burned.
+#[tokio::test]
+async fn quota_rejection_is_permanent_and_not_retried() {
+    let dir = test_dir("quota");
+
+    let err = driver()
+        .run(spec(
+            &dir,
+            "plan",
+            None,
+            vec![("FAKE_AGENT_QUOTA".to_string(), "1".to_string())],
+            vec![],
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(err.source, DriverError::Permanent(_)), "{err}");
+    assert!(err.to_string().contains("quota/authentication failure"), "{err}");
 
     std::fs::remove_dir_all(&dir).ok();
 }

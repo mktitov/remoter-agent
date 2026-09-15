@@ -13,6 +13,12 @@ max_concurrent_runs = 4
 max_concurrent_runs_per_project = 0            # 0 = unlimited; set 1 for hardcoded-port projects
 run_timeout_minutes = 60
 max_attempts        = 3
+# Stall detection (spec §5.7): an ACP turn with no session updates, callbacks,
+# or agent stderr for stall_idle_secs is cancelled and the attempt retried
+# (without waiting for run_timeout_minutes); stall_grace_secs is the grace
+# between the cancel and the hard kill of a still-wedged agent process.
+stall_idle_secs     = 300
+stall_grace_secs    = 30
 
 # Execution environment (docs/specs/remoter-agent-containers.md). Default is
 # host mode — the agent runs on this host via `devenv shell --`. In container

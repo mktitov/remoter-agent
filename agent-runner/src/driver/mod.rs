@@ -53,6 +53,18 @@ pub struct RunSpec {
     pub config_options: Vec<(String, String)>,
     /// Structured ACP log writer for this run.  The stub driver ignores it.
     pub logger: SessionLogger,
+    /// Live phase sink (#154): the ACP driver reports `DriverPhase::Stalled`
+    /// the moment the idle watchdog fires, so the backend shows the stall
+    /// while it happens instead of after the attempt. `None` for nudge turns
+    /// and drivers without live reporting.
+    pub phase_tx: Option<tokio::sync::mpsc::UnboundedSender<DriverPhase>>,
+}
+
+/// Live phase signals from the driver to the run loop (#154).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverPhase {
+    /// The idle watchdog fired; the driver is cancelling/killing the turn.
+    Stalled,
 }
 
 /// A finished attempt's outcome.
@@ -73,11 +85,15 @@ pub struct RunOutcome {
 }
 
 /// Failure taxonomy (spec §5.7): transient errors are retried (bounded by
-/// `max_attempts`); permanent ones escalate the ticket immediately.
+/// `max_attempts`); permanent ones escalate the ticket immediately. `Stalled`
+/// is a transient failure with its own journal/note wording: the ACP turn
+/// produced no activity for `stall_idle_secs`, was cancelled, and the attempt
+/// is retried without waiting for `run_timeout_minutes`.
 #[derive(Debug)]
 pub enum DriverError {
     Transient(String),
     Permanent(String),
+    Stalled(String),
 }
 
 impl std::fmt::Display for DriverError {
@@ -85,6 +101,7 @@ impl std::fmt::Display for DriverError {
         match self {
             DriverError::Transient(e) => write!(f, "transient driver error: {e}"),
             DriverError::Permanent(e) => write!(f, "permanent driver error: {e}"),
+            DriverError::Stalled(e) => write!(f, "stalled driver error: {e}"),
         }
     }
 }
@@ -147,6 +164,8 @@ pub fn from_config(
     api_url: &str,
     token: &str,
     workspace_id: Option<i32>,
+    stall_idle_secs: u64,
+    stall_grace_secs: u64,
 ) -> anyhow::Result<std::sync::Arc<dyn AgentDriver>> {
     match cfg.kind.as_str() {
         "stub" => Ok(std::sync::Arc::new(stub::StubDriver::new(
@@ -158,6 +177,8 @@ pub fn from_config(
             api_url,
             token,
             workspace_id,
+            stall_idle_secs,
+            stall_grace_secs,
         ))),
         other => anyhow::bail!("unknown driver kind {other:?} (expected \"stub\", \"kimi-acp\", or \"opencode-acp\")"),
     }

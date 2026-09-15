@@ -12,21 +12,23 @@
 //! (§5.5). End-turn token usage is recorded when the agent reports it (§4.1).
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    ContentBlock, CreateElicitationRequest, CreateElicitationResponse, ElicitationAction, InitializeRequest, McpServer,
-    NewSessionRequest, PermissionOptionKind, Plan, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigId, SessionConfigKind,
-    SessionConfigOption, SessionConfigOptionValue, SessionConfigSelectOptions, SessionId, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest, StopReason, TextContent,
+    CancelNotification, ContentBlock, CreateElicitationRequest, CreateElicitationResponse, ElicitationAction,
+    InitializeRequest, McpServer, NewSessionRequest, PermissionOptionKind, Plan, PromptRequest,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
+    SelectedPermissionOutcome, SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionValue,
+    SessionConfigSelectOptions, SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    StopReason, TextContent,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo};
 use async_trait::async_trait;
 
-use super::{AgentDriver, DriverError, RunFailure, RunOutcome, RunSpec, kimi_usage, mcp};
+use super::{AgentDriver, DriverError, DriverPhase, RunFailure, RunOutcome, RunSpec, kimi_usage, mcp};
 use crate::config::DriverConfig;
 use crate::run::RunKind;
 use crate::session_log::{SessionLogger, tool_kind_str, tool_status_str};
@@ -57,10 +59,23 @@ pub struct AcpDriver {
     /// Kimi session directory, used only by Kimi's token-usage fallback when
     /// ACP does not report usage directly (§4.1).
     sessions_dir: Option<PathBuf>,
+    /// Idle limit for one turn: no session updates, permission/elicitation
+    /// callbacks, or agent stderr for this long stalls the run (spec §5.7).
+    stall_idle: Duration,
+    /// Grace between the stall `session/cancel` and dropping the connection
+    /// (which lets the ChildGuard TERM → KILL a still-wedged agent).
+    stall_grace: Duration,
 }
 
 impl AcpDriver {
-    pub fn new(cfg: &DriverConfig, api_url: &str, token: &str, workspace_id: Option<i32>) -> Self {
+    pub fn new(
+        cfg: &DriverConfig,
+        api_url: &str,
+        token: &str,
+        workspace_id: Option<i32>,
+        stall_idle_secs: u64,
+        stall_grace_secs: u64,
+    ) -> Self {
         Self {
             program: cfg.agent_program.clone(),
             args: cfg.agent_args.clone(),
@@ -69,6 +84,8 @@ impl AcpDriver {
             token: token.to_string(),
             workspace_id,
             sessions_dir: cfg.sessions_dir.clone(),
+            stall_idle: Duration::from_secs(stall_idle_secs),
+            stall_grace: Duration::from_secs(stall_grace_secs),
         }
     }
 }
@@ -81,7 +98,11 @@ impl AgentDriver for AcpDriver {
         // Kill-on-drop: a dropped run future (timeout, human cancel) must never
         // leave a live dev-agent behind (spec §5.5).
         let mut guard = ChildGuard::new(child);
-        let stderr_tail = spawn_stderr_drain(stderr);
+        // Last-activity timestamp (unix seconds) for the stall watchdog:
+        // session updates, permission/elicitation callbacks, and agent stderr
+        // lines all count as signs of life.
+        let activity = Arc::new(AtomicU64::new(now_secs()));
+        let stderr_tail = spawn_stderr_drain(stderr, activity.clone());
 
         let capture = Arc::new(Mutex::new(Capture::default()));
         let kind = match spec.kind {
@@ -130,6 +151,17 @@ impl AgentDriver for AcpDriver {
         let known_session_for_conn = known_session.clone();
         let baseline_for_conn = baseline_lines.clone();
         let sessions_dir_after = sessions_dir.clone();
+        // Set once the stall watchdog fires: a turn that then ends (or errors)
+        // inside the grace window is still reported as Stalled, not as whatever
+        // the cancel shook loose.
+        let stalled = Arc::new(AtomicBool::new(false));
+        // The live connection, stashed so the watchdog select! arm can send
+        // `session/cancel` from outside the protocol future.
+        let conn_handle: Arc<Mutex<Option<ConnectionTo<Agent>>>> = Arc::new(Mutex::new(None));
+        let conn_handle_for_cx = conn_handle.clone();
+        let activity_for_notify = activity.clone();
+        let activity_for_permission = activity.clone();
+        let activity_for_elicitation = activity.clone();
 
         // Log the outgoing prompt before any session setup can fail.
         spec.logger.log_prompt(&spec.prompt);
@@ -139,6 +171,7 @@ impl AgentDriver for AcpDriver {
             .name("remoter-agent")
             .on_receive_notification(
                 async move |n: SessionNotification, _cx| {
+                    activity_for_notify.store(now_secs(), Ordering::Relaxed);
                     apply_update(&updates, &logger, n.update);
                     Ok(())
                 },
@@ -146,6 +179,7 @@ impl AgentDriver for AcpDriver {
             )
             .on_receive_request(
                 async move |request: RequestPermissionRequest, responder, _cx| {
+                    activity_for_permission.store(now_secs(), Ordering::Relaxed);
                     // Auto-approve every permission request (spec §5.5) — but only
                     // via an allow option. An agent that offers none gets the
                     // request cancelled; blindly picking the first option could
@@ -171,6 +205,7 @@ impl AgentDriver for AcpDriver {
             )
             .on_receive_request(
                 async move |_request: CreateElicitationRequest, responder, _cx| {
+                    activity_for_elicitation.store(now_secs(), Ordering::Relaxed);
                     // The agent must not ask questions (spec §5.5): decline every
                     // elicitation so it proceeds on its own assumptions.
                     responder.respond(CreateElicitationResponse::new(ElicitationAction::Decline))
@@ -178,6 +213,7 @@ impl AgentDriver for AcpDriver {
                 agent_client_protocol::on_receive_request!(),
             )
             .connect_with(transport, move |cx: ConnectionTo<Agent>| async move {
+                *conn_handle_for_cx.lock().expect("conn handle poisoned") = Some(cx.clone());
                 cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
                     .block_task()
                     .await?;
@@ -261,7 +297,22 @@ impl AgentDriver for AcpDriver {
         // agent that exits mid-turn (e.g. after a provider-side failure that
         // never produces a JSON-RPC response) is detected here instead of
         // hanging the attempt until the outer run timeout. Transient: the
-        // retry budget bounds the damage (spec §5.7).
+        // retry budget bounds the damage (spec §5.7). The third arm is the
+        // stall watchdog: a turn with no activity for `stall_idle` is
+        // cancelled via `session/cancel` and, if the agent is still wedged
+        // after `stall_grace`, the connection is dropped so the ChildGuard
+        // kills the process — the attempt fails Stalled and is retried
+        // without waiting for the absolute run timeout.
+        let stall_watchdog = stall_watchdog(
+            &activity,
+            self.stall_idle,
+            self.stall_grace,
+            &stalled,
+            &conn_handle,
+            &known_session,
+            &spec.logger,
+            spec.phase_tx.as_ref(),
+        );
         let result = tokio::select! {
             result = conn => result,
             status = guard.wait_exited() => {
@@ -274,14 +325,37 @@ impl AgentDriver for AcpDriver {
                     None,
                 ));
             }
+            () = stall_watchdog => {
+                let stderr = stderr_tail.lock().expect("stderr poisoned").clone();
+                let sid = known_session.lock().expect("known_session poisoned").clone();
+                let mut msg = format!(
+                    "no ACP activity for over {}s; sent session/cancel and waited {}s grace, agent still wedged",
+                    self.stall_idle.as_secs(),
+                    self.stall_grace.as_secs()
+                );
+                if !stderr.is_empty() {
+                    msg.push_str(&format!("; agent stderr tail: {stderr}"));
+                }
+                return Err(RunFailure::new(DriverError::Stalled(msg), sid));
+            }
         };
 
         let (session_id, response) = match result {
             Ok(ok) => ok,
             Err(e) => {
                 let stderr = stderr_tail.lock().expect("stderr poisoned").clone();
-                let source = classify_error(e, &stderr);
                 let sid = known_session.lock().expect("known_session poisoned").clone();
+                // The protocol future resolving during the post-cancel grace
+                // window (cancelled turn, transport error) is still a stall.
+                let source = if stalled.load(Ordering::Relaxed) {
+                    DriverError::Stalled(format!(
+                        "no ACP activity for over {}s; sent session/cancel, turn ended during the {}s grace ({e})",
+                        self.stall_idle.as_secs(),
+                        self.stall_grace.as_secs()
+                    ))
+                } else {
+                    classify_error(e, &stderr)
+                };
                 let baseline = *baseline_lines.lock().expect("baseline poisoned");
                 let (input_tokens, output_tokens) = if kimi_usage_enabled {
                     if let (Some(dir), Some(sid)) = (sessions_dir_after.as_deref(), sid.as_ref()) {
@@ -300,6 +374,19 @@ impl AgentDriver for AcpDriver {
                 });
             }
         };
+
+        // A turn that answers the prompt only after the stall watchdog fired
+        // (during the grace window) is a stall, not a success.
+        if stalled.load(Ordering::Relaxed) {
+            return Err(RunFailure::new(
+                DriverError::Stalled(format!(
+                    "no ACP activity for over {}s; sent session/cancel, turn ended during the {}s grace",
+                    self.stall_idle.as_secs(),
+                    self.stall_grace.as_secs()
+                )),
+                Some(session_id.0.to_string()),
+            ));
+        }
 
         // Normal end: the agent should exit on its own once the dropped
         // transport closed its stdin; give it a grace window, then escalate.
@@ -386,9 +473,74 @@ async fn usage_from_wire(
 fn driver_error_to_acp_error(e: DriverError) -> agent_client_protocol::Error {
     let msg = match e {
         DriverError::Permanent(m) => format!("permanent driver error: {m}"),
+        DriverError::Stalled(m) => format!("stalled driver error: {m}"),
         DriverError::Transient(m) => m,
     };
     agent_client_protocol::Error::new(-32603, msg)
+}
+
+/// Unix seconds for the shared last-activity timestamp.
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The stall watchdog select! arm (spec §5.7). Polls the shared last-activity
+/// timestamp; once the turn has been idle for `stall_idle` it marks the run
+/// stalled, journals the stall, and sends `session/cancel`. It then waits
+/// `stall_grace` for the turn to end on its own — if it does, the protocol
+/// arm wins the select! and the stalled flag reclassifies the outcome. If the
+/// agent is still wedged when the grace elapses, this arm completes and the
+/// caller drops the connection so the ChildGuard (SIGTERM → grace → SIGKILL)
+/// terminates the process tree.
+#[allow(clippy::too_many_arguments)]
+async fn stall_watchdog(
+    activity: &AtomicU64,
+    stall_idle: Duration,
+    stall_grace: Duration,
+    stalled: &AtomicBool,
+    conn_handle: &Mutex<Option<ConnectionTo<Agent>>>,
+    known_session: &Mutex<Option<String>>,
+    logger: &SessionLogger,
+    phase_tx: Option<&tokio::sync::mpsc::UnboundedSender<DriverPhase>>,
+) {
+    loop {
+        tokio::time::sleep(EXIT_POLL).await;
+        if now_secs().saturating_sub(activity.load(Ordering::Relaxed)) >= stall_idle.as_secs() {
+            break;
+        }
+    }
+    stalled.store(true, Ordering::Relaxed);
+    // Report the stall the moment the watchdog fires (#154): the run loop
+    // forwards this to the backend so the UI shows `stalled` during the
+    // cancel/grace window, not only after the attempt has already failed.
+    if let Some(tx) = phase_tx {
+        let _ = tx.send(DriverPhase::Stalled);
+    }
+    let idle = now_secs().saturating_sub(activity.load(Ordering::Relaxed));
+    tracing::warn!(
+        idle_secs = idle,
+        limit_secs = stall_idle.as_secs(),
+        "ACP turn stalled; sending session/cancel"
+    );
+    logger.log_error(format!(
+        "stalled after {idle}s idle (limit {}s) — sending session/cancel",
+        stall_idle.as_secs()
+    ));
+    {
+        let cx = conn_handle.lock().expect("conn handle poisoned").clone();
+        let sid = known_session.lock().expect("known_session poisoned").clone();
+        // No session yet (a stall inside initialize/session/new): nothing to
+        // cancel — the grace wait and connection drop still apply.
+        if let (Some(cx), Some(sid)) = (cx, sid)
+            && let Err(e) = cx.send_notification(CancelNotification::new(sid))
+        {
+            tracing::warn!(error = %e, "could not send session/cancel for the stalled turn");
+        }
+    }
+    tokio::time::sleep(stall_grace).await;
 }
 
 async fn new_session(
@@ -578,9 +730,10 @@ fn spawn_agent(
 
 /// Protocol/transport failures are transient (spec §5.7): the retry budget
 /// bounds the damage when the cause turns out to be persistent. Provider
-/// context/size-limit rejections (4xx like "supports only 256K context") and
-/// explicit permanent driver errors (e.g. config option mismatch) are permanent
-/// instead — retrying only burns the attempt budget.
+/// context/size-limit rejections (4xx like "supports only 256K context"),
+/// provider quota/billing rejections (403 "weekly usage limit"), auth
+/// failures (401), and explicit permanent driver errors (e.g. config option
+/// mismatch) are permanent instead — retrying only burns the attempt budget.
 fn classify_error(e: agent_client_protocol::Error, stderr_tail: &str) -> DriverError {
     let raw = e.to_string();
     if raw.contains("permanent driver error:") {
@@ -594,7 +747,61 @@ fn classify_error(e: agent_client_protocol::Error, stderr_tail: &str) -> DriverE
     if looks_like_context_limit(&msg) {
         return DriverError::Permanent(format!("provider context/size limit rejection (not retryable): {msg}"));
     }
+    // Auth phrasing is matched strictly: on the error text alone, or on the
+    // unambiguous provider rejections in stderr — a tool's own "access
+    // denied"/"invalid token" log line in the stderr tail must not escalate a
+    // generic transport error to permanent (#154 review). Quota wording may
+    // be split across the error and the stderr tail, so 403+quota is matched
+    // on the combined text.
+    let error_only = format!("ACP error: {e}");
+    if looks_like_quota_or_auth_failure(&error_only)
+        || looks_like_quota_rejection(&msg)
+        || looks_like_auth_rejection_in_stderr(stderr_tail)
+    {
+        return DriverError::Permanent(format!("provider quota/authentication failure — not retrying: {msg}"));
+    }
     DriverError::Transient(msg)
+}
+
+/// Provider quota/billing and authentication rejections surface only as
+/// message text (no structured code to rely on) — match the known wordings,
+/// case-insensitively, on the error text plus the captured stderr tail. A
+/// 403 alone can be a transient gateway quirk, so it must come with
+/// quota-phrasing ("weekly", "usage limit", "quota"); a 401 or explicit
+/// auth-failure wording is permanent on its own — retrying with the same
+/// credentials can never succeed.
+fn looks_like_quota_or_auth_failure(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    if looks_like_quota_rejection(&m) {
+        return true;
+    }
+    const AUTH_PHRASES: &[&str] = &[
+        "401",
+        "unauthorized",
+        "authentication failed",
+        "authentication failure",
+        "auth failure",
+        "invalid api key",
+        "invalid token",
+        "access denied",
+    ];
+    AUTH_PHRASES.iter().any(|p| m.contains(p))
+}
+
+/// A 403 alone can be a transient gateway quirk, so it must come with
+/// quota-phrasing ("weekly", "usage limit", "quota").
+fn looks_like_quota_rejection(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    const QUOTA_PHRASES: &[&str] = &["weekly", "usage limit", "quota"];
+    m.contains("403") && QUOTA_PHRASES.iter().any(|p| m.contains(p))
+}
+
+/// Stderr-only auth matches are restricted to unambiguous provider
+/// rejections (#154 review): an agent's tool logging "access denied" or
+/// "invalid token" to stderr is not an auth failure of the provider.
+fn looks_like_auth_rejection_in_stderr(stderr_tail: &str) -> bool {
+    let m = stderr_tail.to_lowercase();
+    m.contains("401") || m.contains("unauthorized") || m.contains("authentication failed")
 }
 
 /// Provider 4xx "prompt too large" rejections surface only as message text
@@ -684,8 +891,9 @@ impl Drop for ChildGuard {
 }
 
 /// Drains the agent's stderr into a bounded tail buffer (for error reports)
-/// plus trace logs. Ends when the child exits and closes the pipe.
-fn spawn_stderr_drain(stderr: async_process::ChildStderr) -> Arc<Mutex<String>> {
+/// plus trace logs. Every line also counts as activity for the stall
+/// watchdog. Ends when the child exits and closes the pipe.
+fn spawn_stderr_drain(stderr: async_process::ChildStderr, activity: Arc<AtomicU64>) -> Arc<Mutex<String>> {
     let tail = Arc::new(Mutex::new(String::new()));
     let sink = tail.clone();
     tokio::spawn(async move {
@@ -696,6 +904,7 @@ fn spawn_stderr_drain(stderr: async_process::ChildStderr) -> Arc<Mutex<String>> 
             match stderr.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    activity.store(now_secs(), Ordering::Relaxed);
                     let chunk = String::from_utf8_lossy(&buf[..n]);
                     tracing::debug!(target: "remoter_agent::acp_stderr", "{chunk}");
                     let mut tail = sink.lock().expect("stderr poisoned");
@@ -881,6 +1090,88 @@ mod tests {
         assert!(matches!(err, DriverError::Transient(_)), "{err}");
     }
 
+    /// A provider weekly-quota rejection (403) is permanent: the retry budget
+    /// must not be burned on a limit that resets on its own schedule.
+    #[test]
+    fn quota_rejection_is_permanent() {
+        let e = agent_client_protocol::Error::new(
+            -32603,
+            "HTTP 403: you have reached your weekly usage limit for this model",
+        );
+        let err = classify_error(e, "");
+        assert!(matches!(err, DriverError::Permanent(_)), "{err}");
+        assert!(err.to_string().contains("quota/authentication failure"), "{err}");
+    }
+
+    /// The same quota rejection reported only via the agent's stderr tail.
+    #[test]
+    fn quota_rejection_in_stderr_tail_is_permanent() {
+        let e = agent_client_protocol::Error::internal_error();
+        let err = classify_error(e, "error: 403 quota exceeded for this billing period");
+        assert!(matches!(err, DriverError::Permanent(_)), "{err}");
+    }
+
+    /// A bare 403 without quota phrasing stays transient (gateway quirk).
+    #[test]
+    fn bare_403_without_quota_phrasing_stays_transient() {
+        let e = agent_client_protocol::Error::new(-32603, "HTTP 403 from edge proxy");
+        let err = classify_error(e, "");
+        assert!(matches!(err, DriverError::Transient(_)), "{err}");
+    }
+
+    /// Auth failures (401) are permanent: retrying with the same credentials
+    /// can never succeed.
+    #[test]
+    fn auth_failure_is_permanent() {
+        let e = agent_client_protocol::Error::new(-32603, "HTTP 401: invalid api key");
+        let err = classify_error(e, "");
+        assert!(matches!(err, DriverError::Permanent(_)), "{err}");
+        assert!(err.to_string().contains("quota/authentication failure"), "{err}");
+    }
+
+    #[test]
+    fn auth_failure_in_stderr_tail_is_permanent() {
+        let e = agent_client_protocol::Error::internal_error();
+        let err = classify_error(e, "fatal: authentication failed for API request");
+        assert!(matches!(err, DriverError::Permanent(_)), "{err}");
+    }
+
+    /// A quota rejection split across the error text (403) and the stderr
+    /// tail (weekly wording) is still permanent (#154 review).
+    #[test]
+    fn quota_rejection_split_across_error_and_stderr_is_permanent() {
+        let e = agent_client_protocol::Error::new(-32603, "HTTP 403");
+        let err = classify_error(e, "you have reached your weekly usage limit");
+        assert!(matches!(err, DriverError::Permanent(_)), "{err}");
+    }
+
+    /// A tool's own "access denied"/"invalid token" log line in the stderr
+    /// tail must not escalate a generic transport error (#154 review).
+    #[test]
+    fn tool_permission_noise_in_stderr_stays_transient() {
+        let e = agent_client_protocol::Error::new(-32603, "connection reset by peer");
+        let err = classify_error(e, "tool bash: access denied for /etc/shadow; invalid token in header");
+        assert!(matches!(err, DriverError::Transient(_)), "{err}");
+    }
+
+    #[test]
+    fn quota_and_auth_phrases() {
+        for msg in [
+            "HTTP 403: weekly limit reached",
+            "403 usage limit exceeded",
+            "request failed with 403: quota exhausted",
+            "HTTP 401 Unauthorized",
+            "authentication failed",
+            "invalid api key",
+            "access denied by provider",
+        ] {
+            assert!(looks_like_quota_or_auth_failure(msg), "{msg}");
+        }
+        for msg in ["403 forbidden by proxy", "rate limited, retry later", "internal error"] {
+            assert!(!looks_like_quota_or_auth_failure(msg), "{msg}");
+        }
+    }
+
     #[test]
     fn context_limit_phrases() {
         for msg in [
@@ -899,5 +1190,62 @@ mod tests {
         for msg in ["permission denied", "rate limited, retry later", "internal error"] {
             assert!(!looks_like_context_limit(msg), "{msg}");
         }
+    }
+
+    /// An idle turn fires the watchdog: the stalled flag is set and the arm
+    /// completes after idle limit + grace (no session to cancel here).
+    #[tokio::test]
+    async fn stall_watchdog_fires_after_idle_limit_plus_grace() {
+        let activity = AtomicU64::new(now_secs().saturating_sub(10));
+        let stalled = AtomicBool::new(false);
+        let conn: Mutex<Option<ConnectionTo<Agent>>> = Mutex::new(None);
+        let session = Mutex::new(None);
+        let logger = SessionLogger::noop();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            stall_watchdog(
+                &activity,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                &stalled,
+                &conn,
+                &session,
+                &logger,
+                Some(&tx),
+            ),
+        )
+        .await
+        .expect("watchdog completes after idle limit + grace");
+        assert!(stalled.load(Ordering::Relaxed));
+        // The stall is reported live, at watchdog-fire time (#154).
+        assert_eq!(rx.try_recv(), Ok(DriverPhase::Stalled));
+    }
+
+    /// Fresh activity keeps the watchdog pending: no stall while the agent
+    /// keeps producing updates.
+    #[tokio::test]
+    async fn stall_watchdog_stays_quiet_while_active() {
+        let activity = AtomicU64::new(now_secs());
+        let stalled = AtomicBool::new(false);
+        let conn: Mutex<Option<ConnectionTo<Agent>>> = Mutex::new(None);
+        let session = Mutex::new(None);
+        let logger = SessionLogger::noop();
+        let fired = tokio::time::timeout(
+            Duration::from_secs(3),
+            stall_watchdog(
+                &activity,
+                Duration::from_secs(60),
+                Duration::from_secs(1),
+                &stalled,
+                &conn,
+                &session,
+                &logger,
+                None,
+            ),
+        )
+        .await;
+        assert!(fired.is_err(), "watchdog must not fire while active");
+        assert!(!stalled.load(Ordering::Relaxed));
     }
 }

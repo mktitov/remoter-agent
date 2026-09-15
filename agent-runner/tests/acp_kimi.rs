@@ -43,6 +43,7 @@ fn spec(
         exec: remoter_agent::workspace::ExecEnv::host(false),
         config_options,
         logger: remoter_agent::session_log::SessionLogger::noop(),
+        phase_tx: None,
     }
 }
 
@@ -83,7 +84,7 @@ async fn kimi_acp_conformance() {
         review_thinking: None,
         sessions_dir: None,
     };
-    let driver = AcpDriver::new(&cfg, "http://localhost:8181", "unused-in-this-test", None);
+    let driver = AcpDriver::new(&cfg, "http://localhost:8181", "unused-in-this-test", None, 300, 30);
 
     // New session + prompt/stream with per-kind config options.
     let first = driver

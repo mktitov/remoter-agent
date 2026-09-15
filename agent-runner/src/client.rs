@@ -317,6 +317,10 @@ pub struct AgentRunDto {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub attempt: i16,
+    /// Live phase of a running run (#154: `active`/`stalled`/`cancelling`/
+    /// `retrying`); absent on backends older than the column.
+    #[serde(default)]
+    pub phase: Option<String>,
     /// When the run row was opened (`created_at` — the entity serializes
     /// snake_case). The supervise run anchors its verdict freshness check on
     /// it.
@@ -559,6 +563,24 @@ impl RemoterClient {
             .await
             .map_err(ClientError::transport)?;
         Self::decode(resp).await
+    }
+
+    /// `PATCH /agent-runs/{id}/phase` — set the live phase of a running run
+    /// (#154: `active` / `stalled` / `cancelling` / `retrying`), or clear it
+    /// (`None` → NULL) when the run returns to plain running. Finishing the
+    /// run clears the phase server-side, so callers need not clear before
+    /// `finish_run`. Best-effort: callers log failures, never fail the run.
+    pub async fn set_run_phase(&self, run_id: i32, phase: Option<&str>) -> Result<(), ClientError> {
+        let resp = self
+            .auth_request(
+                self.http
+                    .patch(format!("{}/api/v1/agent-runs/{run_id}/phase", self.base_url)),
+            )
+            .json(&serde_json::json!({ "phase": phase }))
+            .send()
+            .await
+            .map_err(ClientError::transport)?;
+        Self::decode_unit(resp).await
     }
 
     /// `POST /agent-logs` — ship a batch of log lines (daemon + ACP

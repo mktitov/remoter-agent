@@ -698,8 +698,8 @@ pub async fn execute(rc: SuperviseContext) {
             Some(result) => match result {
                 Ok(outcome) => outcome,
                 Err(failure) => {
-                    let retrying =
-                        matches!(failure.source, DriverError::Transient(_)) && attempt < rc.config.max_attempts;
+                    let retrying = matches!(failure.source, DriverError::Transient(_) | DriverError::Stalled(_))
+                        && attempt < rc.config.max_attempts;
                     run::finish_failed(
                         &rc.client,
                         parent_id,
@@ -884,6 +884,7 @@ async fn run_attempt(
         exec,
         config_options: rc.config.driver.config_options_for(SUPERVISE_RUN_KIND),
         logger: logger.clone(),
+        phase_tx: None,
     };
     let timeout = Duration::from_secs(rc.config.run_timeout_minutes * 60);
     let result = tokio::select! {
@@ -2183,6 +2184,7 @@ mod tests {
             input_tokens: None,
             output_tokens: None,
             attempt: 1,
+            phase: None,
             created_at: None,
         }
     }

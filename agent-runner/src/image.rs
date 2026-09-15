@@ -234,7 +234,7 @@ async fn build_and_commit(
 /// succeed, and the ticket must escalate rather than burn attempts.
 fn image_build_error(e: DriverError) -> DriverError {
     match e {
-        DriverError::Transient(msg) | DriverError::Permanent(msg) => {
+        DriverError::Transient(msg) | DriverError::Permanent(msg) | DriverError::Stalled(msg) => {
             DriverError::Permanent(format!("agent image build failed (not retryable): {msg}"))
         }
     }

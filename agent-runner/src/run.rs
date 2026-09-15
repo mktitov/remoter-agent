@@ -13,7 +13,7 @@ use crate::{
     client::{AttachmentDto, FinishRunBody, LinkDto, ProjectRepoConfig, RemoterClient, TaskDetail, TaskSummary},
     config::Config,
     container,
-    driver::{AgentDriver, DriverError, RunFailure, RunOutcome, RunSpec},
+    driver::{AgentDriver, DriverError, DriverPhase, RunFailure, RunOutcome, RunSpec},
     forge, image,
     image::ImageLocks,
     logstore::LogStore,
@@ -132,6 +132,7 @@ impl Drop for RunLogGuard {
 /// doing any further work. If so, record the failure, roll back, and stop.
 async fn cancel_after_attempt(rc: &RunContext, task_id: i32, run_id: i32) -> bool {
     if rc.cancel.is_cancelled() {
+        set_phase(rc, run_id, "cancelling").await;
         finish_failed(
             &rc.client,
             task_id,
@@ -297,6 +298,25 @@ pub async fn execute(rc: RunContext) {
                 return;
             }
         };
+        set_phase(&rc, run.id, "active").await;
+        // Live driver-phase forwarder (#154): the driver reports `stalled`
+        // the moment its idle watchdog fires; relay it to the backend so the
+        // journal shows the stall during the cancel/grace window.
+        let (phase_tx, mut phase_rx) = tokio::sync::mpsc::unbounded_channel::<DriverPhase>();
+        let phase_forwarder = {
+            let client = rc.client.clone();
+            let run_id = run.id;
+            tokio::spawn(async move {
+                while let Some(p) = phase_rx.recv().await {
+                    let name = match p {
+                        DriverPhase::Stalled => "stalled",
+                    };
+                    if let Err(e) = client.set_run_phase(run_id, Some(name)).await {
+                        tracing::warn!(run_id, phase = name, error = %e, "could not set run phase");
+                    }
+                }
+            })
+        };
         tracing::info!(
             task_id,
             run_id = run.id,
@@ -362,6 +382,7 @@ pub async fn execute(rc: RunContext) {
         // its status now (then the rollback write conflicts and is skipped).
         let result = tokio::select! {
             _ = rc.cancel.cancelled() => {
+                set_phase(&rc, run.id, "cancelling").await;
                 finish_failed(&rc.client, task_id, run.id, "cancelled (human intervention or daemon shutdown)".to_string(), None, None).await;
                 tracing::info!(task_id, run_id = run.id, "run cancelled");
                 rollback(&rc).await;
@@ -370,8 +391,9 @@ pub async fn execute(rc: RunContext) {
             // Resume only on attempt 1 (spec §5.4): a retry after a failure
             // always starts fresh — failures are the main source of poisoned
             // sessions, and resuming one would just replay the same crash.
-            r = tokio::time::timeout(timeout, attempt_run(&rc, run.id, &logger, &prompt, if attempt == 1 { &resume_session } else { &None }, &branch, supervised.as_ref().map(|(p, _)| p.branch.as_str()))) => r,
+            r = tokio::time::timeout(timeout, attempt_run(&rc, run.id, &logger, &prompt, if attempt == 1 { &resume_session } else { &None }, &branch, supervised.as_ref().map(|(p, _)| p.branch.as_str()), Some(phase_tx))) => r,
         };
+        phase_forwarder.abort();
 
         match result {
             Ok(Ok(mut outcome)) => {
@@ -570,12 +592,54 @@ pub async fn execute(rc: RunContext) {
                 return;
             }
             Ok(Err(RunFailure {
+                source: DriverError::Stalled(e),
+                input_tokens,
+                output_tokens,
+                ..
+            })) if attempt < rc.config.max_attempts => {
+                tracing::warn!(task_id, run_id = run.id, attempt, error = %e, "run stalled; retrying");
+                logger.log_error(format!("attempt {attempt} stalled — retrying attempt {}", attempt + 1));
+                let failure = format!("attempt {attempt}: stalled after idle limit: {e} — retrying");
+                // The live `stalled` phase was already PATCHed when the
+                // watchdog fired; mark the row `retrying` now so the phase
+                // survives finish_failed and stays visible across the backoff
+                // (#154).
+                set_phase(&rc, run.id, "retrying").await;
+                finish_failed(
+                    &rc.client,
+                    task_id,
+                    run.id,
+                    failure.clone(),
+                    input_tokens,
+                    output_tokens,
+                )
+                .await;
+                note(
+                    &rc.client,
+                    task_id,
+                    format!(
+                        "{} run #{} stalled after the idle limit ({e}) — retrying (attempt {}/{})",
+                        rc.kind.as_str(),
+                        run.id,
+                        attempt + 1,
+                        rc.config.max_attempts
+                    ),
+                )
+                .await;
+                backoff(&rc, attempt).await;
+            }
+            Ok(Err(RunFailure {
                 source: DriverError::Transient(e),
                 input_tokens,
                 output_tokens,
                 ..
             })) if attempt < rc.config.max_attempts => {
                 tracing::warn!(task_id, run_id = run.id, attempt, error = %e, "transient failure; retrying");
+                logger.log_error(format!(
+                    "attempt {attempt} failed: {e} — retrying attempt {}",
+                    attempt + 1
+                ));
+                set_phase(&rc, run.id, "retrying").await;
                 finish_failed(
                     &rc.client,
                     task_id,
@@ -618,6 +682,7 @@ pub async fn execute(rc: RunContext) {
 /// dirty-worktree nudges), always tear the runtime down. Workspace/devenv
 /// failures are transient (network, nix cache); a missing project Dockerfile
 /// is permanent (container mode fails closed).
+#[allow(clippy::too_many_arguments)]
 async fn attempt_run(
     rc: &RunContext,
     run_id: i32,
@@ -626,6 +691,7 @@ async fn attempt_run(
     resume_session: &Option<String>,
     branch: &str,
     stack_base: Option<&str>,
+    phase_tx: Option<tokio::sync::mpsc::UnboundedSender<DriverPhase>>,
 ) -> Result<RunOutcome, RunFailure> {
     let task_id = rc.task.id;
     let prepared = workspace::prepare_with_stack(
@@ -671,6 +737,7 @@ async fn attempt_run(
         exec: exec_env(&rc.config, run_id, prepared.devenv),
         config_options: rc.config.driver.config_options_for(rc.kind.as_str()),
         logger: logger.clone(),
+        phase_tx,
     };
     let result = run_with_dirty_nudges(rc, run_id, spec, branch, &prepared.dir, logger).await;
 
@@ -749,6 +816,7 @@ async fn ensure_clean_worktree(
             exec: exec_env(&rc.config, run_id, devenv),
             config_options: config_options.clone(),
             logger: logger.clone(),
+            phase_tx: None,
         };
         let nudge_outcome = rc.driver.run(nudge_spec).await?;
         merged.session_id = nudge_outcome.session_id.clone().or(merged.session_id);
@@ -884,6 +952,7 @@ async fn ensure_final_actions(
             exec: exec_env(&rc.config, run_id, devenv),
             config_options: config_options.clone(),
             logger: logger.clone(),
+            phase_tx: None,
         };
         let nudge_outcome = rc.driver.run(nudge_spec).await?;
         merged.session_id = nudge_outcome.session_id.clone().or(merged.session_id);
@@ -1770,6 +1839,7 @@ async fn rebase_nudge_loop(
             exec: exec_env(&rc.config, run_id, devenv),
             config_options: rc.config.driver.config_options_for(rc.kind.as_str()),
             logger: logger.clone(),
+            phase_tx: None,
         };
         let nudge_outcome = tokio::select! {
             biased;
@@ -1890,6 +1960,16 @@ async fn rebase_nudge_loop(
     .await;
 }
 
+/// Best-effort live phase update on the run row (#154): `active` / `stalled` /
+/// `cancelling` / `retrying`. Finishing clears the phase server-side, except
+/// `retrying`, which survives so the inter-attempt backoff stays visible. Like
+/// `note`, a failure here must never affect the run itself.
+async fn set_phase(rc: &RunContext, run_id: i32, phase: &str) {
+    if let Err(e) = rc.client.set_run_phase(run_id, Some(phase)).await {
+        tracing::warn!(run_id, phase, error = %e, "could not set run phase");
+    }
+}
+
 /// Best-effort daemon note on the ticket thread (spec §5.6): the conversation
 /// a human reads — and the next prompt is built from — stays complete. A
 /// failure here must never affect the run itself.
@@ -1995,6 +2075,7 @@ mod tests {
             input_tokens: None,
             output_tokens: None,
             attempt: 1,
+            phase: None,
             created_at: None,
         }
     }

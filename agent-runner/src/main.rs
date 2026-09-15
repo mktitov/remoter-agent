@@ -51,7 +51,14 @@ async fn main() -> anyhow::Result<()> {
 
     let client = RemoterClient::new(&config.api_url, &config.token, config.workspace_id);
     let event_client = client.clone();
-    let driver = driver::from_config(&config.driver, &config.api_url, &config.token, config.workspace_id)?;
+    let driver = driver::from_config(
+        &config.driver,
+        &config.api_url,
+        &config.token,
+        config.workspace_id,
+        config.stall_idle_secs,
+        config.stall_grace_secs,
+    )?;
     let mut daemon = Daemon::new(config.clone(), client, driver, log_store.clone());
 
     // Best-effort log shipper: batches the queue to `POST /agent-logs`.

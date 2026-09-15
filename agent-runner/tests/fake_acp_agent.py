@@ -10,7 +10,23 @@ mid-turn, and an end-turn response carrying token usage.
 Env knobs:
   FAKE_AGENT_CAPTURE  — path; every notable event is appended as a JSON line.
   FAKE_AGENT_PIDFILE  — path; the agent writes its pid there at startup.
-  FAKE_AGENT_HANG=1   — never answer session/prompt (kill-on-drop tests).
+  FAKE_AGENT_HANG=1   — never answer session/prompt on its own (stall tests):
+                        a session/cancel ends the turn with stopReason
+                        "cancelled" …
+  FAKE_AGENT_HANG_MARKER — path; like HANG but only while the marker file
+                        does not exist (the first hang creates it). A retry
+                        attempt spawns a fresh agent process, so per-process
+                        state cannot express "stall once, then succeed".
+  FAKE_AGENT_IGNORE_CANCEL=1 — … unless this is set: the cancel is recorded
+                        and the hang continues (grace-expiry → ChildGuard
+                        SIGTERM→SIGKILL tests).
+  FAKE_AGENT_HANG_GRANDCHILD=1 — with HANG: on session/prompt spawn a
+                        `sleep` grandchild holding the stdout pipe open (pid
+                        appended to FAKE_AGENT_PIDFILE on its own line) so
+                        tests can verify the whole process group is killed.
+  FAKE_AGENT_QUOTA=1  — fail session/prompt with a provider quota error
+                        ("HTTP 403: weekly usage limit") instead of a turn
+                        (permanent, no-retry classification tests).
   FAKE_AGENT_EXIT_ON_PROMPT=1 — exit the process on session/prompt without
                         answering, leaving a grandchild holding the stdout pipe
                         open (died-mid-turn detection tests: no pipe EOF for
@@ -28,10 +44,13 @@ import json
 import os
 import subprocess
 import sys
-import time
 
 capture_path = os.environ.get("FAKE_AGENT_CAPTURE")
 hang = os.environ.get("FAKE_AGENT_HANG") == "1"
+hang_marker = os.environ.get("FAKE_AGENT_HANG_MARKER")
+ignore_cancel = os.environ.get("FAKE_AGENT_IGNORE_CANCEL") == "1"
+hang_grandchild = os.environ.get("FAKE_AGENT_HANG_GRANDCHILD") == "1"
+quota = os.environ.get("FAKE_AGENT_QUOTA") == "1"
 exit_on_prompt = os.environ.get("FAKE_AGENT_EXIT_ON_PROMPT") == "1"
 empty = os.environ.get("FAKE_AGENT_EMPTY") == "1"
 no_allow = os.environ.get("FAKE_AGENT_NO_ALLOW") == "1"
@@ -124,6 +143,7 @@ def finish_turn(prompt_msg):
 next_req = 0
 pending = {}  # our request id -> ("permission" | "elicitation", prompt_msg)
 session_count = 0
+hung_prompt = None  # session/prompt msg being hung (FAKE_AGENT_HANG)
 
 for line in sys.stdin:
     line = line.strip()
@@ -184,9 +204,25 @@ for line in sys.stdin:
             current_model = msg["params"].get("value")
         send({"jsonrpc": "2.0", "id": msg["id"], "result": {"configOptions": config_options()}})
     elif method == "session/prompt":
-        if hang:
+        if hang or (hang_marker and not os.path.exists(hang_marker)):
             record({"prompt_hang": True})
-            time.sleep(3600)
+            if hang_marker:
+                # First hang only: the next attempt's process sees the marker.
+                open(hang_marker, "w").close()
+            if hang_grandchild:
+                # Keep the stdout pipe open via a grandchild and expose its
+                # pid: after the ChildGuard TERM→KILLs the group, tests assert
+                # the grandchild is gone too.
+                gc = subprocess.Popen(
+                    ["sleep", "3600"], stdin=subprocess.DEVNULL, stdout=sys.stdout, stderr=subprocess.DEVNULL
+                )
+                if pidfile:
+                    with open(pidfile, "a") as f:
+                        f.write("\n%d" % gc.pid)
+            # Stay in the read loop so a session/cancel can end (or, with
+            # IGNORE_CANCEL, be observed and ignored) the hung turn.
+            hung_prompt = msg
+            continue
         if exit_on_prompt:
             record({"prompt_exit": True})
             # Die without answering, but keep the stdout pipe open via a
@@ -197,6 +233,12 @@ for line in sys.stdin:
             os._exit(1)
         sid = msg["params"]["sessionId"]
         record({"prompt": msg["params"].get("prompt")})
+        if quota:
+            record({"prompt_quota": sid})
+            send({"jsonrpc": "2.0", "id": msg["id"],
+                  "error": {"code": -32603,
+                            "message": "HTTP 403: you have reached your weekly usage limit for this model"}})
+            continue
         if fail_prompt_on_session and sid in fail_prompt_on_session:
             record({"prompt_failed": sid})
             send({"jsonrpc": "2.0", "id": msg["id"],
@@ -226,4 +268,14 @@ for line in sys.stdin:
                 "options": options,
             },
         })
-    # Anything else (notifications, cancels) is ignored.
+    elif method == "session/cancel":
+        record({"cancel": msg["params"].get("sessionId")})
+        if hung_prompt is not None and not ignore_cancel:
+            send({
+                "jsonrpc": "2.0",
+                "id": hung_prompt["id"],
+                "result": {"stopReason": "cancelled"},
+            })
+            hung_prompt = None
+        # With IGNORE_CANCEL the hang continues past the driver's grace window.
+    # Anything else (notifications) is ignored.
