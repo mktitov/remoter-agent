@@ -74,6 +74,28 @@ tools at run time (install them yourself, they are not bundled):
 
 `remoter-mcp` needs nothing but a reachable Remoter HTTP API and a token.
 
+## Agent container image (`.remoter/`)
+
+`.remoter/` is the image build context the daemon uses in
+`[execution] mode = "container"` (spec `docs/specs/remoter-agent-containers.md`
+in the Remoter monorepo) — it is what lets the daemon work this repo's own
+tickets in container mode:
+
+- `agent.Dockerfile` — the nix+devenv bootstrap (required; a project without
+  it is a hard error in container mode);
+- `agent-flake.nix` + `agent-configuration.nix` — the image's package
+  profile (`remoter-mcp` built from this repo's own flake, nodejs);
+- `agent-init.sh` — installs that profile plus the pinned kimi CLI once per
+  image build;
+- `check-image.sh` — per-turn freshness hook: marks the image stale when
+  `main` moved since the image was baked;
+- `kimi-config.toml` — kimi provider/model template rendered into the
+  container's agent home at every start (`${KIMI_API_KEY}` is substituted
+  from the daemon's environment — never commit a real key).
+
+The image tag is content-keyed over every file in `.remoter/`, so any edit
+there rebuilds the image automatically on the next run.
+
 ## Configuration
 
 - `remoter-agent` reads `remoter-agent.toml` (see the annotated

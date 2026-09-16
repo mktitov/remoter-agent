@@ -1,0 +1,60 @@
+# kimi CLI configuration for remoter-agent run containers
+# (docs/specs/remoter-agent-containers.md §3.1).
+#
+# The daemon renders this template into <agent_home>/.kimi-code/config.toml
+# at every container start (container.rs::provision_kimi_config):
+# ${KIMI_API_KEY} is substituted from the daemon's own environment. Never
+# commit a real key here — the image and this file must stay secret-free.
+#
+# `default_model` is required: kimi's ACP auth readiness gate
+# (auth.ensureReady) fails session/new without a resolvable default model.
+# The daemon overrides the model per run kind via ACP
+# session/set_config_option (spec §5.5), so this default only gates startup.
+default_model = "kimi-code/kimi-for-coding"
+
+[providers.kimi-code]
+type = "kimi"
+base_url = "https://api.kimi.com/coding/v1"
+api_key = "${KIMI_API_KEY}"
+
+[models.k3]
+provider = "kimi-code"
+model = "k3"
+max_context_size = 1048576
+
+[models.kimi-for-coding]
+provider = "kimi-code"
+model = "kimi-for-coding"
+max_context_size = 262144
+
+[models."kimi-code/kimi-for-coding"]
+provider = "kimi-code"
+model = "kimi-for-coding"
+max_context_size = 262144
+capabilities = [ "thinking", "always_thinking", "image_in", "video_in", "tool_use" ]
+display_name = "K2.7 Coding"
+
+[models."kimi-code/kimi-for-coding-highspeed"]
+provider = "kimi-code"
+model = "kimi-for-coding-highspeed"
+max_context_size = 262144
+capabilities = [ "thinking", "always_thinking", "image_in", "video_in", "tool_use" ]
+display_name = "K2.7 Coding Highspeed"
+
+[models."kimi-code/k3"]
+provider = "kimi-code"
+model = "k3"
+max_context_size = 1048576
+capabilities = [ "thinking", "always_thinking", "image_in", "video_in", "tool_use" ]
+display_name = "K3"
+support_efforts = [ "low", "high", "max" ]
+default_effort = "max"
+
+[models."kimi-code/k3-256k"]
+provider = "kimi-code"
+model = "k3-256k"
+max_context_size = 262144
+capabilities = [ "thinking", "always_thinking", "image_in", "video_in", "tool_use" ]
+display_name = "K3-256k"
+support_efforts = [ "low", "high", "max" ]
+default_effort = "max"
