@@ -706,6 +706,27 @@ async fn attempt_run(
     .await
     .map_err(|e| RunFailure::new(DriverError::Transient(format!("workspace prepare: {e}")), None))?;
 
+    // Reference repos (docs/specs/cross-repo-projects.md): mounted read-only
+    // into the ticket worktree as `.refs/<mount>` — fail-open per ref; an
+    // unavailable ref is noted on the thread and the run continues without it
+    // (same fail-open policy as the image freshness check).
+    let refs = workspace::prepare_reference_repos(
+        &rc.config.workspace_root,
+        rc.project.project_id,
+        task_id,
+        &prepared.dir,
+        &rc.project.reference_repos,
+    )
+    .await;
+    for (mount, error) in &refs.failed {
+        note(
+            &rc.client,
+            task_id,
+            format!("reference repo `{mount}` is unavailable: {error} — the run continues without it"),
+        )
+        .await;
+    }
+
     let env = run_env(rc);
     // Container mode: the guard's drop (`docker rm -f` + worktree unlock) is
     // the teardown on every exit path below, including cancellation.
@@ -717,8 +738,20 @@ async fn attempt_run(
         &prepared.dir,
         prepared.devenv,
         &env,
+        &refs.mounted,
     )
     .await?;
+    if containers.is_none() {
+        // Host mode surfaces refs as symlinks; container mode bind-mounts them.
+        for (mount, error) in workspace::link_refs_into(&prepared.dir, &refs.mounted).await {
+            note(
+                &rc.client,
+                task_id,
+                format!("reference repo `{mount}` could not be linked into the worktree: {error} — the run continues without it"),
+            )
+            .await;
+        }
+    }
     if containers.is_none() && prepared.devenv {
         workspace::services_up(&prepared.dir, &env)
             .await
@@ -1027,6 +1060,7 @@ pub(crate) fn exec_env(config: &Config, run_id: i32, devenv: bool) -> ExecEnv {
 /// waits for the sidecars). Host mode returns `None` and the caller falls
 /// back to `workspace::services_up`/`services_down`. No silent fallback: a
 /// container-mode failure propagates as a run failure, never a host run.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_container_runtime(
     config: &Config,
     image_locks: &ImageLocks,
@@ -1035,6 +1069,7 @@ pub(crate) async fn start_container_runtime(
     worktree: &Path,
     devenv: bool,
     env: &[(String, String)],
+    refs: &[workspace::RefMount],
 ) -> Result<Option<container::RunContainers>, RunFailure> {
     if !config.execution.is_container() {
         return Ok(None);
@@ -1053,6 +1088,7 @@ pub(crate) async fn start_container_runtime(
         repo: &repo,
         agent_home: &config.execution.agent_home(&config.workspace_root),
         env,
+        refs,
     })
     .await
     .map_err(|e| RunFailure::new(e, None))?;
@@ -1271,13 +1307,52 @@ async fn build_prompt(
     current_run_id: i32,
 ) -> Result<String, crate::client::ClientError> {
     let detail = rc.client.task_detail(rc.task.id).await?;
+    // The configured mount names — the `.refs/` block appears only when the
+    // project has reference repos, whether or not every one of them mounted
+    // (a failed ref is noted on the thread separately).
+    let refs: Vec<String> = rc
+        .project
+        .reference_repos
+        .iter()
+        .map(|r| r.mount_name.clone())
+        .collect();
     Ok(render_prompt(
         rc.kind,
         &detail,
         plan,
         current_run_id,
         rc.client.base_url(),
+        &refs,
     ))
+}
+
+/// The `.refs/` block (docs/specs/cross-repo-projects.md): rendered only when
+/// the project has reference repos configured. Both run kinds get the
+/// read-only rule; the plan run additionally gets the cross-repo splitting
+/// convention.
+fn refs_section(kind: RunKind, refs: &[String]) -> String {
+    let names = refs
+        .iter()
+        .map(|r| format!("`.refs/{r}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut s = format!(
+        "## Reference repositories\nRead-only copies of the project's dependent repositories are mounted at \
+         {names} — read them freely, but never create, edit, or delete anything in them: they are detached \
+         checkouts that land in no PR, and any change there is lost. If the task requires changes in a \
+         reference repository, that is a separate ticket in that repository's project, not this one.\n\n"
+    );
+    if kind == RunKind::Plan {
+        s.push_str(
+            "Cross-repo splitting convention: a task that spans several repositories is planned as a chain of \
+             per-repo tickets linked with `blocks`: (1) the contract/API in the provider repo, (2) the \
+             implementation in the consumer repo, (3) the pin-bump plus integration tests in the first repo. \
+             Every such ticket must be holistic (builds, tests green, deployable) and self-contained (the \
+             contract is quoted in its description). Never create cross-project tickets yourself — propose \
+             their text in the plan or a comment for the human.\n\n",
+        );
+    }
+    s
 }
 
 /// Pure prompt assembly, split out from `build_prompt` for tests. Every
@@ -1291,6 +1366,7 @@ fn render_prompt(
     plan: Option<&str>,
     current_run_id: i32,
     base_url: &str,
+    refs: &[String],
 ) -> String {
     let mut p = String::new();
     p.push_str("## Ticket\n");
@@ -1453,6 +1529,9 @@ fn render_prompt(
          human reads in the ticket's language: the plan, the report, and comments. \
          Code, commit messages, and tool calls stay in English.\n\n",
     );
+    if !refs.is_empty() {
+        p.push_str(&refs_section(kind, refs));
+    }
     match kind {
         RunKind::Plan => p.push_str(PLAN_INSTRUCTIONS),
         RunKind::Implement => {
@@ -1755,7 +1834,7 @@ async fn ensure_pr_mergeable(
     let env = run_env(rc);
     let devenv = workspace::uses_devenv(&wt);
     let containers =
-        match start_container_runtime(&rc.config, &rc.image_locks, &rc.project, run_id, &wt, devenv, &env).await {
+        match start_container_runtime(&rc.config, &rc.image_locks, &rc.project, run_id, &wt, devenv, &env, &[]).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(task_id, error = %e, "rebase nudge: container runtime start failed");
@@ -2022,7 +2101,7 @@ mod tests {
     #[test]
     fn ticket_creation_outcome_must_be_holistic() {
         for kind in [RunKind::Plan, RunKind::Implement] {
-            let p = render_prompt(kind, &detail(vec![], vec![]), None, 999, "http://api");
+            let p = render_prompt(kind, &detail(vec![], vec![]), None, 999, "http://api", &[]);
             assert!(p.contains("holistic"), "{kind:?}: {p}");
             assert!(p.contains("all tests passing"), "{kind:?}: {p}");
             assert!(p.contains("safe to deploy to production"), "{kind:?}: {p}");
@@ -2035,17 +2114,86 @@ mod tests {
     /// child ticket is ready for implementation and which are blocked.
     #[test]
     fn ticket_creation_outcome_wires_blocker_links() {
-        let p = render_prompt(RunKind::Plan, &detail(vec![], vec![]), None, 999, "http://api");
+        let p = render_prompt(RunKind::Plan, &detail(vec![], vec![]), None, 999, "http://api", &[]);
         assert!(p.contains("which ticket blocks which"), "{p}");
 
         for kind in [RunKind::Plan, RunKind::Implement] {
-            let p = render_prompt(kind, &detail(vec![], vec![]), None, 999, "http://api");
+            let p = render_prompt(kind, &detail(vec![], vec![]), None, 999, "http://api", &[]);
             assert!(p.contains("`add_link`"), "{kind:?}: {p}");
             assert!(p.contains("ready for implementation"), "{kind:?}: {p}");
         }
-        let p = render_prompt(RunKind::Implement, &detail(vec![], vec![]), None, 999, "http://api");
+        let p = render_prompt(
+            RunKind::Implement,
+            &detail(vec![], vec![]),
+            None,
+            999,
+            "http://api",
+            &[],
+        );
         assert!(p.contains("relation `blocks`"), "{p}");
         assert!(p.contains("`blocked_by`"), "{p}");
+    }
+
+    /// The `.refs/` block (docs/specs/cross-repo-projects.md): with reference
+    /// repos configured, both prompts name the mounts and forbid changes in
+    /// them (they land in no PR); changes in a reference repo are a separate
+    /// ticket of that repo's project.
+    #[test]
+    fn refs_block_marks_reference_repos_read_only() {
+        let refs = vec!["contracts".to_string(), "backend".to_string()];
+        for kind in [RunKind::Plan, RunKind::Implement] {
+            let p = render_prompt(kind, &detail(vec![], vec![]), None, 999, "http://api", &refs);
+            assert!(p.contains("## Reference repositories"), "{kind:?}: {p}");
+            assert!(p.contains("`.refs/contracts`"), "{kind:?}: {p}");
+            assert!(p.contains("`.refs/backend`"), "{kind:?}: {p}");
+            assert!(
+                p.contains("never create, edit, or delete anything in them"),
+                "{kind:?}: {p}"
+            );
+            assert!(p.contains("land in no PR"), "{kind:?}: {p}");
+            assert!(
+                p.contains("a separate ticket in that repository's project"),
+                "{kind:?}: {p}"
+            );
+        }
+    }
+
+    /// The cross-repo splitting convention rides the plan prompt only: a
+    /// multi-repo task is a chain of per-repo tickets linked with `blocks`
+    /// (contract → consumer → pin-bump), each holistic and self-contained,
+    /// and the agent never creates cross-project tickets itself.
+    #[test]
+    fn refs_block_carries_cross_repo_splitting_convention_in_plan_only() {
+        let refs = vec!["contracts".to_string()];
+        let p = render_prompt(RunKind::Plan, &detail(vec![], vec![]), None, 999, "http://api", &refs);
+        assert!(p.contains("Cross-repo splitting convention"), "{p}");
+        assert!(p.contains("linked with `blocks`"), "{p}");
+        assert!(p.contains("contract/API in the provider repo"), "{p}");
+        assert!(p.contains("consumer repo"), "{p}");
+        assert!(p.contains("pin-bump"), "{p}");
+        assert!(p.contains("self-contained"), "{p}");
+        assert!(p.contains("Never create cross-project tickets yourself"), "{p}");
+
+        let p = render_prompt(
+            RunKind::Implement,
+            &detail(vec![], vec![]),
+            None,
+            999,
+            "http://api",
+            &refs,
+        );
+        assert!(!p.contains("Cross-repo splitting convention"), "{p}");
+    }
+
+    /// No configured reference repos → no `.refs/` block at all: projects
+    /// without refs see the same prompts as before the feature.
+    #[test]
+    fn refs_block_absent_without_configured_refs() {
+        for kind in [RunKind::Plan, RunKind::Implement] {
+            let p = render_prompt(kind, &detail(vec![], vec![]), None, 999, "http://api", &[]);
+            assert!(!p.contains("## Reference repositories"), "{kind:?}: {p}");
+            assert!(!p.contains(".refs/"), "{kind:?}: {p}");
+        }
     }
 
     fn comment(id: i32, body: String) -> CommentDto {
@@ -2114,7 +2262,14 @@ mod tests {
     /// branch name and PR title derive from), then the full description body.
     #[test]
     fn ticket_section_leads_with_title() {
-        let p = render_prompt(RunKind::Implement, &detail(vec![], vec![]), None, 999, "http://api");
+        let p = render_prompt(
+            RunKind::Implement,
+            &detail(vec![], vec![]),
+            None,
+            999,
+            "http://api",
+            &[],
+        );
         assert!(
             p.starts_with("## Ticket\nTicket #1\n\nticket title\n\nticket\n\n"),
             "{p}"
@@ -2126,7 +2281,7 @@ mod tests {
     #[test]
     fn language_section_is_in_both_prompts() {
         for kind in [RunKind::Plan, RunKind::Implement] {
-            let p = render_prompt(kind, &detail(vec![], vec![]), None, 999, "http://api");
+            let p = render_prompt(kind, &detail(vec![], vec![]), None, 999, "http://api", &[]);
             assert!(p.contains("## Language\n"), "{kind:?}: {p}");
             assert!(p.contains("Think and reason in English"), "{kind:?}: {p}");
             assert!(p.contains("ticket's language"), "{kind:?}: {p}");
@@ -2140,7 +2295,7 @@ mod tests {
     #[test]
     fn no_pending_background_tasks_rule_is_in_both_prompts() {
         for kind in [RunKind::Plan, RunKind::Implement] {
-            let p = render_prompt(kind, &detail(vec![], vec![]), None, 999, "http://api");
+            let p = render_prompt(kind, &detail(vec![], vec![]), None, 999, "http://api", &[]);
             assert!(
                 p.contains("Never end your turn with background tasks still running"),
                 "{kind:?}: {p}"
@@ -2152,7 +2307,14 @@ mod tests {
     /// `set_task_report` MCP tool; plan runs stay read-only (no report write).
     #[test]
     fn task_report_section_is_implement_only() {
-        let p = render_prompt(RunKind::Implement, &detail(vec![], vec![]), None, 999, "http://api");
+        let p = render_prompt(
+            RunKind::Implement,
+            &detail(vec![], vec![]),
+            None,
+            999,
+            "http://api",
+            &[],
+        );
         assert!(p.contains("## Task report\n"), "{p}");
         assert!(p.contains("`set_task_report`"), "{p}");
         // Report artifacts attach to the outcome, not the task.
@@ -2163,7 +2325,7 @@ mod tests {
         assert!(p.contains("\"Problems with tools\" bullet list"), "{p}");
         assert!(p.contains("omit the section entirely if there were none"), "{p}");
 
-        let p = render_prompt(RunKind::Plan, &detail(vec![], vec![]), None, 999, "http://api");
+        let p = render_prompt(RunKind::Plan, &detail(vec![], vec![]), None, 999, "http://api", &[]);
         assert!(!p.contains("## Task report"), "{p}");
         assert!(!p.contains("set_task_report"), "{p}");
         assert!(!p.contains("Problems with tools"), "{p}");
@@ -2177,7 +2339,14 @@ mod tests {
         let comments: Vec<_> = (1..=(MAX_CONVERSATION_COMMENTS as i32 + 10))
             .map(|i| comment(i, format!("note {i}")))
             .collect();
-        let p = render_prompt(RunKind::Implement, &detail(comments, vec![]), None, 999, "http://api");
+        let p = render_prompt(
+            RunKind::Implement,
+            &detail(comments, vec![]),
+            None,
+            999,
+            "http://api",
+            &[],
+        );
         assert!(p.contains("earlier comment(s) omitted"), "{p}");
         assert!(!p.contains("- note 1\n"), "oldest comments must be dropped: {p}");
         assert!(
@@ -2189,7 +2358,14 @@ mod tests {
     #[test]
     fn short_thread_is_not_marked_truncated() {
         let comments = vec![comment(1, "hello".to_string())];
-        let p = render_prompt(RunKind::Implement, &detail(comments, vec![]), None, 999, "http://api");
+        let p = render_prompt(
+            RunKind::Implement,
+            &detail(comments, vec![]),
+            None,
+            999,
+            "http://api",
+            &[],
+        );
         assert!(p.contains("- hello\n"));
         assert!(!p.contains("omitted"), "{p}");
     }
@@ -2197,7 +2373,14 @@ mod tests {
     #[test]
     fn long_comment_body_is_truncated() {
         let comments = vec![comment(1, "x".repeat(10 * 1024))];
-        let p = render_prompt(RunKind::Implement, &detail(comments, vec![]), None, 999, "http://api");
+        let p = render_prompt(
+            RunKind::Implement,
+            &detail(comments, vec![]),
+            None,
+            999,
+            "http://api",
+            &[],
+        );
         assert!(p.contains("… [truncated, 10240 bytes total]"), "{p}");
         // The new per-comment cap is 8 KiB, so the prefix kept in the prompt is
         // larger than the old 2 KiB limit.
@@ -2213,7 +2396,14 @@ mod tests {
         let comments: Vec<_> = (1..=10)
             .map(|i| comment(i, format!("comment {i}\n{}", "x".repeat(8 * 1024))))
             .collect();
-        let p = render_prompt(RunKind::Implement, &detail(comments, vec![]), None, 999, "http://api");
+        let p = render_prompt(
+            RunKind::Implement,
+            &detail(comments, vec![]),
+            None,
+            999,
+            "http://api",
+            &[],
+        );
         assert!(p.contains("earlier comment(s) omitted"), "{p}");
         assert!(
             !p.contains("- comment 1\n"),
@@ -2232,7 +2422,7 @@ mod tests {
     #[test]
     fn prior_run_error_is_truncated() {
         let runs = vec![run_row(5, "implement", "failed", None, Some("e".repeat(50 * 1024)))];
-        let p = render_prompt(RunKind::Implement, &detail(vec![], runs), None, 999, "http://api");
+        let p = render_prompt(RunKind::Implement, &detail(vec![], runs), None, 999, "http://api", &[]);
         assert!(p.contains("error: "));
         assert!(p.contains("… [truncated, 51200 bytes total]"), "{p}");
         assert!(!p.contains(&"e".repeat(MAX_PRIOR_OUTCOME_BYTES + 1)), "{p}");
@@ -2379,6 +2569,7 @@ mod tests {
             None,
             999,
             "http://api",
+            &[],
         );
         assert!(p.contains("- [x] #1: done"), "{p}");
         assert!(
@@ -2400,7 +2591,14 @@ mod tests {
             a,
             action_item(3, "todo", "inactive"),
         ];
-        let p = render_prompt(RunKind::Plan, &detail_with_actions(actions), None, 999, "http://api");
+        let p = render_prompt(
+            RunKind::Plan,
+            &detail_with_actions(actions),
+            None,
+            999,
+            "http://api",
+            &[],
+        );
         assert!(p.contains("- [x] #1: done"), "{p}");
         assert!(p.contains("- [~] #2: dropped (rejected: no longer needed)"), "{p}");
         assert!(p.contains("- [ ] #3: todo"), "{p}");
@@ -2441,7 +2639,7 @@ mod tests {
             },
         ]);
         for kind in [RunKind::Plan, RunKind::Implement] {
-            let p = render_prompt(kind, &d, None, 999, "http://api");
+            let p = render_prompt(kind, &d, None, 999, "http://api", &[]);
             assert!(p.contains("## Open questions\n"), "{kind:?}: {p}");
             assert!(
                 p.contains("- #5 [answered] Which storage backend? (single-choice)"),
@@ -2451,12 +2649,19 @@ mod tests {
             assert!(p.contains("answer: S3 it is"), "{kind:?}: {p}");
             assert!(p.contains("- #6 [open] Anything else? (multi-choice)"), "{kind:?}: {p}");
         }
-        let p = render_prompt(RunKind::Implement, &d, None, 999, "http://api");
+        let p = render_prompt(RunKind::Implement, &d, None, 999, "http://api", &[]);
         assert!(p.contains("`delete_task_question`"), "{p}");
-        let p = render_prompt(RunKind::Plan, &d, None, 999, "http://api");
+        let p = render_prompt(RunKind::Plan, &d, None, 999, "http://api", &[]);
         assert!(p.contains("`add_task_question`"), "{p}");
         // No questions → no section at all.
-        let p = render_prompt(RunKind::Implement, &detail(vec![], vec![]), None, 999, "http://api");
+        let p = render_prompt(
+            RunKind::Implement,
+            &detail(vec![], vec![]),
+            None,
+            999,
+            "http://api",
+            &[],
+        );
         assert!(!p.contains("## Open questions"), "{p}");
     }
 
@@ -2490,7 +2695,14 @@ mod tests {
     /// the final-state requirement.
     #[test]
     fn implement_instructions_mention_action_choreography() {
-        let p = render_prompt(RunKind::Implement, &detail(vec![], vec![]), None, 999, "http://api");
+        let p = render_prompt(
+            RunKind::Implement,
+            &detail(vec![], vec![]),
+            None,
+            999,
+            "http://api",
+            &[],
+        );
         assert!(p.contains("start_action"), "{p}");
         assert!(p.contains("complete_action"), "{p}");
         assert!(p.contains("reject_action"), "{p}");
@@ -2639,6 +2851,7 @@ kind = "stub"
                 repo_url: "https://forge.example/proj.git".into(),
                 base_branch: None,
                 staging_auto_start: false,
+                reference_repos: vec![],
             },
             kind: RunKind::Implement,
             port_block: Some(crate::ports::Ports::default().allocate().unwrap()),

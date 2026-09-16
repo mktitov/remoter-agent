@@ -4,11 +4,15 @@
 //! ```text
 //! <workspace_root>/
 //!   p<project_id>/
-//!     repo/            # full clone (worktree source)      — PoC-4
-//!     wt-<task_id>/    # per-ticket worktree + branch       — PoC-4
+//!     repo/                      # full clone (worktree source)       — PoC-4
+//!     wt-<task_id>/              # per-ticket worktree + branch       — PoC-4
+//!     refs/<mount>/repo/         # shared clone of a reference repo   — #169
+//!     refs/<mount>/wt-<task_id>/ # detached ref worktree of a ticket  — #169
 //! ```
 
 use std::path::{Path, PathBuf};
+
+use crate::client::ReferenceRepo;
 
 /// `<workspace_root>/p<project_id>`
 pub fn project_dir(root: &Path, project_id: i32) -> PathBuf {
@@ -24,6 +28,23 @@ pub fn repo_dir(root: &Path, project_id: i32) -> PathBuf {
 /// agent works in.
 pub fn worktree_dir(root: &Path, project_id: i32, task_id: i32) -> PathBuf {
     project_dir(root, project_id).join(format!("wt-{task_id}"))
+}
+
+/// `<workspace_root>/p<project_id>/refs/<mount>/repo` — the shared clone of one
+/// project reference repo (docs/specs/cross-repo-projects.md). Cloned once,
+/// re-fetched on every prepare, kept by cleanup.
+pub fn refs_repo_dir(root: &Path, project_id: i32, mount: &str) -> PathBuf {
+    project_dir(root, project_id).join("refs").join(mount).join("repo")
+}
+
+/// `<workspace_root>/p<project_id>/refs/<mount>/wt-<task_id>` — the per-ticket
+/// detached worktree of a reference repo, surfaced inside the ticket worktree
+/// as `.refs/<mount>`.
+pub fn refs_worktree_dir(root: &Path, project_id: i32, mount: &str, task_id: i32) -> PathBuf {
+    project_dir(root, project_id)
+        .join("refs")
+        .join(mount)
+        .join(format!("wt-{task_id}"))
 }
 
 /// `agent/task-<id>-<slug>` — one branch per ticket attempt (spec §5.4). The
@@ -194,6 +215,252 @@ pub async fn prepare_with_stack(
     })
 }
 
+// ── reference repos (docs/specs/cross-repo-projects.md, #169) ────────────────
+
+/// One reference repo mounted for a ticket run.
+#[derive(Debug, Clone)]
+pub struct RefMount {
+    /// The mount name — surfaced as `.refs/<mount_name>` in the ticket
+    /// worktree (symlink in host mode, read-only bind mount in container mode).
+    pub mount_name: String,
+    /// `refs/<mount>/wt-<task_id>` — the per-ticket detached worktree.
+    pub worktree: PathBuf,
+    /// `refs/<mount>/repo` — the shared ref clone. Container mode also mounts
+    /// its `.git` (at the same absolute path, like the main repo's) so git
+    /// commands work inside `/work/.refs/<mount_name>`.
+    pub repo: PathBuf,
+}
+
+/// The result of [`prepare_reference_repos`] — fail-open: an unavailable ref
+/// (network down, no keys, bad config) never fails the run; it lands in
+/// `failed` for a warning log + ticket-thread note and the run continues
+/// without that ref.
+#[derive(Debug, Default)]
+pub struct RefsOutcome {
+    pub mounted: Vec<RefMount>,
+    /// `(mount_name, error)` per ref that could not be prepared.
+    pub failed: Vec<(String, String)>,
+}
+
+/// Prepares the project's reference repos for one ticket run, mirroring the
+/// [`prepare_with_stack`] lifecycle per ref:
+/// - clone `<repo_url>` into `refs/<mount>/repo` on first use (with the same
+///   clone-race tolerance as the main repo), repoint `origin` on every later
+///   use;
+/// - always `fetch origin <base_branch>` (or bare `fetch origin` when the ref
+///   has no base branch) so ref worktrees branch off fresh upstream state;
+/// - `git worktree add refs/<mount>/wt-<task_id> --detach origin/<base>`
+///   (`origin/HEAD` when no base branch). Detached, always: the daemon never
+///   creates branches in — and never pushes to — a reference repo. An
+///   existing ref worktree is reused as-is (the fetch above already refreshed
+///   the clone; re-pointing a live worktree mid-ticket would confuse a run
+///   that already read it).
+///
+/// When at least one ref mounted, `.refs/` is appended to the ticket
+/// worktree's `info/exclude` so the mounts never dirty `git status
+/// --porcelain` (the commit guard must stay clean). Per-ref failures are
+/// collected in [`RefsOutcome::failed`], never returned.
+pub async fn prepare_reference_repos(
+    root: &Path,
+    project_id: i32,
+    task_id: i32,
+    ticket_worktree: &Path,
+    refs: &[ReferenceRepo],
+) -> RefsOutcome {
+    let mut outcome = RefsOutcome::default();
+    for r in refs {
+        match prepare_reference_repo(root, project_id, task_id, r).await {
+            Ok(mount) => outcome.mounted.push(mount),
+            Err(e) => {
+                tracing::warn!(
+                    mount = %r.mount_name,
+                    error = %e,
+                    "reference repo unavailable; continuing without it"
+                );
+                outcome.failed.push((r.mount_name.clone(), e.to_string()));
+            }
+        }
+    }
+    if !outcome.mounted.is_empty()
+        && let Err(e) = exclude_refs_dir(ticket_worktree).await
+    {
+        tracing::warn!(
+            dir = ?ticket_worktree,
+            error = %e,
+            "could not add .refs/ to git info/exclude — the commit guard may flag the ref mounts"
+        );
+    }
+    outcome
+}
+
+async fn prepare_reference_repo(
+    root: &Path,
+    project_id: i32,
+    task_id: i32,
+    r: &ReferenceRepo,
+) -> Result<RefMount, WorkspaceError> {
+    // The mount name becomes a path segment — refuse anything that could
+    // escape `refs/` (it comes from project settings, but defense in depth).
+    let name = r.mount_name.trim();
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        return Err(WorkspaceError(format!("invalid mount name {:?}", r.mount_name)));
+    }
+    let repo = refs_repo_dir(root, project_id, name);
+    let wt = refs_worktree_dir(root, project_id, name, task_id);
+
+    if !repo.exists() {
+        if let Some(parent) = repo.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| WorkspaceError(format!("mkdir {parent:?}: {e}")))?;
+        }
+        // Same clone-race tolerance as `prepare_with_stack`: two parallel
+        // tickets of one project race this clone; the loser's failure is a
+        // win as long as the clone is really there.
+        if let Err(e) = git(root, &["clone", &r.repo_url, &repo.to_string_lossy()]).await {
+            if !repo.exists() {
+                return Err(e);
+            }
+            tracing::info!(repo = ?repo, "clone race lost; using the winner's clone");
+        }
+    } else {
+        // The ref clone outlives the project's reference-repo settings:
+        // repoint origin every prepare so an edited URL stops the daemon
+        // fetching from the stale remote.
+        git(&repo, &["remote", "set-url", "origin", &r.repo_url]).await?;
+    }
+
+    let start_point = match r.base_branch.as_deref() {
+        Some(b) => {
+            git(&repo, &["fetch", "origin", b]).await?;
+            format!("origin/{b}")
+        }
+        None => {
+            git(&repo, &["fetch", "origin"]).await?;
+            "origin/HEAD".to_string()
+        }
+    };
+
+    if !wt.exists() {
+        git(
+            &repo,
+            &["worktree", "add", &wt.to_string_lossy(), "--detach", &start_point],
+        )
+        .await?;
+    }
+
+    Ok(RefMount {
+        mount_name: name.to_string(),
+        worktree: wt,
+        repo,
+    })
+}
+
+/// Appends `.refs/` to the worktree's `info/exclude` (idempotent). Resolved
+/// via `git rev-parse --git-path` so linked worktrees get the right shared
+/// location.
+async fn exclude_refs_dir(worktree: &Path) -> Result<(), WorkspaceError> {
+    let path = git_output(worktree, &["rev-parse", "--git-path", "info/exclude"]).await?;
+    let path = {
+        let p = PathBuf::from(&path);
+        if p.is_absolute() { p } else { worktree.join(p) }
+    };
+    let mut content = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| WorkspaceError(format!("read {path:?}: {e}")))?;
+    if content.lines().any(|l| l.trim() == ".refs/") {
+        return Ok(());
+    }
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(".refs/\n");
+    tokio::fs::write(&path, content)
+        .await
+        .map_err(|e| WorkspaceError(format!("write {path:?}: {e}")))
+}
+
+/// Host mode: expose each mounted ref inside the ticket worktree as a
+/// `.refs/<mount_name>` symlink to the ref worktree. Idempotent (an existing
+/// symlink is replaced — the ref worktree path never changes for a ticket,
+/// but a stale link must not block a re-run). Fail-open per ref, like
+/// [`prepare_reference_repos`]: returns `(mount_name, error)` for the caller
+/// to note. Container mode does not call this — refs appear via bind mounts.
+pub async fn link_refs_into(worktree: &Path, mounted: &[RefMount]) -> Vec<(String, String)> {
+    let mut failed = Vec::new();
+    if mounted.is_empty() {
+        return failed;
+    }
+    let refs_dir = worktree.join(".refs");
+    if let Err(e) = tokio::fs::create_dir_all(&refs_dir).await {
+        let e = format!("mkdir {refs_dir:?}: {e}");
+        return mounted.iter().map(|m| (m.mount_name.clone(), e.clone())).collect();
+    }
+    for m in mounted {
+        let link = refs_dir.join(&m.mount_name);
+        if let Err(e) = symlink_ref(&m.worktree, &link) {
+            tracing::warn!(link = ?link, error = %e, "could not symlink reference repo into the worktree");
+            failed.push((m.mount_name.clone(), e.to_string()));
+        }
+    }
+    failed
+}
+
+#[cfg(unix)]
+fn symlink_ref(target: &Path, link: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(link) {
+        Ok(md) if md.file_type().is_symlink() => std::fs::remove_file(link)?,
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("{link:?} exists and is not a symlink"),
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    std::os::unix::fs::symlink(target, link)
+}
+
+/// Removes this ticket's reference-repo worktrees (`refs/*/wt-<task_id>`),
+/// best-effort per ref — the housekeeping twin of [`cleanup`]'s worktree
+/// removal. Enumerates the `refs/` directory rather than the project config:
+/// a ref removed from the settings since the run must still be cleaned up.
+/// The shared `refs/<mount>/repo` clones stay — they are reused across
+/// tickets.
+async fn cleanup_reference_worktrees(root: &Path, project_id: i32, task_id: i32) {
+    let refs_root = project_dir(root, project_id).join("refs");
+    let mounts = match std::fs::read_dir(&refs_root) {
+        Ok(mounts) => mounts,
+        Err(_) => return, // no refs ever mounted (or the project dir is gone)
+    };
+    for mount in mounts.flatten() {
+        let wt = mount.path().join(format!("wt-{task_id}"));
+        if !wt.exists() {
+            continue;
+        }
+        let repo = mount.path().join("repo");
+        let removed = repo.exists()
+            && git(&repo, &["worktree", "remove", "--force", &wt.to_string_lossy()])
+                .await
+                .is_ok();
+        if !removed {
+            // Same stale-leftover rule as the main cleanup: a dir that
+            // outlived its worktree registration is deleted directly.
+            if repo.exists()
+                && let Err(e) = git(&repo, &["worktree", "prune"]).await
+            {
+                tracing::debug!(error = %e, "ref worktree prune failed");
+            }
+            if wt.exists()
+                && let Err(e) = tokio::fs::remove_dir_all(&wt).await
+            {
+                tracing::warn!(dir = ?wt, error = %e, "ref worktree removal failed; will retry on the next poll");
+            }
+        }
+    }
+}
+
 /// Removes the ticket worktree and its branch (after the human accepts the
 /// work). The branch name comes from the run row (recorded at finish time), not
 /// recomputed from the title — a ticket renamed mid-flight would
@@ -227,6 +494,9 @@ pub async fn cleanup(
     branch: &str,
     keep_branch: bool,
 ) -> Result<(), WorkspaceError> {
+    // The ticket's reference-repo worktrees go with it (same housekeeping
+    // rules); the shared refs clones stay for reuse (#169).
+    cleanup_reference_worktrees(root, project_id, task_id).await;
     let repo = repo_dir(root, project_id);
     let wt = worktree_dir(root, project_id, task_id);
     if repo.exists() {
@@ -2305,5 +2575,189 @@ mod tests {
             "{calls:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── reference repos (#169) ───────────────────────────────────────────
+
+    fn reference_repo(url: &Path, base_branch: Option<&str>, mount: &str) -> ReferenceRepo {
+        ReferenceRepo {
+            repo_url: url.to_string_lossy().to_string(),
+            base_branch: base_branch.map(str::to_string),
+            mount_name: mount.to_string(),
+        }
+    }
+
+    /// A bare repo's default branch (`HEAD` symref) — `master`/`main` depends
+    /// on the environment's git, so tests must not hardcode either.
+    fn bare_default_branch(bare: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(bare)
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Refs mount into the ticket worktree as `.refs/<mount>` symlinks (host
+    /// mode), `info/exclude` keeps `git status --porcelain` clean (the commit
+    /// guard), the ref worktree is detached, and an unavailable remote is
+    /// fail-open — it lands in `failed` while the rest still mount.
+    #[tokio::test]
+    async fn reference_repos_mount_detached_and_fail_open() {
+        let base = scratch("refs-mount");
+        let origin = make_bare_repo(&base, "origin");
+        let ref_a = make_bare_repo(&base, "refa");
+        let ref_b = make_bare_repo(&base, "refb");
+        let ws = base.join("ws");
+        let prepared = prepare(&ws, 7, 42, "ticket work", &origin.to_string_lossy(), None)
+            .await
+            .unwrap();
+
+        let refs = vec![
+            reference_repo(&ref_a, None, "refa"),
+            reference_repo(&ref_b, Some(&bare_default_branch(&ref_b)), "refb"),
+            // Unreachable remote: fail-open, the other refs still mount.
+            reference_repo(&base.join("gone.git"), None, "gone"),
+        ];
+        let outcome = prepare_reference_repos(&ws, 7, 42, &prepared.dir, &refs).await;
+        assert_eq!(outcome.failed.len(), 1);
+        assert_eq!(outcome.failed[0].0, "gone");
+        assert_eq!(outcome.mounted.len(), 2);
+
+        // The ref worktree carries the base-branch tip's content, detached.
+        let wt_a = refs_worktree_dir(&ws, 7, "refa", 42);
+        assert_eq!(std::fs::read_to_string(wt_a.join("README.md")).unwrap(), "refa");
+        assert!(
+            worktree_branch(&wt_a).await.is_err(),
+            "ref worktree must be detached — the daemon never branches in a reference repo"
+        );
+
+        // Host mode: `.refs/<mount>` symlinks into the ticket worktree.
+        let failed = link_refs_into(&prepared.dir, &outcome.mounted).await;
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(
+            std::fs::read_to_string(prepared.dir.join(".refs/refa/README.md")).unwrap(),
+            "refa"
+        );
+        assert_eq!(
+            std::fs::read_link(prepared.dir.join(".refs/refb")).unwrap(),
+            refs_worktree_dir(&ws, 7, "refb", 42)
+        );
+
+        // `.refs/` is excluded: the commit guard's status stays clean.
+        let exclude = git_output(&prepared.dir, &["rev-parse", "--git-path", "info/exclude"])
+            .await
+            .unwrap();
+        let exclude = prepared.dir.join(exclude);
+        let content = std::fs::read_to_string(exclude).unwrap();
+        assert!(content.lines().any(|l| l.trim() == ".refs/"), "{content}");
+        assert_eq!(
+            dirty_status(&prepared.dir).await.unwrap(),
+            "",
+            "ref mounts must not dirty the ticket worktree"
+        );
+
+        // Idempotent re-run: no duplicate exclude line, links still fine.
+        let outcome = prepare_reference_repos(&ws, 7, 42, &prepared.dir, &refs[..2]).await;
+        assert_eq!(outcome.mounted.len(), 2);
+        assert!(outcome.failed.is_empty());
+        let failed = link_refs_into(&prepared.dir, &outcome.mounted).await;
+        assert!(failed.is_empty(), "{failed:?}");
+        let content = std::fs::read_to_string(
+            prepared.dir.join(
+                git_output(&prepared.dir, &["rev-parse", "--git-path", "info/exclude"])
+                    .await
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(content.lines().filter(|l| l.trim() == ".refs/").count(), 1);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A repeated prepare reuses the shared refs clone and fetches the new
+    /// upstream base: a *new* ticket's ref worktree branches off the new tip
+    /// (an existing ticket's ref worktree is reused as-is).
+    #[tokio::test]
+    async fn reference_repos_reprepare_fetches_new_base() {
+        let base = scratch("refs-refresh");
+        let origin = make_bare_repo(&base, "origin");
+        let ref_a = make_bare_repo(&base, "refa");
+        let ws = base.join("ws");
+        let prepared = prepare(&ws, 7, 42, "ticket work", &origin.to_string_lossy(), None)
+            .await
+            .unwrap();
+        let refs = vec![reference_repo(&ref_a, None, "refa")];
+
+        let outcome = prepare_reference_repos(&ws, 7, 42, &prepared.dir, &refs).await;
+        assert_eq!(outcome.mounted.len(), 1);
+        assert!(outcome.failed.is_empty());
+        let clone = refs_repo_dir(&ws, 7, "refa");
+        assert!(clone.exists());
+
+        // Advance the upstream base branch.
+        let branch = bare_default_branch(&ref_a);
+        let src = base.join("refa-src");
+        std::fs::write(src.join("NEW.md"), "new").unwrap();
+        sh(&src, "git", &["add", "."]);
+        sh(
+            &src,
+            "git",
+            &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "new"],
+        );
+        sh(&src, "git", &["push", &ref_a.to_string_lossy(), &branch]);
+
+        // Same ticket: the existing ref worktree is reused as-is…
+        let outcome = prepare_reference_repos(&ws, 7, 42, &prepared.dir, &refs).await;
+        assert_eq!(outcome.mounted.len(), 1);
+        assert!(!refs_worktree_dir(&ws, 7, "refa", 42).join("NEW.md").exists());
+        // …but the clone did fetch the new tip.
+        let tip = git_output(&clone, &["rev-parse", &format!("origin/{branch}")])
+            .await
+            .unwrap();
+        let src_tip = git_output(&src, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_eq!(tip, src_tip);
+
+        // A new ticket's ref worktree branches off the fresh tip.
+        let prepared_43 = prepare(&ws, 7, 43, "other ticket", &origin.to_string_lossy(), None)
+            .await
+            .unwrap();
+        let outcome = prepare_reference_repos(&ws, 7, 43, &prepared_43.dir, &refs).await;
+        assert_eq!(outcome.mounted.len(), 1);
+        assert!(refs_worktree_dir(&ws, 7, "refa", 43).join("NEW.md").exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `cleanup` removes the ticket's ref worktrees along with its worktree;
+    /// the shared refs clones stay for reuse.
+    #[tokio::test]
+    async fn cleanup_removes_ref_worktrees_keeps_clones() {
+        let base = scratch("refs-cleanup");
+        let origin = make_bare_repo(&base, "origin");
+        let ref_a = make_bare_repo(&base, "refa");
+        let ws = base.join("ws");
+        let prepared = prepare(&ws, 7, 42, "ticket work", &origin.to_string_lossy(), None)
+            .await
+            .unwrap();
+        let refs = vec![reference_repo(&ref_a, None, "refa")];
+        let outcome = prepare_reference_repos(&ws, 7, 42, &prepared.dir, &refs).await;
+        assert_eq!(outcome.mounted.len(), 1);
+        let failed = link_refs_into(&prepared.dir, &outcome.mounted).await;
+        assert!(failed.is_empty(), "{failed:?}");
+        assert!(refs_worktree_dir(&ws, 7, "refa", 42).exists());
+
+        cleanup(&ws, 7, 42, "agent/task-42-ticket-work", false).await.unwrap();
+
+        assert!(!refs_worktree_dir(&ws, 7, "refa", 42).exists());
+        assert!(
+            refs_repo_dir(&ws, 7, "refa").exists(),
+            "the shared refs clone is reused"
+        );
+        assert!(!worktree_dir(&ws, 7, 42).exists());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

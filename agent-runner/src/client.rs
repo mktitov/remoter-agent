@@ -72,6 +72,19 @@ pub struct WhoAmI {
     pub workspaces: Vec<WorkspaceMembership>,
 }
 
+/// One reference repo of a project (`project_reference_repos` row,
+/// docs/specs/cross-repo-projects.md): a dependent repository the daemon
+/// mounts read-only into every ticket worktree as `.refs/<mount_name>`.
+/// Embedded in `ProjectDto` (snake_case, like the rest of the `Project`
+/// entity). NULL `base_branch` = the remote's default branch.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReferenceRepoDto {
+    pub repo_url: String,
+    #[serde(default)]
+    pub base_branch: Option<String>,
+    pub mount_name: String,
+}
+
 /// A project row from `GET /projects` (snake_case — the backend serializes the
 /// `Project` entity as-is). Only the fields the daemon needs; the rest are
 /// ignored by serde.
@@ -82,6 +95,21 @@ pub struct ProjectDto {
     pub base_branch: Option<String>,
     #[serde(default)]
     pub staging_auto_start: bool,
+    /// Absent on backends older than the reference-repos rollout — serde
+    /// default keeps the daemon working against them (additive deploy).
+    #[serde(default)]
+    pub reference_repos: Vec<ReferenceRepoDto>,
+}
+
+/// A validated reference repo (the daemon's domain view of
+/// [`ReferenceRepoDto`]) — entries with a blank `repo_url`/`mount_name` are
+/// dropped at the DTO boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceRepo {
+    pub repo_url: String,
+    /// `None` = remote default branch (HEAD).
+    pub base_branch: Option<String>,
+    pub mount_name: String,
 }
 
 /// The daemon's view of one agent-managed project's repo config (spec §4.4),
@@ -93,6 +121,9 @@ pub struct ProjectRepoConfig {
     /// `None` = remote default branch (HEAD).
     pub base_branch: Option<String>,
     pub staging_auto_start: bool,
+    /// Reference repos mounted read-only into every ticket worktree
+    /// (docs/specs/cross-repo-projects.md).
+    pub reference_repos: Vec<ReferenceRepo>,
 }
 
 impl ProjectRepoConfig {
@@ -100,11 +131,22 @@ impl ProjectRepoConfig {
     /// `repo_url` is treated as missing too — the backend normalizes blank to
     /// NULL on write, this keeps the invariant local to the daemon as well.
     pub fn from_dto(dto: ProjectDto) -> Option<Self> {
+        let reference_repos = dto
+            .reference_repos
+            .into_iter()
+            .filter(|r| !r.repo_url.trim().is_empty() && !r.mount_name.trim().is_empty())
+            .map(|r| ReferenceRepo {
+                repo_url: r.repo_url,
+                base_branch: r.base_branch,
+                mount_name: r.mount_name,
+            })
+            .collect();
         dto.repo_url.filter(|u| !u.trim().is_empty()).map(|repo_url| Self {
             project_id: dto.id,
             repo_url,
             base_branch: dto.base_branch,
             staging_auto_start: dto.staging_auto_start,
+            reference_repos,
         })
     }
 }
@@ -648,6 +690,58 @@ impl RemoterClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `reference_repos` defaults to an empty list when absent — an older
+    /// backend that does not send the field yet must keep the daemon working
+    /// exactly as before (additive deploy, docs/specs/cross-repo-projects.md).
+    #[test]
+    fn project_dto_without_reference_repos_decodes_as_empty() {
+        let json = serde_json::json!({
+            "id": 1,
+            "repo_url": "https://forge.example/proj.git",
+            "base_branch": "master",
+            "staging_auto_start": false
+        });
+        let dto: ProjectDto = serde_json::from_value(json).expect("ProjectDto decodes");
+        let cfg = ProjectRepoConfig::from_dto(dto).expect("agent-managed project");
+        assert!(cfg.reference_repos.is_empty());
+    }
+
+    /// Present `reference_repos` map into the domain config; entries with a
+    /// blank `repo_url`/`mount_name` are dropped (same blank-is-missing rule
+    /// as the project's own `repo_url`).
+    #[test]
+    fn project_dto_reference_repos_mapped_and_blank_filtered() {
+        let json = serde_json::json!({
+            "id": 1,
+            "repo_url": "https://forge.example/proj.git",
+            "base_branch": null,
+            "staging_auto_start": false,
+            "reference_repos": [
+                { "repo_url": "https://forge.example/contracts.git", "base_branch": null, "mount_name": "contracts" },
+                { "repo_url": "https://forge.example/backend.git", "base_branch": "main", "mount_name": "backend" },
+                { "repo_url": "  ", "base_branch": null, "mount_name": "blank-url" },
+                { "repo_url": "https://forge.example/x.git", "base_branch": null, "mount_name": "" }
+            ]
+        });
+        let dto: ProjectDto = serde_json::from_value(json).expect("ProjectDto decodes");
+        let cfg = ProjectRepoConfig::from_dto(dto).expect("agent-managed project");
+        assert_eq!(
+            cfg.reference_repos,
+            vec![
+                ReferenceRepo {
+                    repo_url: "https://forge.example/contracts.git".to_string(),
+                    base_branch: None,
+                    mount_name: "contracts".to_string(),
+                },
+                ReferenceRepo {
+                    repo_url: "https://forge.example/backend.git".to_string(),
+                    base_branch: Some("main".to_string()),
+                    mount_name: "backend".to_string(),
+                },
+            ]
+        );
+    }
 
     /// Regression: the backend serializes embedded links as the camelCase
     /// `TaskLinkRef` read-model (`taskId`/`createdBy`), not the snake_case
