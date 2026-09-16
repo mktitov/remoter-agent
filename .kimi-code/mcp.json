@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "remoter": {
+      "command": "remoter-mcp"
+    }
+  }
+}
