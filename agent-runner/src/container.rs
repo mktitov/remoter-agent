@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use crate::config::ExecutionConfig;
 use crate::driver::DriverError;
+use crate::workspace::RefMount;
 
 /// Docker label marking every container a run owns (run + sidecars).
 pub const RUN_ID_LABEL: &str = "remoter.run_id";
@@ -125,6 +126,9 @@ pub struct ContainerSpec<'a> {
     pub agent_home: &'a Path,
     /// Env for the run container (`CI`, `REMOTER_CONTAINER=1`, DB URLs, …).
     pub env: &'a [(String, String)],
+    /// Reference repos prepared for this run (docs/specs/cross-repo-projects.md)
+    /// — each is bind-mounted read-only at `/work/.refs/<mount_name>`.
+    pub refs: &'a [RefMount],
 }
 
 /// The live containers of one run. Teardown is guaranteed: `teardown()` on
@@ -305,6 +309,22 @@ async fn start_inner(
         "-v".to_string(),
         format!("{}:/root", spec.agent_home.display()),
     ];
+    // Reference repos (#169): read-only bind mounts at /work/.refs/<mount> —
+    // the agent must never write to a reference repo (its checkout is
+    // detached and never pushed). The ref clone's `.git` rides at the same
+    // absolute host path (like the main repo's above) so git commands work
+    // inside the mount; read-only as well.
+    for r in spec.refs {
+        args.extend([
+            "-v".to_string(),
+            format!("{}:{WORK_DIR}/.refs/{}:ro", r.worktree.display(), r.mount_name),
+        ]);
+        let ref_git = r.repo.join(".git");
+        args.extend([
+            "-v".to_string(),
+            format!("{}:{}:ro", ref_git.display(), ref_git.display()),
+        ]);
+    }
     #[cfg(target_os = "linux")]
     args.extend([
         "--add-host".to_string(),

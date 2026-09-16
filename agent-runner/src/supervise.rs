@@ -850,6 +850,7 @@ async fn run_attempt(
                 env.cwd,
                 env.devenv,
                 &env_vars,
+                &[],
             )
             .await
             {
