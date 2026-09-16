@@ -48,6 +48,17 @@ cd remoter-agent
 cargo build --release   # binaries in target/release/
 ```
 
+## Development
+
+The repo ships a [devenv](https://devenv.sh) shell with the stable Rust
+toolchain (clippy, rustfmt, rust-analyzer) plus the test prerequisites
+(`git`, `python3`, `openssl`):
+
+```sh
+devenv shell            # or `direnv allow` with direnv installed
+cargo test --workspace  # fmt/clippy/test mirrors CI
+```
+
 ## Runtime prerequisites
 
 The binaries themselves are self-contained; the daemon shells out to these

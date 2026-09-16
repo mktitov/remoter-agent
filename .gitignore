@@ -1,2 +1,6 @@
 /target
 /result*
+
+# devenv
+.devenv*
+devenv.local.nix
