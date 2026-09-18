@@ -1055,10 +1055,12 @@ pub(crate) fn exec_env(config: &Config, run_id: i32, devenv: bool) -> ExecEnv {
 
 /// Container-mode runtime for one driver turn (shared by `attempt_run`, the
 /// rebase-nudge loop, and `supervise::run_attempt`): ensure the project's
-/// agent image, start the run container + sidecars, and run the project's
-/// `just db-up` inside the container (its `REMOTER_CONTAINER=1` branch only
-/// waits for the sidecars). Host mode returns `None` and the caller falls
-/// back to `workspace::services_up`/`services_down`. No silent fallback: a
+/// agent image, start the run container + sidecars, and — when the worktree
+/// carries a justfile — run the project's `just db-up` inside the container
+/// (its `REMOTER_CONTAINER=1` branch only waits for the sidecars; projects
+/// without a justfile have no services to wait for and skip the step). Host
+/// mode returns `None` and the caller falls back to
+/// `workspace::services_up`/`services_down`. No silent fallback: a
 /// container-mode failure propagates as a run failure, never a host run.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_container_runtime(
@@ -1092,14 +1094,29 @@ pub(crate) async fn start_container_runtime(
     })
     .await
     .map_err(|e| RunFailure::new(e, None))?;
-    if devenv {
+    if devenv && worktree_has_justfile(worktree) {
         container_services_up(config, run_id, env).await?;
+    } else if devenv {
+        tracing::info!(run_id, "no justfile in worktree — skipping db-up (no sidecar wait)");
     }
     Ok(Some(containers))
 }
 
+/// Whether the worktree carries a justfile — the `db-up` contract below is
+/// optional: projects without a justfile have no services to wait for (their
+/// tests don't use the sidecars), so the step is skipped for them instead of
+/// dying on `just: command not found` (exit 127) inside the run container.
+fn worktree_has_justfile(worktree: &Path) -> bool {
+    ["justfile", "Justfile", ".justfile"]
+        .iter()
+        .any(|f| worktree.join(f).exists())
+}
+
 /// `just db-up` inside the run container — under `REMOTER_CONTAINER=1` the
 /// justfile only waits for the already-running sidecars (no devenv services).
+/// Called only when the worktree carries a justfile (see
+/// `worktree_has_justfile`); a justfile without a `db-up` recipe stays a hard
+/// error — that signals a broken project contract, not a missing one.
 async fn container_services_up(config: &Config, run_id: i32, env: &[(String, String)]) -> Result<(), RunFailure> {
     let exec = exec_env(config, run_id, true);
     let cmd = workspace::wrap_command(Path::new("/"), &exec, "just", &["db-up"], env);
@@ -2070,6 +2087,21 @@ pub(crate) async fn finish_reporting(client: &RemoterClient, run_id: i32, body: 
 mod tests {
     use super::*;
     use crate::client::{AgentRunDto, CommentDto};
+
+    /// The `db-up` contract is keyed on the worktree carrying a justfile:
+    /// without one the container-mode `just db-up` step is skipped (it would
+    /// die on `just: command not found`, exit 127, inside the run container);
+    /// with one it runs and any failure (e.g. a missing `db-up` recipe) stays
+    /// a hard error.
+    #[test]
+    fn worktree_has_justfile_detects_contract() {
+        let dir = std::env::temp_dir().join(format!("remoter-run-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!worktree_has_justfile(&dir));
+        std::fs::write(dir.join("justfile"), "").unwrap();
+        assert!(worktree_has_justfile(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// The plan prompt must NOT ask for a text "Open questions" section —
     /// open questions are registered as structured questions via
