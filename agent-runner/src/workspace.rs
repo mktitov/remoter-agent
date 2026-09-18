@@ -115,28 +115,21 @@ pub async fn prepare(
 /// stack on the parent's branch and ride its PR. A reused worktree/branch is
 /// untouched (stacking applies only at creation), and a reopened ticket whose
 /// remote branch still exists keeps the remote-reattach precedence.
-pub async fn prepare_with_stack(
-    root: &Path,
-    project_id: i32,
-    task_id: i32,
-    title: &str,
-    repo_url: &str,
-    base_branch: Option<&str>,
-    stack_base: Option<&str>,
-) -> Result<PreparedWorktree, WorkspaceError> {
+/// Clone `<repo_url>` into `p<project_id>/repo` on first use (with clone-race
+/// tolerance: two parallel tickets of a brand-new project race this clone — the
+/// loser's `git clone` fails with "destination path already exists", which is a
+/// win as long as the repo is really there); on every later use repoint
+/// `origin` at `<repo_url>` — the project's Repository URL may have been edited
+/// since the clone was made. Returns the clone path. No fetch: callers fetch
+/// the refs they need.
+pub async fn ensure_repo_clone(root: &Path, project_id: i32, repo_url: &str) -> Result<PathBuf, WorkspaceError> {
     let repo = repo_dir(root, project_id);
-    let wt = worktree_dir(root, project_id, task_id);
-    let branch = branch_name(task_id, title);
-
     if !repo.exists() {
         if let Some(parent) = repo.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(|e| WorkspaceError(format!("mkdir {parent:?}: {e}")))?;
         }
-        // Two parallel tickets of a brand-new project race this clone: the
-        // loser's `git clone` fails with "destination path already exists" —
-        // that's a win, not an error, as long as the repo is really there.
         if let Err(e) = git(root, &["clone", repo_url, &repo.to_string_lossy()]).await {
             if !repo.exists() {
                 return Err(e);
@@ -149,6 +142,21 @@ pub async fn prepare_with_stack(
         // daemon fetching from / pushing to the stale remote (spec §5.4).
         git(&repo, &["remote", "set-url", "origin", repo_url]).await?;
     }
+    Ok(repo)
+}
+
+pub async fn prepare_with_stack(
+    root: &Path,
+    project_id: i32,
+    task_id: i32,
+    title: &str,
+    repo_url: &str,
+    base_branch: Option<&str>,
+    stack_base: Option<&str>,
+) -> Result<PreparedWorktree, WorkspaceError> {
+    let repo = ensure_repo_clone(root, project_id, repo_url).await?;
+    let wt = worktree_dir(root, project_id, task_id);
+    let branch = branch_name(task_id, title);
 
     let start_point = match base_branch {
         Some(b) => {
@@ -299,36 +307,8 @@ async fn prepare_reference_repo(
     task_id: i32,
     r: &ReferenceRepo,
 ) -> Result<RefMount, WorkspaceError> {
-    // The mount name becomes a path segment — refuse anything that could
-    // escape `refs/` (it comes from project settings, but defense in depth).
-    let name = r.mount_name.trim();
-    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
-        return Err(WorkspaceError(format!("invalid mount name {:?}", r.mount_name)));
-    }
-    let repo = refs_repo_dir(root, project_id, name);
-    let wt = refs_worktree_dir(root, project_id, name, task_id);
-
-    if !repo.exists() {
-        if let Some(parent) = repo.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| WorkspaceError(format!("mkdir {parent:?}: {e}")))?;
-        }
-        // Same clone-race tolerance as `prepare_with_stack`: two parallel
-        // tickets of one project race this clone; the loser's failure is a
-        // win as long as the clone is really there.
-        if let Err(e) = git(root, &["clone", &r.repo_url, &repo.to_string_lossy()]).await {
-            if !repo.exists() {
-                return Err(e);
-            }
-            tracing::info!(repo = ?repo, "clone race lost; using the winner's clone");
-        }
-    } else {
-        // The ref clone outlives the project's reference-repo settings:
-        // repoint origin every prepare so an edited URL stops the daemon
-        // fetching from the stale remote.
-        git(&repo, &["remote", "set-url", "origin", &r.repo_url]).await?;
-    }
+    let (repo, wt, name) = refs_paths(root, project_id, task_id, &r.mount_name)?;
+    ensure_refs_clone(root, &repo, &r.repo_url).await?;
 
     let start_point = match r.base_branch.as_deref() {
         Some(b) => {
@@ -350,10 +330,90 @@ async fn prepare_reference_repo(
     }
 
     Ok(RefMount {
-        mount_name: name.to_string(),
+        mount_name: name,
         worktree: wt,
         repo,
     })
+}
+
+/// Branch-mode reference mount (docs/specs/cross-repo-projects.md): a
+/// supervise/review run of a parent gets a read-only checkout of a supervised
+/// child's branch — for a cross-project child the branch lives in the child
+/// project's repo, which the parent's own clone never sees. Behaves like
+/// [`prepare_reference_repo`] with `branch` as the start point, except that an
+/// existing worktree is re-pointed at the fresh `origin/<branch>` tip: the
+/// child branch advances between supervision cycles (unlike a ref's base), and
+/// re-pointing is safe because prepare always runs before the run starts.
+pub async fn prepare_branch_reference(
+    root: &Path,
+    project_id: i32,
+    task_id: i32,
+    mount_name: &str,
+    repo_url: &str,
+    branch: &str,
+) -> Result<RefMount, WorkspaceError> {
+    let (repo, wt, name) = refs_paths(root, project_id, task_id, mount_name)?;
+    ensure_refs_clone(root, &repo, repo_url).await?;
+    git(&repo, &["fetch", "origin", branch]).await?;
+    let start_point = format!("origin/{branch}");
+    if wt.exists() {
+        git(&wt, &["checkout", "--detach", &start_point]).await?;
+    } else {
+        git(
+            &repo,
+            &["worktree", "add", &wt.to_string_lossy(), "--detach", &start_point],
+        )
+        .await?;
+    }
+    Ok(RefMount {
+        mount_name: name,
+        worktree: wt,
+        repo,
+    })
+}
+
+/// Validated mount name + the refs-clone and per-ticket worktree paths for it.
+fn refs_paths(
+    root: &Path,
+    project_id: i32,
+    task_id: i32,
+    mount_name: &str,
+) -> Result<(PathBuf, PathBuf, String), WorkspaceError> {
+    // The mount name becomes a path segment — refuse anything that could
+    // escape `refs/` (it comes from project settings, but defense in depth).
+    let name = mount_name.trim();
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        return Err(WorkspaceError(format!("invalid mount name {mount_name:?}")));
+    }
+    Ok((
+        refs_repo_dir(root, project_id, name),
+        refs_worktree_dir(root, project_id, name, task_id),
+        name.to_string(),
+    ))
+}
+
+/// Clone `<repo_url>` into the refs clone `repo` on first use (with the same
+/// clone-race tolerance as [`ensure_repo_clone`]: two parallel tickets of one
+/// project race this clone; the loser's failure is a win as long as the clone
+/// is really there), repoint `origin` on every later use — the ref clone
+/// outlives the settings it was created from.
+async fn ensure_refs_clone(root: &Path, repo: &Path, repo_url: &str) -> Result<(), WorkspaceError> {
+    if !repo.exists() {
+        if let Some(parent) = repo.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| WorkspaceError(format!("mkdir {parent:?}: {e}")))?;
+        }
+        if let Err(e) = git(root, &["clone", repo_url, &repo.to_string_lossy()]).await {
+            if !repo.exists() {
+                return Err(e);
+            }
+            tracing::info!(repo = ?repo, "clone race lost; using the winner's clone");
+        }
+    } else {
+        git(repo, &["remote", "set-url", "origin", repo_url]).await?;
+    }
+    Ok(())
 }
 
 /// Appends `.refs/` to the worktree's `info/exclude` (idempotent). Resolved
@@ -1111,6 +1171,100 @@ pub async fn remote_branch_exists(dir: &Path, branch: &str) -> bool {
     )
     .await
     .is_ok()
+}
+
+/// `agent/feature-<parentId>-<slug>` — the integration branch that collects a
+/// cross-project feature's child work inside the *child* project's repo
+/// (docs/specs/cross-repo-projects.md): the child's work never reaches that
+/// repo's base branch before a human merges the integration PR. The branch
+/// lives until the parent ticket completes.
+pub fn integration_branch_name(parent_id: i32, parent_title: &str) -> String {
+    format!("agent/feature-{parent_id}-{}", slugify(parent_title))
+}
+
+/// Ensure the parent ticket's integration branch exists in `repo` (the child
+/// project's clone) and on its origin. Idempotent: a present local branch is
+/// returned as-is, a branch that exists only on origin is reattached locally;
+/// otherwise it is branched off `origin/<base_branch>` (or `origin/HEAD` when
+/// the child project has no base branch configured) and pushed, so the
+/// isolation invariant holds even if the daemon host dies right after.
+pub async fn ensure_integration_branch(
+    repo: &Path,
+    parent_id: i32,
+    parent_title: &str,
+    base_branch: Option<&str>,
+) -> Result<String, WorkspaceError> {
+    let branch = integration_branch_name(parent_id, parent_title);
+    match ensure_local_branch(repo, &branch).await? {
+        LocalBranchState::Present | LocalBranchState::Reattached => return Ok(branch),
+        LocalBranchState::Missing => {}
+    }
+    let start_point = match base_branch {
+        Some(b) => {
+            git(repo, &["fetch", "origin", b]).await?;
+            format!("origin/{b}")
+        }
+        None => {
+            git(repo, &["fetch", "origin"]).await?;
+            "origin/HEAD".to_string()
+        }
+    };
+    git(repo, &["branch", &branch, &start_point]).await?;
+    git(repo, &["push", "origin", &branch]).await?;
+    Ok(branch)
+}
+
+/// Delete the parent ticket's integration branch locally and on origin — the
+/// housekeeping twin of [`ensure_integration_branch`], run when the parent
+/// completes. Best-effort and idempotent: already-gone pieces are skipped, a
+/// failed delete is a warning for the next poll's retry, never an error.
+pub async fn delete_integration_branch(repo: &Path, branch: &str) {
+    if local_branch_exists(repo, branch).await
+        && let Err(e) = git(repo, &["branch", "-D", branch]).await
+    {
+        tracing::warn!(branch, error = %e, "integration branch cleanup failed");
+    }
+    if remote_branch_exists(repo, branch).await
+        && let Err(e) = git(repo, &["push", "origin", "--delete", branch]).await
+    {
+        tracing::warn!(branch, error = %e, "integration branch remote cleanup failed");
+    }
+}
+
+/// Housekeeping sweep for a completed parent ticket: delete its integration
+/// branches (`agent/feature-<parentId>-*`) in every project clone under
+/// `root`. Enumerates the local clones instead of asking the API which
+/// projects had cross-project children — cheap, and covers projects whose
+/// config changed since the branches were created.
+pub async fn cleanup_integration_branches(root: &Path, parent_id: i32) {
+    let projects = match std::fs::read_dir(root) {
+        Ok(projects) => projects,
+        Err(_) => return,
+    };
+    let pattern = format!("agent/feature-{parent_id}-*");
+    for project in projects.flatten() {
+        let repo = project.path().join("repo");
+        if !repo.exists() {
+            continue;
+        }
+        let Ok(branches) = git_output(&repo, &["branch", "--list", &pattern, "--format=%(refname:short)"]).await else {
+            continue;
+        };
+        for branch in branches.lines().filter(|l| !l.is_empty()) {
+            delete_integration_branch(&repo, branch).await;
+        }
+    }
+}
+
+/// `git ls-remote <repo_url> refs/heads/<branch>` tip commit — `None` when the
+/// branch is absent or the remote is unreachable. Prompt-context use: never
+/// fatal. `dir` is any existing directory (ls-remote needs no repository).
+pub async fn ls_remote_tip(dir: &Path, repo_url: &str, branch: &str) -> Option<String> {
+    git_output(dir, &["ls-remote", repo_url, &format!("refs/heads/{branch}")])
+        .await
+        .ok()
+        .and_then(|out| out.split_whitespace().next().map(str::to_string))
+        .filter(|s| !s.is_empty())
 }
 
 /// `git symbolic-ref --short HEAD` — the branch a worktree is on (`Err` when
@@ -2757,6 +2911,142 @@ mod tests {
             "the shared refs clone is reused"
         );
         assert!(!worktree_dir(&ws, 7, 42).exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── integration branches (cross-project children, #184) ───────────────
+
+    #[test]
+    fn integration_branch_name_format() {
+        assert_eq!(
+            integration_branch_name(7, "Cross-repo feature!"),
+            "agent/feature-7-cross-repo-feature"
+        );
+    }
+
+    /// ensure_integration_branch creates the branch off the child clone's
+    /// origin base and pushes it; a second call reuses it; a local-only
+    /// deletion is healed from the pushed remote copy.
+    #[tokio::test]
+    async fn integration_branch_create_reuse_reattach() {
+        let base = scratch("integration-branch");
+        let origin = make_bare_repo(&base, "origin");
+        let ws = base.join("ws");
+        let repo = ensure_repo_clone(&ws, 2, &origin.to_string_lossy()).await.unwrap();
+
+        let branch = ensure_integration_branch(&repo, 7, "Parent work", None).await.unwrap();
+        assert_eq!(branch, "agent/feature-7-parent-work");
+        assert!(local_branch_exists(&repo, &branch).await);
+        assert!(
+            remote_branch_exists(&repo, &branch).await,
+            "the integration branch must be pushed — the isolation invariant survives a host death"
+        );
+        // Branched off the base tip, not off some other ref.
+        let base_tip = git_output(&repo, &["rev-parse", "origin/HEAD"]).await.unwrap();
+        assert_eq!(git_rev_parse(&repo, &branch).await.unwrap(), base_tip);
+
+        // Idempotent reuse.
+        let again = ensure_integration_branch(&repo, 7, "Parent work", None).await.unwrap();
+        assert_eq!(again, branch);
+
+        // Local copy lost (fresh daemon workspace would re-clone, but a
+        // partially cleaned clone reattaches from origin).
+        sh(&repo, "git", &["branch", "-D", &branch]);
+        let reattached = ensure_integration_branch(&repo, 7, "Parent work", None).await.unwrap();
+        assert_eq!(reattached, branch);
+        assert!(local_branch_exists(&repo, &branch).await);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// delete_integration_branch removes the branch locally and on origin and
+    /// is idempotent; cleanup_integration_branches sweeps every project clone
+    /// under the workspace root for the parent's `agent/feature-<id>-*`.
+    #[tokio::test]
+    async fn integration_branch_cleanup_sweeps_project_clones() {
+        let base = scratch("integration-cleanup");
+        let origin_a = make_bare_repo(&base, "origin-a");
+        let origin_b = make_bare_repo(&base, "origin-b");
+        let ws = base.join("ws");
+        let repo_a = ensure_repo_clone(&ws, 2, &origin_a.to_string_lossy()).await.unwrap();
+        let repo_b = ensure_repo_clone(&ws, 3, &origin_b.to_string_lossy()).await.unwrap();
+        let branch_a = ensure_integration_branch(&repo_a, 7, "Parent work", None)
+            .await
+            .unwrap();
+        let branch_b = ensure_integration_branch(&repo_b, 7, "Parent work", None)
+            .await
+            .unwrap();
+        // Another parent's branch in the same clone must survive the sweep.
+        let other = ensure_integration_branch(&repo_a, 8, "Other parent", None)
+            .await
+            .unwrap();
+
+        cleanup_integration_branches(&ws, 7).await;
+
+        for (repo, branch) in [(&repo_a, &branch_a), (&repo_b, &branch_b)] {
+            assert!(
+                !local_branch_exists(repo, branch).await,
+                "{branch} must be gone locally"
+            );
+            assert!(
+                !remote_branch_exists(repo, branch).await,
+                "{branch} must be gone on origin"
+            );
+        }
+        assert!(local_branch_exists(&repo_a, &other).await);
+        assert!(remote_branch_exists(&repo_a, &other).await);
+
+        // Idempotent: a second sweep over the leftovers is a no-op.
+        cleanup_integration_branches(&ws, 7).await;
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// prepare_branch_reference mounts a detached worktree at the child
+    /// branch's tip and re-points an existing worktree when the branch
+    /// advances (unlike base-mode refs, which are reused as-is).
+    #[tokio::test]
+    async fn branch_reference_follows_the_child_branch_tip() {
+        let base = scratch("branch-ref");
+        let child_origin = make_bare_repo(&base, "child");
+        let ws = base.join("ws");
+        let branch = "agent/task-42-child-work";
+        // Push a child branch with one commit on top of the base.
+        let src = base.join("child-src");
+        sh(&src, "git", &["checkout", "-b", branch]);
+        std::fs::write(src.join("CHILD.md"), "v1").unwrap();
+        sh(&src, "git", &["add", "."]);
+        sh(
+            &src,
+            "git",
+            &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "child v1"],
+        );
+        sh(&src, "git", &["push", &child_origin.to_string_lossy(), branch]);
+
+        let mount = prepare_branch_reference(&ws, 1, 70, "task-42", &child_origin.to_string_lossy(), branch)
+            .await
+            .unwrap();
+        assert_eq!(mount.mount_name, "task-42");
+        assert_eq!(std::fs::read_to_string(mount.worktree.join("CHILD.md")).unwrap(), "v1");
+        assert!(
+            worktree_branch(&mount.worktree).await.is_err(),
+            "branch reference worktree must be detached"
+        );
+
+        // The child branch advances: the same mount re-points at the new tip.
+        std::fs::write(src.join("CHILD.md"), "v2").unwrap();
+        sh(&src, "git", &["add", "."]);
+        sh(
+            &src,
+            "git",
+            &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "child v2"],
+        );
+        sh(&src, "git", &["push", &child_origin.to_string_lossy(), branch]);
+        let mount = prepare_branch_reference(&ws, 1, 70, "task-42", &child_origin.to_string_lossy(), branch)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(mount.worktree.join("CHILD.md")).unwrap(), "v2");
 
         let _ = std::fs::remove_dir_all(&base);
     }

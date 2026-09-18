@@ -454,9 +454,17 @@ pub struct CreateTaskParams {
     /// The task description (Markdown; rendered as Markdown in the task UI,
     /// may embed attachment links returned by add_attachment).
     pub description: String,
-    /// The feature ID (required in standalone mode; omit in daemon mode).
+    /// The feature ID (required in standalone mode; omit in daemon mode unless
+    /// creating a cross-project subtask — see projectId).
     #[serde(rename = "featureId")]
     pub feature_id: Option<i32>,
+    /// Target project ID (daemon mode only). Omit (or pass the current
+    /// ticket's project) for a same-project subtask. When it differs from the
+    /// current ticket's project, featureId is required and must belong to
+    /// that project; the subtask is created there with the current ticket as
+    /// its cross-project parent.
+    #[serde(rename = "projectId")]
+    pub project_id: Option<i32>,
     /// Assign the new task to this user immediately (id from list_users).
     /// Default null: the task is created unassigned.
     #[serde(rename = "assigneeId")]
@@ -901,25 +909,53 @@ impl RemoterMcp {
 
     #[tool(
         name = "create_task",
-        description = "Create a new task. In daemon mode (inside a ticket run) the task is created as a subtask of the current ticket; do not pass featureId. In standalone mode, featureId is required and is used to derive the project. Pass assigneeId (from list_users) to assign the task immediately; omit it to leave the task unassigned. Pass taskKind (\"task\", \"research\", or \"bug\") to set the task type; omit it to create a regular task. The description field accepts Markdown (rendered as Markdown in the task UI) and may embed attachment links returned by add_attachment."
+        description = "Create a new task. In daemon mode (inside a ticket run) the task is created as a subtask of the current ticket; do not pass featureId. In standalone mode, featureId is required and is used to derive the project. Cross-project subtasks (daemon mode): pass projectId of a different project together with a featureId that belongs to it — the subtask is created in that project with the current ticket as its cross-project parent. Pass assigneeId (from list_users) to assign the task immediately; omit it to leave the task unassigned. Pass taskKind (\"task\", \"research\", or \"bug\") to set the task type; omit it to create a regular task. The description field accepts Markdown (rendered as Markdown in the task UI) and may embed attachment links returned by add_attachment."
     )]
     async fn create_task(&self, Parameters(p): Parameters<CreateTaskParams>) -> Result<CallToolResult, McpErrorData> {
         let task_kind = p.task_kind;
         let body = if let Some(agent_task_id) = self.agent_task_id {
-            if p.feature_id.is_some() {
-                return Err(McpErrorData::invalid_params(
-                    "featureId must not be provided in daemon mode; omit it so the subtask is created in the current ticket's project/feature",
-                    None,
-                ));
-            }
             let task = self.client.get_task(agent_task_id).await.map_err(McpErrorData::from)?;
-            serde_json::json!({
-                "projectId": task.project_id,
-                "featureId": task.feature_id,
-                "title": p.title,
-                "description": p.description,
-                "parentTaskId": agent_task_id,
-            })
+            let cross_project = p.project_id.is_some_and(|id| id != task.project_id);
+            if !cross_project {
+                if p.feature_id.is_some() {
+                    return Err(McpErrorData::invalid_params(
+                        "featureId must not be provided in daemon mode; omit it so the subtask is created in the current ticket's project/feature",
+                        None,
+                    ));
+                }
+                serde_json::json!({
+                    "projectId": task.project_id,
+                    "featureId": task.feature_id,
+                    "title": p.title,
+                    "description": p.description,
+                    "parentTaskId": agent_task_id,
+                })
+            } else {
+                let project_id = p.project_id.expect("cross_project implies projectId");
+                let Some(feature_id) = p.feature_id else {
+                    return Err(McpErrorData::invalid_params(
+                        "featureId is required for a cross-project subtask (projectId differs from the current ticket's project)",
+                        None,
+                    ));
+                };
+                let feature = self.client.get_feature(feature_id).await.map_err(McpErrorData::from)?;
+                if feature.project_id != project_id {
+                    return Err(McpErrorData::invalid_params(
+                        format!(
+                            "featureId {feature_id} belongs to project {}, not to the requested projectId {project_id}",
+                            feature.project_id
+                        ),
+                        None,
+                    ));
+                }
+                serde_json::json!({
+                    "projectId": project_id,
+                    "featureId": feature_id,
+                    "title": p.title,
+                    "description": p.description,
+                    "parentTaskId": agent_task_id,
+                })
+            }
         } else {
             let Some(feature_id) = p.feature_id else {
                 return Err(McpErrorData::invalid_params(

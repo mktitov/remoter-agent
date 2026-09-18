@@ -396,9 +396,41 @@ async fn run_attempt(
     // Container mode: the review turn runs in a container like any other run —
     // no silent fallback to host. A ticket whose project is not agent-managed
     // has no repo to build an image from — it keeps the host path (its review
-    // is report-only anyway).
+    // is report-only anyway). When the reviewed ticket parents supervised
+    // subtasks, its cross-project children are mounted read-only as
+    // `.refs/task-<childId>` (fail-open per child — a missing mount must
+    // never fail the run).
+    let mut child_refs: Vec<workspace::RefMount> = Vec::new();
     let containers = match &rc.project {
         Some(project) => {
+            // From the ticket's perspective, links to its children carry the
+            // `"parent"` relation (same rule as the supervision loop).
+            let child_ids: Vec<i32> = rc
+                .client
+                .task_detail(rc.task.id)
+                .await
+                .map(|d| {
+                    d.links
+                        .unwrap_or_default()
+                        .iter()
+                        .filter(|l| l.relation == "parent")
+                        .map(|l| l.task_id)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !child_ids.is_empty() {
+                child_refs = supervise::mount_cross_project_children(
+                    &rc.client,
+                    &rc.config.workspace_root,
+                    project.project_id,
+                    rc.task.id,
+                    &child_ids,
+                )
+                .await;
+                if !child_refs.is_empty() {
+                    supervise::exclude_refs_from_status(env.cwd).await;
+                }
+            }
             match run::start_container_runtime(
                 &rc.config,
                 &rc.image_locks,
@@ -407,7 +439,7 @@ async fn run_attempt(
                 env.cwd,
                 env.devenv,
                 &env_vars,
-                &[],
+                &child_refs,
             )
             .await
             {
@@ -417,6 +449,18 @@ async fn run_attempt(
         }
         None => None,
     };
+    if containers.is_none() {
+        // Host mode surfaces the mounts as symlinks; container mode
+        // bind-mounts them (container.rs).
+        for (mount, error) in workspace::link_refs_into(env.cwd, &child_refs).await {
+            note(
+                &rc.client,
+                rc.task.id,
+                format!("cross-project child mount `{mount}` could not be linked into the worktree: {error} — the run continues without it"),
+            )
+            .await;
+        }
+    }
     if containers.is_none()
         && env.devenv
         && let Err(e) = workspace::services_up(env.cwd, &env_vars).await

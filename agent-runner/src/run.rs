@@ -154,11 +154,16 @@ async fn cancel_after_attempt(rc: &RunContext, task_id: i32, run_id: i32) -> boo
 /// so a bounce/retry run never posts it twice (review #106).
 const STACKING_NOTE_MARKER: &str = "stacked on parent";
 
-/// A supervised child's stacking target: the parent ticket and the parent's
-/// local branch the child's worktree branches off (branch stacking, spec §5.4).
+/// A supervised child's stacking target: the parent ticket and the branch the
+/// child's worktree branches off (branch stacking, spec §5.4). Same-project:
+/// the parent's local branch, and the child's commits ride the parent's PR.
+/// Cross-project (`cross_project`): the parent's integration branch in the
+/// child's own project clone — the child's PR targets that branch, never the
+/// base (docs/specs/cross-repo-projects.md).
 struct SupervisedParent {
     parent_id: i32,
     branch: String,
+    cross_project: bool,
 }
 
 /// Supervised-child detection (branch stacking): a child ticket whose parent
@@ -191,6 +196,27 @@ async fn supervised_parent(rc: &RunContext) -> Option<(SupervisedParent, TaskDet
         return None;
     }
     let root = &rc.config.workspace_root;
+    if parent.project_id != rc.project.project_id {
+        // Cross-project child: the parent's branch lives in the parent's
+        // project clone, which the child never touches — stack on the
+        // parent's integration branch in the child's own project clone
+        // instead (created and pushed on first use).
+        let repo = workspace::ensure_repo_clone(root, rc.project.project_id, &rc.project.repo_url)
+            .await
+            .ok()?;
+        let branch =
+            workspace::ensure_integration_branch(&repo, parent_id, &parent.title, rc.project.base_branch.as_deref())
+                .await
+                .ok()?;
+        return Some((
+            SupervisedParent {
+                parent_id,
+                branch,
+                cross_project: true,
+            },
+            detail,
+        ));
+    }
     let repo = workspace::repo_dir(root, rc.project.project_id);
     // The parent's branch: its worktree's branch when one exists, else the
     // name recomputed from the title (the completion cleanup removes the
@@ -201,7 +227,14 @@ async fn supervised_parent(rc: &RunContext) -> Option<(SupervisedParent, TaskDet
     if !workspace::local_branch_exists(&repo, &branch).await {
         return None;
     }
-    Some((SupervisedParent { parent_id, branch }, detail))
+    Some((
+        SupervisedParent {
+            parent_id,
+            branch,
+            cross_project: false,
+        },
+        detail,
+    ))
 }
 
 /// Executes the run to completion (success, escalation, rollback, or
@@ -268,17 +301,22 @@ pub async fn execute(rc: RunContext) {
             .iter()
             .any(|c| c.body.contains(STACKING_NOTE_MARKER));
         if rc.kind == RunKind::Implement && !already_noted {
-            note(
-                &rc.client,
-                task_id,
+            let text = if parent.cross_project {
+                format!(
+                    "branch `{branch}` {STACKING_NOTE_MARKER} #{}'s integration branch `{}` — supervised \
+                     cross-project run: this branch's PR targets the integration branch, never the base; \
+                     the work reaches this repo's base only through the human-merged integration PR",
+                    parent.parent_id, parent.branch
+                )
+            } else {
                 format!(
                     "branch `{branch}` {STACKING_NOTE_MARKER} #{}'s branch `{}` — supervised run: \
                      commits ride the parent's PR; this branch is not pushed (unless a remote copy \
                      already exists) and no new PR is opened",
                     parent.parent_id, parent.branch
-                ),
-            )
-            .await;
+                )
+            };
+            note(&rc.client, task_id, text).await;
         }
     }
 
@@ -464,22 +502,40 @@ pub async fn execute(rc: RunContext) {
                         // remote copy — a branch pushed by an earlier run (a
                         // gate was down) keeps being updated, or its open PR
                         // would silently go stale (review #106).
-                        let skip_push_pr = if supervised.is_some() {
-                            let wt = workspace::worktree_dir(&rc.config.workspace_root, rc.project.project_id, task_id);
-                            !workspace::remote_branch_exists(&wt, &branch).await
-                        } else {
-                            false
+                        let skip_push_pr = match &supervised {
+                            // Cross-project child: always push and open the PR
+                            // against the parent's integration branch (never the
+                            // base) — create-or-reuse keeps it idempotent.
+                            Some((p, _)) if p.cross_project => false,
+                            Some(_) => {
+                                let wt =
+                                    workspace::worktree_dir(&rc.config.workspace_root, rc.project.project_id, task_id);
+                                !workspace::remote_branch_exists(&wt, &branch).await
+                            }
+                            None => false,
                         };
                         if !created_child_tickets && !skip_push_pr {
-                            match push_and_create_pr(&rc, &branch).await {
+                            let pr_base = supervised
+                                .as_ref()
+                                .and_then(|(p, _)| p.cross_project.then_some(p.branch.as_str()));
+                            match push_and_create_pr(&rc, &branch, pr_base).await {
                                 Ok(Some(url)) => {
                                     body.pr_url = Some(url.clone());
                                     // PROD-9: if the PR is not mergeable into its
                                     // target, ask the agent to rebase. Never fail
                                     // the run over this — the code is still
                                     // reviewable.
-                                    ensure_pr_mergeable(&rc, run.id, &logger, &branch, &url, &mut outcome, timeout)
-                                        .await;
+                                    ensure_pr_mergeable(
+                                        &rc,
+                                        run.id,
+                                        &logger,
+                                        &branch,
+                                        &url,
+                                        &mut outcome,
+                                        timeout,
+                                        pr_base,
+                                    )
+                                    .await;
                                 }
                                 Ok(None) => {} // no forge configured — skip
                                 Err(e) => {
@@ -1316,6 +1372,7 @@ async fn build_prompt(
         .iter()
         .map(|r| r.mount_name.clone())
         .collect();
+    let deps = dependency_repos_section(rc, &detail).await;
     Ok(render_prompt(
         rc.kind,
         &detail,
@@ -1323,7 +1380,74 @@ async fn build_prompt(
         current_run_id,
         rc.client.base_url(),
         &refs,
+        &deps,
     ))
+}
+
+/// The static intro of the "## Dependency repos" block — module scope so
+/// tests can pin the contract.
+const DEPENDENCY_REPOS_INTRO: &str = "## Dependency repos\nThis feature spans into other projects: their child tickets' work is collected \
+     on this ticket's integration branch in each repo (it reaches the repo's base branch only through a \
+     human-merged integration PR — never merge it yourself). Before finishing, pin each listed dependency \
+     to the integration branch tip below (e.g. `cargo update -p <dep> --precise <rev>` for a git \
+     dependency, or the rev of the corresponding flake input) and run the integration tests that \
+     exercise the pairing.\n\n";
+
+/// The "## Dependency repos" block (docs/specs/cross-repo-projects.md): only
+/// for the final integration run of a parent with cross-project supervised
+/// children. Each child project's repo collects the children's work on this
+/// ticket's integration branch (never merged to the repo's base automatically)
+/// — the block hands the agent each repo's URL, the branch, its current tip
+/// (via `git ls-remote`), and the pin/integration-test instructions. Empty when
+/// there are no cross-project children. Fail-open per repo: an unmanaged
+/// project or an unreachable remote degrades its entry, never the prompt.
+async fn dependency_repos_section(rc: &RunContext, detail: &TaskDetail) -> String {
+    if rc.kind != RunKind::Implement {
+        return String::new();
+    }
+    let child_ids: Vec<i32> = detail
+        .links
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .filter(|l| l.relation == "parent")
+        .map(|l| l.task_id)
+        .collect();
+    if child_ids.is_empty() {
+        return String::new();
+    }
+    let mut projects: Vec<ProjectRepoConfig> = Vec::new();
+    for id in child_ids {
+        let child = match rc.client.task_detail(id).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(task_id = id, error = %e, "dependency repos: could not fetch child");
+                continue;
+            }
+        };
+        if child.project_id == detail.project_id || projects.iter().any(|p| p.project_id == child.project_id) {
+            continue;
+        }
+        if let Some(cfg) = crate::client::project_repo_config(&rc.client, child.project_id).await {
+            projects.push(cfg);
+        }
+    }
+    if projects.is_empty() {
+        return String::new();
+    }
+    let branch = workspace::integration_branch_name(detail.id, &detail.title);
+    let mut s = String::from(DEPENDENCY_REPOS_INTRO);
+    for project in &projects {
+        let tip = workspace::ls_remote_tip(&rc.config.workspace_root, &project.repo_url, &branch)
+            .await
+            .unwrap_or_else(|| "unknown (ls-remote failed — fetch it yourself)".to_string());
+        s.push_str(&format!(
+            "- {} (project #{}), branch `{branch}`, tip `{tip}`\n",
+            project.repo_url, project.project_id
+        ));
+    }
+    s.push('\n');
+    s
 }
 
 /// The `.refs/` block (docs/specs/cross-repo-projects.md): rendered only when
@@ -1367,6 +1491,7 @@ fn render_prompt(
     current_run_id: i32,
     base_url: &str,
     refs: &[String],
+    deps_section: &str,
 ) -> String {
     let mut p = String::new();
     p.push_str("## Ticket\n");
@@ -1532,6 +1657,9 @@ fn render_prompt(
     if !refs.is_empty() {
         p.push_str(&refs_section(kind, refs));
     }
+    if !deps_section.is_empty() {
+        p.push_str(deps_section);
+    }
     match kind {
         RunKind::Plan => p.push_str(PLAN_INSTRUCTIONS),
         RunKind::Implement => {
@@ -1655,10 +1783,17 @@ async fn child_ticket_ids(client: &RemoterClient, task_id: i32) -> Option<Vec<i3
 
 /// PROD-2 (§4.4), implement success path only: fetch the project's forge
 /// config, push the ticket branch to origin, then create-or-reuse the draft
-/// PR/MR. `Ok(None)` = no forge configured (push/PR skipped). Every failure
-/// is returned as a one-line message for the thread note and the run row's
-/// `pr_error` — it must never fail the run itself.
-async fn push_and_create_pr(rc: &RunContext, branch: &str) -> Result<Option<String>, String> {
+/// PR/MR. `base_override` replaces the project's base branch as the PR target —
+/// a cross-project supervised child's PR targets the parent's integration
+/// branch, never the base (docs/specs/cross-repo-projects.md). `Ok(None)` = no
+/// forge configured (push/PR skipped). Every failure is returned as a one-line
+/// message for the thread note and the run row's `pr_error` — it must never
+/// fail the run itself.
+async fn push_and_create_pr(
+    rc: &RunContext,
+    branch: &str,
+    base_override: Option<&str>,
+) -> Result<Option<String>, String> {
     let cfg = rc
         .client
         .forge_config(rc.project.project_id)
@@ -1700,7 +1835,10 @@ async fn push_and_create_pr(rc: &RunContext, branch: &str) -> Result<Option<Stri
         .forge_token
         .as_deref()
         .ok_or_else(|| "forge token is not configured".to_string())?;
-    let base = base_branch(rc).await.map_err(|e| format!("default branch: {e}"))?;
+    let base = match base_override {
+        Some(b) => b.to_string(),
+        None => base_branch(rc).await.map_err(|e| format!("default branch: {e}"))?,
+    };
     let url = forge::create_pr(
         rc.client.http(),
         kind,
@@ -1750,6 +1888,7 @@ Fetch the latest `origin/{base}`, then `git rebase origin/{base}` (or an equival
 /// `MAX_REBASE_NUDGES` rebase prompts on the resumed session, push after each
 /// successful nudge, and recheck. Errors and unresolved conflicts are noted on
 /// the thread but never fail the run.
+#[allow(clippy::too_many_arguments)]
 async fn ensure_pr_mergeable(
     rc: &RunContext,
     run_id: i32,
@@ -1758,6 +1897,7 @@ async fn ensure_pr_mergeable(
     pr_url: &str,
     outcome: &mut RunOutcome,
     _timeout: Duration,
+    base_override: Option<&str>,
 ) {
     let task_id = rc.task.id;
     let cfg = match rc.client.forge_config(rc.project.project_id).await {
@@ -1787,7 +1927,11 @@ async fn ensure_pr_mergeable(
             return;
         }
     };
-    let base = match base_branch(rc).await {
+    let base = match base_override {
+        Some(b) => Ok(b.to_string()),
+        None => base_branch(rc).await,
+    };
+    let base = match base {
         Ok(b) => b,
         Err(e) => {
             note(&rc.client, task_id, format!("mergeability check failed: {e}")).await;
@@ -2101,7 +2245,7 @@ mod tests {
     #[test]
     fn ticket_creation_outcome_must_be_holistic() {
         for kind in [RunKind::Plan, RunKind::Implement] {
-            let p = render_prompt(kind, &detail(vec![], vec![]), None, 999, "http://api", &[]);
+            let p = render_prompt(kind, &detail(vec![], vec![]), None, 999, "http://api", &[], "");
             assert!(p.contains("holistic"), "{kind:?}: {p}");
             assert!(p.contains("all tests passing"), "{kind:?}: {p}");
             assert!(p.contains("safe to deploy to production"), "{kind:?}: {p}");
@@ -2114,11 +2258,11 @@ mod tests {
     /// child ticket is ready for implementation and which are blocked.
     #[test]
     fn ticket_creation_outcome_wires_blocker_links() {
-        let p = render_prompt(RunKind::Plan, &detail(vec![], vec![]), None, 999, "http://api", &[]);
+        let p = render_prompt(RunKind::Plan, &detail(vec![], vec![]), None, 999, "http://api", &[], "");
         assert!(p.contains("which ticket blocks which"), "{p}");
 
         for kind in [RunKind::Plan, RunKind::Implement] {
-            let p = render_prompt(kind, &detail(vec![], vec![]), None, 999, "http://api", &[]);
+            let p = render_prompt(kind, &detail(vec![], vec![]), None, 999, "http://api", &[], "");
             assert!(p.contains("`add_link`"), "{kind:?}: {p}");
             assert!(p.contains("ready for implementation"), "{kind:?}: {p}");
         }
@@ -2129,6 +2273,7 @@ mod tests {
             999,
             "http://api",
             &[],
+            "",
         );
         assert!(p.contains("relation `blocks`"), "{p}");
         assert!(p.contains("`blocked_by`"), "{p}");
@@ -2142,7 +2287,7 @@ mod tests {
     fn refs_block_marks_reference_repos_read_only() {
         let refs = vec!["contracts".to_string(), "backend".to_string()];
         for kind in [RunKind::Plan, RunKind::Implement] {
-            let p = render_prompt(kind, &detail(vec![], vec![]), None, 999, "http://api", &refs);
+            let p = render_prompt(kind, &detail(vec![], vec![]), None, 999, "http://api", &refs, "");
             assert!(p.contains("## Reference repositories"), "{kind:?}: {p}");
             assert!(p.contains("`.refs/contracts`"), "{kind:?}: {p}");
             assert!(p.contains("`.refs/backend`"), "{kind:?}: {p}");
@@ -2165,7 +2310,15 @@ mod tests {
     #[test]
     fn refs_block_carries_cross_repo_splitting_convention_in_plan_only() {
         let refs = vec!["contracts".to_string()];
-        let p = render_prompt(RunKind::Plan, &detail(vec![], vec![]), None, 999, "http://api", &refs);
+        let p = render_prompt(
+            RunKind::Plan,
+            &detail(vec![], vec![]),
+            None,
+            999,
+            "http://api",
+            &refs,
+            "",
+        );
         assert!(p.contains("Cross-repo splitting convention"), "{p}");
         assert!(p.contains("linked with `blocks`"), "{p}");
         assert!(p.contains("contract/API in the provider repo"), "{p}");
@@ -2181,6 +2334,7 @@ mod tests {
             999,
             "http://api",
             &refs,
+            "",
         );
         assert!(!p.contains("Cross-repo splitting convention"), "{p}");
     }
@@ -2190,10 +2344,67 @@ mod tests {
     #[test]
     fn refs_block_absent_without_configured_refs() {
         for kind in [RunKind::Plan, RunKind::Implement] {
-            let p = render_prompt(kind, &detail(vec![], vec![]), None, 999, "http://api", &[]);
+            let p = render_prompt(kind, &detail(vec![], vec![]), None, 999, "http://api", &[], "");
             assert!(!p.contains("## Reference repositories"), "{kind:?}: {p}");
             assert!(!p.contains(".refs/"), "{kind:?}: {p}");
         }
+    }
+
+    /// The "## Dependency repos" block (cross-project children, #184): the
+    /// intro states the isolation invariant and the pin/integration-test
+    /// instructions; the block renders only when the section is non-empty.
+    #[test]
+    fn dependency_repos_block_contract() {
+        assert!(
+            DEPENDENCY_REPOS_INTRO.starts_with("## Dependency repos\n"),
+            "{DEPENDENCY_REPOS_INTRO}"
+        );
+        assert!(
+            DEPENDENCY_REPOS_INTRO.contains("integration branch"),
+            "{DEPENDENCY_REPOS_INTRO}"
+        );
+        assert!(
+            DEPENDENCY_REPOS_INTRO.contains("human-merged integration PR"),
+            "{DEPENDENCY_REPOS_INTRO}"
+        );
+        assert!(
+            DEPENDENCY_REPOS_INTRO.contains("`cargo update -p <dep> --precise <rev>`"),
+            "{DEPENDENCY_REPOS_INTRO}"
+        );
+        assert!(
+            DEPENDENCY_REPOS_INTRO.contains("flake input"),
+            "{DEPENDENCY_REPOS_INTRO}"
+        );
+        assert!(
+            DEPENDENCY_REPOS_INTRO.contains("integration tests"),
+            "{DEPENDENCY_REPOS_INTRO}"
+        );
+
+        let deps = format!(
+            "{DEPENDENCY_REPOS_INTRO}- https://forge/child (project #2), branch `agent/feature-1-x`, tip `abc`\n\n"
+        );
+        let p = render_prompt(
+            RunKind::Implement,
+            &detail(vec![], vec![]),
+            None,
+            999,
+            "http://api",
+            &[],
+            &deps,
+        );
+        assert!(p.contains("## Dependency repos"), "{p}");
+        assert!(p.contains("https://forge/child (project #2)"), "{p}");
+
+        let p = render_prompt(
+            RunKind::Implement,
+            &detail(vec![], vec![]),
+            None,
+            999,
+            "http://api",
+            &[],
+            "",
+        );
+        assert!(!p.contains("Dependency repos"), "{p}");
     }
 
     fn comment(id: i32, body: String) -> CommentDto {
@@ -2269,6 +2480,7 @@ mod tests {
             999,
             "http://api",
             &[],
+            "",
         );
         assert!(
             p.starts_with("## Ticket\nTicket #1\n\nticket title\n\nticket\n\n"),
@@ -2281,7 +2493,7 @@ mod tests {
     #[test]
     fn language_section_is_in_both_prompts() {
         for kind in [RunKind::Plan, RunKind::Implement] {
-            let p = render_prompt(kind, &detail(vec![], vec![]), None, 999, "http://api", &[]);
+            let p = render_prompt(kind, &detail(vec![], vec![]), None, 999, "http://api", &[], "");
             assert!(p.contains("## Language\n"), "{kind:?}: {p}");
             assert!(p.contains("Think and reason in English"), "{kind:?}: {p}");
             assert!(p.contains("ticket's language"), "{kind:?}: {p}");
@@ -2295,7 +2507,7 @@ mod tests {
     #[test]
     fn no_pending_background_tasks_rule_is_in_both_prompts() {
         for kind in [RunKind::Plan, RunKind::Implement] {
-            let p = render_prompt(kind, &detail(vec![], vec![]), None, 999, "http://api", &[]);
+            let p = render_prompt(kind, &detail(vec![], vec![]), None, 999, "http://api", &[], "");
             assert!(
                 p.contains("Never end your turn with background tasks still running"),
                 "{kind:?}: {p}"
@@ -2314,6 +2526,7 @@ mod tests {
             999,
             "http://api",
             &[],
+            "",
         );
         assert!(p.contains("## Task report\n"), "{p}");
         assert!(p.contains("`set_task_report`"), "{p}");
@@ -2325,7 +2538,7 @@ mod tests {
         assert!(p.contains("\"Problems with tools\" bullet list"), "{p}");
         assert!(p.contains("omit the section entirely if there were none"), "{p}");
 
-        let p = render_prompt(RunKind::Plan, &detail(vec![], vec![]), None, 999, "http://api", &[]);
+        let p = render_prompt(RunKind::Plan, &detail(vec![], vec![]), None, 999, "http://api", &[], "");
         assert!(!p.contains("## Task report"), "{p}");
         assert!(!p.contains("set_task_report"), "{p}");
         assert!(!p.contains("Problems with tools"), "{p}");
@@ -2346,6 +2559,7 @@ mod tests {
             999,
             "http://api",
             &[],
+            "",
         );
         assert!(p.contains("earlier comment(s) omitted"), "{p}");
         assert!(!p.contains("- note 1\n"), "oldest comments must be dropped: {p}");
@@ -2365,6 +2579,7 @@ mod tests {
             999,
             "http://api",
             &[],
+            "",
         );
         assert!(p.contains("- hello\n"));
         assert!(!p.contains("omitted"), "{p}");
@@ -2380,6 +2595,7 @@ mod tests {
             999,
             "http://api",
             &[],
+            "",
         );
         assert!(p.contains("… [truncated, 10240 bytes total]"), "{p}");
         // The new per-comment cap is 8 KiB, so the prefix kept in the prompt is
@@ -2403,6 +2619,7 @@ mod tests {
             999,
             "http://api",
             &[],
+            "",
         );
         assert!(p.contains("earlier comment(s) omitted"), "{p}");
         assert!(
@@ -2422,7 +2639,15 @@ mod tests {
     #[test]
     fn prior_run_error_is_truncated() {
         let runs = vec![run_row(5, "implement", "failed", None, Some("e".repeat(50 * 1024)))];
-        let p = render_prompt(RunKind::Implement, &detail(vec![], runs), None, 999, "http://api", &[]);
+        let p = render_prompt(
+            RunKind::Implement,
+            &detail(vec![], runs),
+            None,
+            999,
+            "http://api",
+            &[],
+            "",
+        );
         assert!(p.contains("error: "));
         assert!(p.contains("… [truncated, 51200 bytes total]"), "{p}");
         assert!(!p.contains(&"e".repeat(MAX_PRIOR_OUTCOME_BYTES + 1)), "{p}");
@@ -2570,6 +2795,7 @@ mod tests {
             999,
             "http://api",
             &[],
+            "",
         );
         assert!(p.contains("- [x] #1: done"), "{p}");
         assert!(
@@ -2598,6 +2824,7 @@ mod tests {
             999,
             "http://api",
             &[],
+            "",
         );
         assert!(p.contains("- [x] #1: done"), "{p}");
         assert!(p.contains("- [~] #2: dropped (rejected: no longer needed)"), "{p}");
@@ -2639,7 +2866,7 @@ mod tests {
             },
         ]);
         for kind in [RunKind::Plan, RunKind::Implement] {
-            let p = render_prompt(kind, &d, None, 999, "http://api", &[]);
+            let p = render_prompt(kind, &d, None, 999, "http://api", &[], "");
             assert!(p.contains("## Open questions\n"), "{kind:?}: {p}");
             assert!(
                 p.contains("- #5 [answered] Which storage backend? (single-choice)"),
@@ -2649,9 +2876,9 @@ mod tests {
             assert!(p.contains("answer: S3 it is"), "{kind:?}: {p}");
             assert!(p.contains("- #6 [open] Anything else? (multi-choice)"), "{kind:?}: {p}");
         }
-        let p = render_prompt(RunKind::Implement, &d, None, 999, "http://api", &[]);
+        let p = render_prompt(RunKind::Implement, &d, None, 999, "http://api", &[], "");
         assert!(p.contains("`delete_task_question`"), "{p}");
-        let p = render_prompt(RunKind::Plan, &d, None, 999, "http://api", &[]);
+        let p = render_prompt(RunKind::Plan, &d, None, 999, "http://api", &[], "");
         assert!(p.contains("`add_task_question`"), "{p}");
         // No questions → no section at all.
         let p = render_prompt(
@@ -2661,6 +2888,7 @@ mod tests {
             999,
             "http://api",
             &[],
+            "",
         );
         assert!(!p.contains("## Open questions"), "{p}");
     }
@@ -2702,6 +2930,7 @@ mod tests {
             999,
             "http://api",
             &[],
+            "",
         );
         assert!(p.contains("start_action"), "{p}");
         assert!(p.contains("complete_action"), "{p}");

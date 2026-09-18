@@ -381,7 +381,8 @@ impl ServerHandler for RemoterMcp {
                  start_task, advance_task, complete_task, or unassign_self. Use list_my_tasks to see your assigned work, \
                  get_task for details, then implement. Use add_action/update_action/delete_action/reject_action to keep \
                  the plan accurate, set_task_report to write the implementation report, add_task_comment for thread updates, \
-                 create_task for subtasks of the current ticket, update_task to edit them, and add_attachment/list_attachments/read_attachment for artifacts. \
+                 create_task for subtasks of the current ticket (pass a different projectId plus a featureId \
+                 belonging to it for a cross-project subtask), update_task to edit them, and add_attachment/list_attachments/read_attachment for artifacts. \
                  Read the human's answers to the ticket's open questions via list_task_questions (also embedded in get_task); \
                  delete questions that are obsolete or already answered with delete_task_question to keep the context clean. \
                  add_attachment prefers filePath (local file read by remoter-mcp), with contentBase64 as a fallback. \
@@ -402,7 +403,8 @@ impl ServerHandler for RemoterMcp {
                 .into(),
             Role::DevAgentSupervise => "Remoter supervision mode. You manage the child tickets of the current ticket: \
                  list_board/list_my_tasks/search_tasks show only the current ticket and its children. \
-                 Create children with create_task (no featureId — they become subtasks of the current ticket), \
+                 Create children with create_task (no featureId — they become subtasks of the current ticket; \
+                 for a subtask in a linked project pass its projectId plus a featureId belonging to that project), \
                  staff them with assign_task (assigneeId from list_users; omit assigneeId to unassign), \
                  and move them along with advance_task — the backend allows a parent-scoped agent the transitions \
                  backlog → todo, backlog → implement, and review → completed on its children. \

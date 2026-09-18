@@ -429,6 +429,163 @@ async fn create_task_without_task_kind_omits_the_field() {
 }
 
 #[tokio::test]
+async fn create_task_daemon_cross_project_creates_in_target_project() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/70"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(task_detail_json(70, serde_json::json!([]))))
+        .expect(1) // current ticket lookup for its project id
+        .mount(&server)
+        .await;
+    // The cross-project contract (remoter#182): the MCP server verifies
+    // feature↔project ownership via `GET /features/{id}` before POSTing.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/features/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 9, "projectId": 2, "description": "f", "tasksTotal": 0, "tasksCompleted": 0,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks"))
+        .and(body_json(serde_json::json!({
+            "projectId": 2,
+            "featureId": 9,
+            "title": "Child",
+            "description": "do it",
+            "parentTaskId": 70,
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 44})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp(server.uri(), Role::DevAgentSupervise, Some(70));
+    let p: CreateTaskParams = serde_json::from_value(serde_json::json!({
+        "title": "Child",
+        "description": "do it",
+        "projectId": 2,
+        "featureId": 9,
+    }))
+    .unwrap();
+    let result = mcp.create_task(Parameters(p)).await.unwrap();
+    assert!(result_text(result).contains("\"id\": 44"));
+}
+
+#[tokio::test]
+async fn create_task_daemon_cross_project_requires_feature_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/70"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(task_detail_json(70, serde_json::json!([]))))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // No POST /tasks mock: the call must fail before any creation happens.
+
+    let mcp = test_mcp(server.uri(), Role::DevAgentSupervise, Some(70));
+    let p: CreateTaskParams = serde_json::from_value(serde_json::json!({
+        "title": "Child",
+        "description": "do it",
+        "projectId": 2,
+    }))
+    .unwrap();
+    let err = mcp.create_task(Parameters(p)).await.unwrap_err();
+    assert!(err.message.contains("featureId is required"), "{err:?}");
+}
+
+#[tokio::test]
+async fn create_task_daemon_cross_project_feature_mismatch_rejected() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/70"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(task_detail_json(70, serde_json::json!([]))))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Feature 9 belongs to project 1, not the requested project 2.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/features/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 9, "projectId": 1, "description": "f", "tasksTotal": 0, "tasksCompleted": 0,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // No POST /tasks mock: the mismatch must fail before any creation happens.
+
+    let mcp = test_mcp(server.uri(), Role::DevAgentSupervise, Some(70));
+    let p: CreateTaskParams = serde_json::from_value(serde_json::json!({
+        "title": "Child",
+        "description": "do it",
+        "projectId": 2,
+        "featureId": 9,
+    }))
+    .unwrap();
+    let err = mcp.create_task(Parameters(p)).await.unwrap_err();
+    assert!(err.message.contains("belongs to project 1"), "{err:?}");
+}
+
+#[tokio::test]
+async fn create_task_daemon_project_id_equal_to_current_behaves_as_before() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/70"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(task_detail_json(70, serde_json::json!([]))))
+        .expect(2) // both create_task calls below look up the current ticket
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks"))
+        .and(body_json(serde_json::json!({
+            "projectId": 1,
+            "featureId": 3,
+            "title": "Child",
+            "description": "do it",
+            "parentTaskId": 70,
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 44})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp(server.uri(), Role::DevAgentSupervise, Some(70));
+    // projectId equal to the current ticket's project is a no-op; featureId
+    // stays banned in that case.
+    let p: CreateTaskParams = serde_json::from_value(serde_json::json!({
+        "title": "Child",
+        "description": "do it",
+        "projectId": 1,
+    }))
+    .unwrap();
+    let result = mcp.create_task(Parameters(p)).await.unwrap();
+    assert!(result_text(result).contains("\"id\": 44"));
+
+    let p: CreateTaskParams = serde_json::from_value(serde_json::json!({
+        "title": "Child",
+        "description": "do it",
+        "projectId": 1,
+        "featureId": 3,
+    }))
+    .unwrap();
+    let err = mcp.create_task(Parameters(p)).await.unwrap_err();
+    assert!(err.message.contains("featureId must not be provided"), "{err:?}");
+}
+
+/// Gating contract: `create_task` stays available in implement/supervise and
+/// gated away in plan/review — cross-project support changes nothing here.
+#[test]
+fn create_task_role_gates_are_unchanged() {
+    for role in [Role::DevAgentPlan, Role::DevAgentReview] {
+        assert!(role.is_gated("create_task"), "create_task must be gated in {role}");
+    }
+    for role in [Role::Full, Role::DevAgentImplement, Role::DevAgentSupervise] {
+        assert!(!role.is_gated("create_task"), "create_task must be open in {role}");
+    }
+}
+
+#[tokio::test]
 async fn update_task_forwards_task_kind() {
     let server = MockServer::start().await;
     Mock::given(method("PUT"))
