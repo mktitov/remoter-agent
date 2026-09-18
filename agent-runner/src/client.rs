@@ -151,6 +151,23 @@ impl ProjectRepoConfig {
     }
 }
 
+/// Resolve one project's repo config over the API (cross-project supervised
+/// children live in a different project than the running ticket). `None` when
+/// the project is not agent-managed on this daemon or the fetch failed — the
+/// caller decides how to degrade (a failed fetch must never fail a run).
+pub async fn project_repo_config(client: &RemoterClient, project_id: i32) -> Option<ProjectRepoConfig> {
+    match client.projects().await {
+        Ok(ps) => ps
+            .into_iter()
+            .find(|p| p.id == project_id)
+            .and_then(ProjectRepoConfig::from_dto),
+        Err(e) => {
+            tracing::warn!(project_id, error = %e, "could not list projects");
+            None
+        }
+    }
+}
+
 /// The gated forge-config payload from `GET /projects/{id}/forge-config`
 /// (camelCase, spec §4.4) — the only API response carrying the raw forge token.
 /// All-null `forge_kind` = no forge configured; the daemon skips push/PR.

@@ -259,6 +259,60 @@ struct PrResponse {
     web_url: Option<String>,
 }
 
+/// Replaces the body of an existing PR/MR (the cross-project integration
+/// PR's body is refreshed on every accepted child, docs/specs/
+/// cross-repo-projects.md): GitHub `PATCH {api}/repos/{o}/{r}/pulls/{n}`,
+/// GitLab `PUT {api}/projects/{path}/merge_requests/{n}` — only the
+/// body/description field is sent; GitLab's draft state lives in the title,
+/// which is deliberately left untouched. Same URL/auth/header conventions as
+/// [`create_pr`]. `body` must be the complete rendered body, including any
+/// header line [`create_pr`] would have added — it is clamped to the same
+/// limit.
+pub async fn update_pr_body(
+    http: &reqwest::Client,
+    kind: ForgeKind,
+    api_base: Option<&str>,
+    token: &str,
+    repo_url: &str,
+    pr_number: u64,
+    body: &str,
+) -> Result<(), ForgeError> {
+    let api_base = api_base
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| kind.default_api_base())
+        .trim_end_matches('/');
+    let body = clamp_chars(body, MAX_PR_BODY_CHARS);
+    match kind {
+        ForgeKind::GitHub => {
+            let (owner, repo) = github_owner_repo(repo_url)?;
+            let resp = http
+                .patch(format!("{api_base}/repos/{owner}/{repo}/pulls/{pr_number}"))
+                .bearer_auth(token)
+                .header("User-Agent", USER_AGENT)
+                .header("Accept", "application/vnd.github+json")
+                .json(&serde_json::json!({ "body": body }))
+                .send()
+                .await
+                .map_err(|e| ForgeError::Api(format!("PATCH pulls/{pr_number}: {e}")))?;
+            decode::<serde_json::Value>(resp).await?;
+        }
+        ForgeKind::GitLab => {
+            let path = gitlab_project_path(repo_url)?;
+            let resp = http
+                .put(format!("{api_base}/projects/{path}/merge_requests/{pr_number}"))
+                .header("PRIVATE-TOKEN", token)
+                .header("User-Agent", USER_AGENT)
+                .json(&serde_json::json!({ "description": body }))
+                .send()
+                .await
+                .map_err(|e| ForgeError::Api(format!("PUT merge_requests/{pr_number}: {e}")))?;
+            decode::<serde_json::Value>(resp).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn decode<T: serde::de::DeserializeOwned>(resp: reqwest::Response) -> Result<T, ForgeError> {
     let status = resp.status();
     if status.is_success() {

@@ -466,6 +466,13 @@ impl Daemon {
             };
             let repo = workspace::repo_dir(&self.config.workspace_root, t.project_id);
             let wt = workspace::worktree_dir(&self.config.workspace_root, t.project_id, t.id);
+            // A completed parent's cross-project integration branches
+            // (`agent/feature-<id>-*` in child-project clones,
+            // docs/specs/cross-repo-projects.md) die with it — the sweep is
+            // idempotent and must also run when the parent's own worktree and
+            // branch are already gone (a pure orchestrator parent never had
+            // either).
+            workspace::cleanup_integration_branches(&self.config.workspace_root, t.id).await;
             if !wt.exists() && !workspace::local_branch_exists(&repo, &branch).await {
                 continue;
             }

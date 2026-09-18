@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    client::{CommentDto, ProjectRepoConfig, RemoterClient, TaskDetail, TaskSummary},
+    client::{self, CommentDto, ProjectRepoConfig, RemoterClient, TaskDetail, TaskSummary},
     config::Config,
     driver::{AgentDriver, DriverError, RunFailure, RunOutcome, RunSpec},
     logstore::LogStore,
@@ -584,11 +584,14 @@ struct VerdictContext<'a> {
 enum ChildDiff {
     /// `git diff <base>...<child>`, capped to the prompt budget.
     Present(String),
-    /// The child's branch has no local ref.
+    /// The child's branch has no ref in the diff's clone (local or origin).
     ChildBranchMissing,
     /// The parent's branch exists neither locally nor on `origin` — there is
     /// no diff base at all.
     ParentBranchMissing,
+    /// The child's project is not agent-managed on this daemon — the daemon
+    /// has no repo URL to clone, so there is no git context at all.
+    ProjectUnmanaged,
     /// Both refs exist but `git diff` failed.
     DiffFailed,
 }
@@ -597,19 +600,25 @@ enum ChildDiff {
 #[derive(Clone)]
 struct ChildGit {
     branch: String,
+    /// The ref the diff and the commit count were computed against: the
+    /// parent's branch (same-project child) or the parent's integration
+    /// branch in the child's own clone (cross-project child).
+    diff_base: Option<String>,
     /// Commits the child branch adds on top of the diff base.
     commits_ahead: Option<u32>,
     diff: ChildDiff,
+    /// Cross-project marker (docs/specs/cross-repo-projects.md):
+    /// `Some(Some(repo_url))` — the child's project is agent-managed here and
+    /// its branch is mounted read-only at `.refs/task-<childId>/`;
+    /// `Some(None)` — the project is not agent-managed on this daemon. `None`
+    /// for a same-project child.
+    cross_project: Option<Option<String>>,
 }
 
-/// Git facts for the whole supervise run; `None` when the project has no
-/// local clone (the prompt degrades to a report-only review).
+/// Git facts for the whole supervise run; `None` when the parent's project
+/// has no local clone (the prompt degrades to a report-only review).
 struct GitContext {
     parent_branch: String,
-    /// The ref the diffs and commit counts were computed against: the
-    /// parent's local branch, or `origin/<parent>` when only a remote copy
-    /// survived; `None` when the parent's branch is missing everywhere.
-    diff_base: Option<String>,
     children: HashMap<i32, ChildGit>,
 }
 
@@ -839,9 +848,24 @@ async fn run_attempt(
     // transient error with retry). The guard's drop is the teardown on every
     // exit path, including cancellation mid-turn. A parent whose project is
     // not agent-managed has no repo to build an image from — it keeps the
-    // host path (its review is report-only anyway).
+    // host path (its review is report-only anyway). Cross-project children
+    // are mounted read-only as `.refs/task-<childId>` (fail-open per child);
+    // same-project children stay reachable via git objects of the shared
+    // clone and are NOT mounted.
+    let mut child_refs: Vec<workspace::RefMount> = Vec::new();
     let containers = match &rc.project {
         Some(project) => {
+            child_refs = mount_cross_project_children(
+                &rc.client,
+                &rc.config.workspace_root,
+                project.project_id,
+                rc.parent.id,
+                &rc.review_children,
+            )
+            .await;
+            if !child_refs.is_empty() {
+                exclude_refs_from_status(env.cwd).await;
+            }
             match run::start_container_runtime(
                 &rc.config,
                 &rc.image_locks,
@@ -850,7 +874,7 @@ async fn run_attempt(
                 env.cwd,
                 env.devenv,
                 &env_vars,
-                &[],
+                &child_refs,
             )
             .await
             {
@@ -860,6 +884,18 @@ async fn run_attempt(
         }
         None => None,
     };
+    if containers.is_none() {
+        // Host mode surfaces the mounts as symlinks (container mode
+        // bind-mounts them — see container.rs, no change needed there).
+        for (mount, error) in workspace::link_refs_into(env.cwd, &child_refs).await {
+            note(
+                &rc.client,
+                rc.parent.id,
+                format!("cross-project child mount `{mount}` could not be linked into the worktree: {error} — the run continues without it"),
+            )
+            .await;
+        }
+    }
     if containers.is_none()
         && env.devenv
         && let Err(e) = workspace::services_up(env.cwd, &env_vars).await
@@ -922,6 +958,125 @@ async fn note(client: &RemoterClient, task_id: i32, body: String) {
     run::note(client, task_id, body).await
 }
 
+/// Read-only mounts of a run's cross-project children
+/// (`workspace::prepare_branch_reference` per child, mount name
+/// `task-<childId>`): a cross-project child's branch lives in another
+/// project's repo, which the run's own clone can never show. Same-project
+/// children are NOT mounted — the shared clone reaches their branch via git
+/// objects. Fail-open per child (warn + thread note on the run's ticket),
+/// mirroring how `run::attempt_run` handles `refs.failed`: a missing mount
+/// must never fail the run. Shared by the supervise and review runs.
+pub(crate) async fn mount_cross_project_children(
+    client: &RemoterClient,
+    root: &Path,
+    run_project_id: i32,
+    run_task_id: i32,
+    child_ids: &[i32],
+) -> Vec<workspace::RefMount> {
+    let mut mounted = Vec::new();
+    for child_id in child_ids {
+        let child = match client.task_detail(*child_id).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(child_id, error = %e, "could not fetch the child detail for a ref mount; skipped");
+                continue;
+            }
+        };
+        if child.project_id == run_project_id {
+            continue;
+        }
+        // The unmanaged-project case is already noted by the git-context /
+        // accept paths — mounting needs the repo URL, so there is nothing
+        // more to do here.
+        let Some(child_project) = client::project_repo_config(client, child.project_id).await else {
+            continue;
+        };
+        let branch = workspace::existing_branch(root, child.project_id, child.id)
+            .await
+            .unwrap_or_else(|| workspace::branch_name(child.id, &child.title));
+        let mount = format!("task-{child_id}");
+        match workspace::prepare_branch_reference(
+            root,
+            run_project_id,
+            run_task_id,
+            &mount,
+            &child_project.repo_url,
+            &branch,
+        )
+        .await
+        {
+            Ok(m) => mounted.push(m),
+            Err(e) => {
+                tracing::warn!(child_id, error = %e, "cross-project child ref mount failed; continuing without it");
+                note(
+                    client,
+                    run_task_id,
+                    format!("cross-project child #{child_id}'s branch `{branch}` could not be mounted read-only: {e} — the run continues without it"),
+                )
+                .await;
+            }
+        }
+    }
+    mounted
+}
+
+/// Appends `.refs/` to the worktree's `info/exclude` (idempotent,
+/// best-effort) so the read-only child mounts never dirty
+/// `git status --porcelain` — the accept path's dirty-worktree guard and the
+/// agent's own status reads must stay clean. The workspace module's own copy
+/// of this step is private to `prepare_reference_repos`, hence this twin.
+/// No-op when `worktree` is not inside a git repository.
+pub(crate) async fn exclude_refs_from_status(worktree: &Path) {
+    let Ok(out) = tokio::process::Command::new("git")
+        .current_dir(worktree)
+        .args(["rev-parse", "--git-path", "info/exclude"])
+        .output()
+        .await
+    else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    let path = {
+        let p = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+        if p.is_absolute() { p } else { worktree.join(p) }
+    };
+    let Ok(mut content) = tokio::fs::read_to_string(&path).await else {
+        return;
+    };
+    if content.lines().any(|l| l.trim() == ".refs/") {
+        return;
+    }
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(".refs/\n");
+    if let Err(e) = tokio::fs::write(&path, content).await {
+        tracing::warn!(path = ?path, error = %e, "could not exclude .refs/ from git status");
+    }
+}
+
+/// `git <args>` in `dir`. The cross-project accept needs raw `worktree
+/// add`/`remove` commands that the workspace module does not expose (it only
+/// manages per-ticket and reference worktrees).
+async fn git(dir: &Path, args: &[&str]) -> Result<(), workspace::WorkspaceError> {
+    let out = tokio::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| workspace::WorkspaceError(format!("git {}: {e}", args.join(" "))))?;
+    if !out.status.success() {
+        return Err(workspace::WorkspaceError(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    Ok(())
+}
+
 // ── prompt ────────────────────────────────────────────────────────────────────
 
 /// Fetches the parent detail and the reviewing children's details, computes
@@ -945,9 +1100,12 @@ async fn build_prompt(rc: &SuperviseContext) -> Result<String, crate::client::Cl
     ))
 }
 
-/// Git facts for the prompt: the parent's branch plus, per child, the branch,
-/// commits-ahead count, and the three-dot diff against the parent. `None`
-/// when the project is not agent-managed or has no local clone yet.
+/// Git facts for the prompt: per child, the branch, commits-ahead count, and
+/// the three-dot diff against its base. Same-project children diff against
+/// the parent's branch in the shared clone; cross-project children
+/// (docs/specs/cross-repo-projects.md) diff against the parent's integration
+/// branch in their own project's clone. `None` when the parent's project is
+/// not agent-managed or has no local clone yet.
 async fn git_context(rc: &SuperviseContext, children: &[TaskDetail]) -> Option<GitContext> {
     let project = rc.project.as_ref()?;
     let root = &rc.config.workspace_root;
@@ -956,19 +1114,133 @@ async fn git_context(rc: &SuperviseContext, children: &[TaskDetail]) -> Option<G
         return None;
     }
     let parent_branch = parent_branch(rc).await?;
-    let mut child_branches = Vec::with_capacity(children.len());
+    let mut same_project = Vec::new();
+    let mut cross_project = HashMap::new();
     for child in children {
-        let branch = workspace::existing_branch(root, project.project_id, child.id)
-            .await
-            .unwrap_or_else(|| workspace::branch_name(child.id, &child.title));
-        child_branches.push((child.id, branch));
+        if child.project_id == project.project_id {
+            let branch = workspace::existing_branch(root, project.project_id, child.id)
+                .await
+                .unwrap_or_else(|| workspace::branch_name(child.id, &child.title));
+            same_project.push((child.id, branch));
+            continue;
+        }
+        cross_project.insert(child.id, cross_project_child_git(rc, child).await);
     }
-    Some(collect_git_context(&repo, &parent_branch, &child_branches).await)
+    let mut ctx = collect_git_context(&repo, &parent_branch, &same_project).await;
+    ctx.children.extend(cross_project);
+    Some(ctx)
+}
+
+/// Git facts for one cross-project child, resolved in the CHILD project's
+/// clone. An unmanaged child project (no repo config on this daemon)
+/// degrades to `ChildDiff::ProjectUnmanaged` plus a thread note on the
+/// parent — a supervise run must never fail over a child it cannot manage
+/// (human decision: skip + note).
+async fn cross_project_child_git(rc: &SuperviseContext, child: &TaskDetail) -> ChildGit {
+    let branch = workspace::existing_branch(&rc.config.workspace_root, child.project_id, child.id)
+        .await
+        .unwrap_or_else(|| workspace::branch_name(child.id, &child.title));
+    let Some(child_project) = client::project_repo_config(&rc.client, child.project_id).await else {
+        note(
+            &rc.client,
+            rc.parent.id,
+            format!(
+                "child #{} lives in project \"{}\" (id {}), which is not agent-managed on this \
+                 daemon — skipping the cross-project git handling; the supervisor reviews its \
+                 report and thread only",
+                child.id, child.project_name, child.project_id
+            ),
+        )
+        .await;
+        return ChildGit {
+            branch,
+            diff_base: None,
+            commits_ahead: None,
+            diff: ChildDiff::ProjectUnmanaged,
+            cross_project: Some(None),
+        };
+    };
+    cross_project_child_git_in(
+        &rc.config.workspace_root,
+        rc.parent.id,
+        &rc.parent.title,
+        child.id,
+        &branch,
+        &child_project,
+    )
+    .await
+}
+
+/// The pure-git half of [`cross_project_child_git`], split out so tests can
+/// run it against scratch clones without a `RemoterClient`: ensure the child
+/// project's clone and the parent's integration branch in it, reattach the
+/// child's branch from origin when only a remote copy survived (same
+/// self-heal as the accept path, #138), then compute `integration...child`.
+async fn cross_project_child_git_in(
+    root: &Path,
+    parent_id: i32,
+    parent_title: &str,
+    child_id: i32,
+    child_branch: &str,
+    child_project: &ProjectRepoConfig,
+) -> ChildGit {
+    let mut cg = ChildGit {
+        branch: child_branch.to_string(),
+        diff_base: None,
+        commits_ahead: None,
+        diff: ChildDiff::DiffFailed,
+        cross_project: Some(Some(child_project.repo_url.clone())),
+    };
+    let repo = match workspace::ensure_repo_clone(root, child_project.project_id, &child_project.repo_url).await {
+        Ok(repo) => repo,
+        Err(e) => {
+            tracing::warn!(child_id, error = %e, "supervise: child project clone unavailable");
+            return cg;
+        }
+    };
+    let base = match workspace::ensure_integration_branch(
+        &repo,
+        parent_id,
+        parent_title,
+        child_project.base_branch.as_deref(),
+    )
+    .await
+    {
+        Ok(base) => base,
+        Err(e) => {
+            tracing::warn!(child_id, error = %e, "supervise: integration branch unavailable");
+            return cg;
+        }
+    };
+    cg.diff_base = Some(base.clone());
+    match workspace::ensure_local_branch(&repo, child_branch).await {
+        Ok(workspace::LocalBranchState::Missing) => {
+            cg.diff = ChildDiff::ChildBranchMissing;
+            return cg;
+        }
+        Err(e) => {
+            tracing::warn!(child_id, error = %e, "supervise: child branch reattach failed");
+            return cg;
+        }
+        Ok(_) => {}
+    }
+    cg.commits_ahead = workspace::commit_count(&repo, &format!("{base}..{child_branch}"))
+        .await
+        .ok();
+    cg.diff = match workspace::diff(&repo, &format!("{base}...{child_branch}")).await {
+        Ok(d) => ChildDiff::Present(run::truncate_with_marker(&d, MAX_DIFF_BYTES)),
+        Err(e) => {
+            tracing::warn!(child_id, error = %e, "supervise: could not compute the cross-project child diff");
+            ChildDiff::DiffFailed
+        }
+    };
+    cg
 }
 
 /// Pure git-ref facts for the prompt, split out from `git_context` (which
 /// resolves branch names from the workspace) so tests can run it against
-/// scratch repositories.
+/// scratch repositories. Same-project children only — cross-project children
+/// are resolved per child in their own clone by `cross_project_child_git`.
 ///
 /// The diff base is the parent's local branch; when that ref is gone (a
 /// wiped/recreated workspace, a renamed ticket) the parent's remote-tracking
@@ -996,25 +1268,11 @@ async fn collect_git_context(repo: &Path, parent_branch: &str, children: &[(i32,
     let mut map = HashMap::new();
     for (child_id, branch) in children {
         let Some(base) = &diff_base else {
-            map.insert(
-                *child_id,
-                ChildGit {
-                    branch: branch.clone(),
-                    commits_ahead: None,
-                    diff: ChildDiff::ParentBranchMissing,
-                },
-            );
+            map.insert(*child_id, child_git(branch, None, None, ChildDiff::ParentBranchMissing));
             continue;
         };
         if !workspace::local_branch_exists(repo, branch).await {
-            map.insert(
-                *child_id,
-                ChildGit {
-                    branch: branch.clone(),
-                    commits_ahead: None,
-                    diff: ChildDiff::ChildBranchMissing,
-                },
-            );
+            map.insert(*child_id, child_git(branch, None, None, ChildDiff::ChildBranchMissing));
             continue;
         }
         let ahead = workspace::commit_count(repo, &format!("{base}..{branch}")).await.ok();
@@ -1025,19 +1283,23 @@ async fn collect_git_context(repo: &Path, parent_branch: &str, children: &[(i32,
                 ChildDiff::DiffFailed
             }
         };
-        map.insert(
-            *child_id,
-            ChildGit {
-                branch: branch.clone(),
-                commits_ahead: ahead,
-                diff,
-            },
-        );
+        map.insert(*child_id, child_git(branch, Some(base.clone()), ahead, diff));
     }
     GitContext {
         parent_branch: parent_branch.to_string(),
-        diff_base,
         children: map,
+    }
+}
+
+/// A same-project child's git facts (`cross_project: None` — the diff base
+/// and the branch both live in the parent's clone).
+fn child_git(branch: &str, diff_base: Option<String>, commits_ahead: Option<u32>, diff: ChildDiff) -> ChildGit {
+    ChildGit {
+        branch: branch.to_string(),
+        diff_base,
+        commits_ahead,
+        diff,
+        cross_project: None,
     }
 }
 
@@ -1065,13 +1327,16 @@ const SUPERVISE_INSTRUCTIONS: &str = "## Instructions\nYou are the supervisor fo
      - When a child produced no code changes (a ticket-creation run), review its outcome and \
      either approve or list what is missing.\n\n";
 
-/// Extra rule appended to the instructions in container mode: child worktrees
-/// are not mounted into the supervise run's container, so the supervisor must
-/// read child work through git objects of the shared clone, never the FS.
-const CONTAINER_INSTRUCTIONS: &str = "- CONTAINER MODE: child worktrees (`wt-<child>`) are NOT available on the \
-     filesystem here — read the child's work via git objects of the shared clone: \
+/// Extra rule appended to the instructions in container mode: same-project
+/// child worktrees are not mounted into the supervise run's container, so the
+/// supervisor reads their work through git objects of the shared clone;
+/// cross-project children ARE mounted read-only under `.refs/task-<childId>/`
+/// (their branch lives in another repo, unreachable by the shared clone).
+const CONTAINER_INSTRUCTIONS: &str = "- CONTAINER MODE: same-project child worktrees (`wt-<child>`) are NOT available on \
+     the filesystem here — read the child's work via git objects of the shared clone: \
      `git show <child-branch>:<path>` for file contents, `git diff <base>...<child-branch>` \
-     for changes.\n\n";
+     for changes. Cross-project children (marked `cross-project` in their section) ARE mounted \
+     read-only at `.refs/task-<childId>/` — read them freely, never write there.\n\n";
 
 /// Pure prompt assembly, split out for tests. `git` is `None` when no local
 /// clone exists — the prompt then degrades to a report-only review.
@@ -1119,11 +1384,24 @@ fn render_prompt(
             Some(g) => match g.children.get(&child.id) {
                 None => p.push_str("_Git context unavailable for this child._\n\n"),
                 Some(cg) => {
+                    if let Some(repo) = &cg.cross_project {
+                        match repo {
+                            Some(repo_url) => p.push_str(&format!(
+                                "Project: {} (cross-project, repo {repo_url}) — the child branch is mounted \
+                                 read-only at `.refs/task-{}`\n\n",
+                                child.project_name, child.id
+                            )),
+                            None => p.push_str(&format!(
+                                "Project: {} (cross-project — not agent-managed on this daemon)\n\n",
+                                child.project_name
+                            )),
+                        }
+                    }
                     let ahead = cg
                         .commits_ahead
                         .map(|n| format!("{n} commit(s)"))
                         .unwrap_or_else(|| "unknown".to_string());
-                    match (&cg.diff, &g.diff_base) {
+                    match (&cg.diff, &cg.diff_base) {
                         (ChildDiff::Present(diff), Some(base)) => {
                             p.push_str(&format!("Branch: `{}` ({} ahead of `{}`)\n\n", cg.branch, ahead, base));
                             p.push_str(&format!("#### Diff (`{base}`...`{}`)\n\n", cg.branch));
@@ -1141,6 +1419,10 @@ fn render_prompt(
                              merging._\n\n",
                             g.parent_branch
                         )),
+                        (ChildDiff::ProjectUnmanaged, _) => p.push_str(
+                            "_The child's project is not agent-managed on this daemon — there is \
+                             no git context; review the report and thread._\n\n",
+                        ),
                         (ChildDiff::DiffFailed, base) => p.push_str(&format!(
                             "_The diff against `{}` could not be computed — review the report \
                              and thread._\n\n",
@@ -1291,13 +1573,29 @@ fn record_give_up(rc: &SuperviseContext, child_id: i32, verdict: Option<&str>, r
         .insert(child_id, format!("{}:{reason}", verdict.unwrap_or("-")));
 }
 
-/// `changes_requested`: return the ticket to `implement` (a regular agent
-/// transition — the daemon is the assignee), then post the review to the
-/// child's thread (the bounced agent reads its prompt from the thread). The
-/// note reflects the actual outcome: it is only posted once the status move
-/// landed, so a transient failure cannot leave a "bounced" note on a child
-/// that is still in `review` (review #110).
+/// `changes_requested`: return the ticket to `implement` with the review
+/// body as the reason (the bounced agent reads its prompt from the thread).
 async fn bounce_child(rc: &SuperviseContext, child: &TaskDetail) {
+    let body = child
+        .review
+        .as_deref()
+        .filter(|b| !b.trim().is_empty())
+        .unwrap_or("(supervisor requested changes but wrote no review body)");
+    bounce_child_with_reason(
+        rc,
+        child,
+        &format!("## Supervisor review — changes requested\n\n{body}"),
+    )
+    .await;
+}
+
+/// The shared bounce path: return the ticket to `implement` (a regular agent
+/// transition — the daemon is the assignee), then post the reason to the
+/// child's thread. `reason` is the full markdown body of the thread note.
+/// The note reflects the actual outcome: it is only posted once the status
+/// move landed, so a transient failure cannot leave a "bounced" note on a
+/// child that is still in `review` (review #110).
+async fn bounce_child_with_reason(rc: &SuperviseContext, child: &TaskDetail, reason: &str) {
     // Circuit-breaker backstop: a supervise run already in flight when the
     // breaker tripped (or a trigger from before the last failure was
     // recorded) must not bounce the child into yet another failing run —
@@ -1321,19 +1619,12 @@ async fn bounce_child(rc: &SuperviseContext, child: &TaskDetail) {
         );
         return;
     }
-    let body = child
-        .review
-        .as_deref()
-        .filter(|b| !b.trim().is_empty())
-        .unwrap_or("(supervisor requested changes but wrote no review body)");
     match rc.client.set_task_status(child.id, "implement").await {
         Ok(()) => {
             note(
                 &rc.client,
                 child.id,
-                format!(
-                    "## Supervisor review — changes requested\n\n{body}\n\n— bounced to implement by the supervisor."
-                ),
+                format!("{reason}\n\n— bounced to implement by the supervisor."),
             )
             .await;
             tracing::info!(child_id = child.id, "supervise: changes requested → implement");
@@ -1345,7 +1636,7 @@ async fn bounce_child(rc: &SuperviseContext, child: &TaskDetail) {
             note(
                 &rc.client,
                 child.id,
-                format!("## Supervisor review — changes requested\n\n{body}\n\n— the supervisor tried to return the ticket to `implement`, but the status write failed ({e}); it will retry."),
+                format!("{reason}\n\n— the supervisor tried to return the ticket to `implement`, but the status write failed ({e}); it will retry."),
             )
             .await;
             tracing::warn!(child_id = child.id, error = %e, "supervise: bounce failed; the supervision loop retries");
@@ -1378,6 +1669,13 @@ async fn accept_child(
         return;
     };
     let root = &rc.config.workspace_root;
+    // Cross-project child (docs/specs/cross-repo-projects.md): the merge
+    // target is the parent's integration branch in the CHILD project's clone
+    // — the parent's own branch does not exist there.
+    if child.project_id != project.project_id {
+        accept_cross_project_child(rc, child).await;
+        return;
+    }
     let repo = workspace::repo_dir(root, project.project_id);
     let Some(parent_branch) = parent_branch(rc).await else {
         return;
@@ -1548,6 +1846,393 @@ async fn accept_child(
             .await;
         }
     }
+}
+
+/// `approve` for a cross-project child (docs/specs/cross-repo-projects.md):
+/// merge the child's branch into the parent's integration branch in the
+/// CHILD project's clone, push it, then complete the child and open/refresh
+/// the integration draft PR. A conflict bounces the child back to
+/// `implement` with the conflicted paths — no agent nudge loop here (the
+/// ticket's explicit choice): the child resolves against the integration
+/// branch in its own repo. An unmanaged child project is skipped with a
+/// thread note on the parent — never a run failure.
+async fn accept_cross_project_child(rc: &SuperviseContext, child: &TaskDetail) {
+    let Some(child_project) = client::project_repo_config(&rc.client, child.project_id).await else {
+        note(
+            &rc.client,
+            rc.parent.id,
+            format!(
+                "supervisor approved child #{}, but its project \"{}\" (id {}) is not agent-managed \
+                 on this daemon — the cross-project merge was skipped; the child is left in review \
+                 for a human",
+                child.id, child.project_name, child.project_id
+            ),
+        )
+        .await;
+        return;
+    };
+    let root = &rc.config.workspace_root;
+    let child_branch = workspace::existing_branch(root, child.project_id, child.id)
+        .await
+        .unwrap_or_else(|| workspace::branch_name(child.id, &child.title));
+    match merge_into_integration_branch(
+        root,
+        rc.parent.id,
+        &rc.parent.title,
+        child.id,
+        &child_project,
+        &child_branch,
+    )
+    .await
+    {
+        Ok(IntegrationMerge::Merged(integration_branch)) => {
+            complete_child(rc, child.id, &child_branch, &integration_branch).await;
+            ensure_integration_pr(rc, child, &child_project, &integration_branch).await;
+        }
+        Ok(IntegrationMerge::Conflicted {
+            integration_branch,
+            unmerged,
+        }) => {
+            bounce_child_with_reason(
+                rc,
+                child,
+                &cross_project_conflict_reason(&child_branch, &integration_branch, &unmerged),
+            )
+            .await;
+        }
+        Err(e) => {
+            record_give_up(
+                rc,
+                child.id,
+                child.review_verdict.as_deref(),
+                "integration-merge-failed",
+            );
+            note(
+                &rc.client,
+                child.id,
+                format!("supervisor approved, but merging into the integration branch failed: {e} — left in review for a human"),
+            )
+            .await;
+        }
+    }
+}
+
+/// The git half of a cross-project accept (split out for tests — no API).
+enum IntegrationMerge {
+    /// Merged and pushed; carries the integration branch name.
+    Merged(String),
+    /// The merge stopped on conflicts; the integration branch (and its
+    /// origin copy) is untouched. Carries the branch name + unmerged paths.
+    Conflicted {
+        integration_branch: String,
+        unmerged: Vec<String>,
+    },
+}
+
+/// Merge `child_branch` into the parent's integration branch inside the
+/// child project's clone: ensure the clone and the integration branch,
+/// reattach the child's branch from origin when only a remote copy survived
+/// (same self-heal as the same-project accept, #138), merge in a throwaway
+/// `wt-integration-<parentId>` worktree (the integration branch's checkout
+/// must never compete with a running child), push on success. The temporary
+/// worktree is removed on EVERY outcome — a leftover would pin the
+/// integration branch checkout and confuse the next accept.
+async fn merge_into_integration_branch(
+    root: &Path,
+    parent_id: i32,
+    parent_title: &str,
+    child_id: i32,
+    child_project: &ProjectRepoConfig,
+    child_branch: &str,
+) -> Result<IntegrationMerge, workspace::WorkspaceError> {
+    let repo = workspace::ensure_repo_clone(root, child_project.project_id, &child_project.repo_url).await?;
+    let integration =
+        workspace::ensure_integration_branch(&repo, parent_id, parent_title, child_project.base_branch.as_deref())
+            .await?;
+    if let workspace::LocalBranchState::Missing = workspace::ensure_local_branch(&repo, child_branch).await? {
+        return Err(workspace::WorkspaceError(format!(
+            "child branch `{child_branch}` does not exist locally or on origin"
+        )));
+    }
+    let tmp = workspace::project_dir(root, child_project.project_id).join(format!("wt-integration-{parent_id}"));
+    if tmp.exists() {
+        // Leftover from a crashed accept — clear it before re-adding.
+        let _ = git(&repo, &["worktree", "remove", "--force", &tmp.to_string_lossy()]).await;
+    }
+    git(&repo, &["worktree", "add", &tmp.to_string_lossy(), &integration]).await?;
+    let message = format!("Merge child #{child_id} ({child_branch}) into {integration}");
+    let result = match workspace::merge(&tmp, child_branch, &message).await {
+        Ok(workspace::MergeOutcome::Clean) => workspace::push(&tmp, &integration)
+            .await
+            .map(|_| IntegrationMerge::Merged(integration.clone())),
+        Ok(workspace::MergeOutcome::Conflicted) => Ok(IntegrationMerge::Conflicted {
+            integration_branch: integration.clone(),
+            unmerged: workspace::unmerged_paths(&tmp).await.unwrap_or_default(),
+        }),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = git(&repo, &["worktree", "remove", "--force", &tmp.to_string_lossy()]).await {
+        tracing::warn!(dir = ?tmp, error = %e, "could not remove the integration merge worktree");
+    }
+    result
+}
+
+/// The bounce body for a cross-project merge conflict: the child resolves
+/// against the integration branch in its OWN repo (its PR's base), not the
+/// parent's branch.
+fn cross_project_conflict_reason(child_branch: &str, integration_branch: &str, unmerged: &[String]) -> String {
+    let files = unmerged.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n");
+    format!(
+        "## Supervisor — merge conflict against the integration branch\n\n\
+         the supervisor approved, but merging your branch `{child_branch}` into the parent \
+         ticket's integration branch `{integration_branch}` stopped on conflicts:\n{files}\n\n\
+         Update your branch against the integration branch (fetch it, merge or rebase onto it, \
+         resolve the conflicts), run the project checks, and push — your PR targets the \
+         integration branch, so the conflict is yours to resolve in this repo."
+    )
+}
+
+/// Marker of the daemon's integration-PR note on the parent's thread — the
+/// idempotency key (same pattern as `run.rs`'s `STACKING_NOTE_MARKER`): the
+/// note carries the PR URL on a `PR: <url>` line, so a later accept finds it
+/// and UPDATEs the PR body instead of opening a duplicate.
+const INTEGRATION_PR_MARKER: &str = "integration PR (draft)";
+
+/// After a successful cross-project accept: open (first accept) or refresh
+/// (later accepts) the draft PR `integration branch → child project base` in
+/// the child's repo. Fail-open throughout — warn + thread note, never fail
+/// the accept: the merge is already pushed and the child completed. No forge
+/// configured on the child project → silently skipped.
+async fn ensure_integration_pr(
+    rc: &SuperviseContext,
+    child: &TaskDetail,
+    child_project: &ProjectRepoConfig,
+    integration_branch: &str,
+) {
+    let parent_id = rc.parent.id;
+
+    let cfg = match rc.client.forge_config(child_project.project_id).await {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::warn!(parent_id, error = %e, "supervise: could not fetch the child project's forge config");
+            note(
+                &rc.client,
+                parent_id,
+                format!(
+                    "could not open the integration PR for child #{}: forge config fetch failed ({e})",
+                    child.id
+                ),
+            )
+            .await;
+            return;
+        }
+    };
+    let Some(kind) = cfg.forge_kind.as_deref() else {
+        return;
+    };
+    let kind = match crate::forge::ForgeKind::from_token(kind) {
+        Ok(k) => k,
+        Err(e) => {
+            note(
+                &rc.client,
+                parent_id,
+                format!("could not open the integration PR for child #{}: {e}", child.id),
+            )
+            .await;
+            return;
+        }
+    };
+    let Some(token) = cfg.forge_token.as_deref() else {
+        note(
+            &rc.client,
+            parent_id,
+            format!(
+                "could not open the integration PR for child #{}: the child project's forge token is not configured",
+                child.id
+            ),
+        )
+        .await;
+        return;
+    };
+
+    // The body lists every accepted cross-project child in this project, so
+    // it is rebuilt (not appended) on every accept.
+    let parent_detail = match rc.client.task_detail(parent_id).await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(parent_id, error = %e, "supervise: could not fetch the parent detail for the integration PR");
+            return;
+        }
+    };
+    let child_ids: Vec<i32> = parent_detail
+        .links
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .filter(|l| l.relation == "parent")
+        .map(|l| l.task_id)
+        .collect();
+    let mut accepted: Vec<(i32, String)> = Vec::new();
+    for id in child_ids {
+        // The just-accepted child's detail still reads `review` — count it.
+        if id == child.id {
+            accepted.push((child.id, child.title.clone()));
+            continue;
+        }
+        match rc.client.task_detail(id).await {
+            Ok(c) if c.project_id == child_project.project_id && c.task_status == "completed" => {
+                accepted.push((c.id, c.title.clone()));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(parent_id, child_id = id, error = %e, "supervise: could not fetch a child for the integration PR body")
+            }
+        }
+    }
+    accepted.sort_by_key(|(id, _)| *id);
+
+    let repo = workspace::repo_dir(&rc.config.workspace_root, child_project.project_id);
+    let base = match child_project.base_branch.clone() {
+        Some(b) => b,
+        None => match workspace::remote_default_branch(&repo).await {
+            Ok(b) => b,
+            Err(e) => {
+                note(
+                    &rc.client,
+                    parent_id,
+                    format!(
+                        "could not open the integration PR for child #{}: default branch: {e}",
+                        child.id
+                    ),
+                )
+                .await;
+                return;
+            }
+        },
+    };
+    // The parent's own PR URL, when one of its run rows recorded it.
+    let parent_pr = rc
+        .client
+        .list_runs(parent_id)
+        .await
+        .ok()
+        .and_then(|runs| runs.iter().find_map(|r| r.pr_url.clone()));
+    let body = integration_pr_body(parent_id, parent_pr.as_deref(), &accepted);
+
+    let existing = parent_detail
+        .comments
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .find_map(|c| integration_pr_url_from_note(&c.body, &child_project.repo_url));
+    match existing {
+        Some(url) => {
+            // Later accept: refresh the body of the already-open PR.
+            match crate::forge::pr_number_from_url(&url) {
+                Ok(n) => {
+                    if let Err(e) = crate::forge::update_pr_body(
+                        rc.client.http(),
+                        kind,
+                        cfg.forge_api_url.as_deref(),
+                        token,
+                        &child_project.repo_url,
+                        n,
+                        &format!("Task: task-{parent_id}\n\n{body}"),
+                    )
+                    .await
+                    {
+                        note(
+                            &rc.client,
+                            parent_id,
+                            format!("could not refresh the integration PR {url}: {e}"),
+                        )
+                        .await;
+                    }
+                }
+                Err(e) => {
+                    note(
+                        &rc.client,
+                        parent_id,
+                        format!("could not refresh the integration PR {url}: {e}"),
+                    )
+                    .await;
+                }
+            }
+        }
+        None => {
+            match crate::forge::create_pr(
+                rc.client.http(),
+                kind,
+                cfg.forge_api_url.as_deref(),
+                token,
+                &child_project.repo_url,
+                &crate::forge::DraftPr {
+                    branch: integration_branch,
+                    base: &base,
+                    task_id: parent_id,
+                    title: &rc.parent.title,
+                    body: &body,
+                },
+            )
+            .await
+            {
+                Ok(url) => {
+                    note(
+                        &rc.client,
+                        parent_id,
+                        format!(
+                            "opened the {INTEGRATION_PR_MARKER} for ticket #{parent_id}'s cross-project \
+                             work in `{}` — merge it with a MERGE COMMIT before the parent's PR\nPR: {url}",
+                            child_project.repo_url
+                        ),
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    note(
+                        &rc.client,
+                        parent_id,
+                        format!("could not open the integration PR for child #{}: {e}", child.id),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+}
+
+/// The integration PR's body (rebuilt on every accept): the merge contract —
+/// merge with a MERGE COMMIT, before the parent's PR, squash/rebase-merge
+/// breaks the rev pin — plus the accepted child tickets.
+fn integration_pr_body(parent_id: i32, parent_pr_url: Option<&str>, accepted: &[(i32, String)]) -> String {
+    let parent_pr = parent_pr_url
+        .map(|u| format!("the parent's PR ({u})"))
+        .unwrap_or_else(|| format!("ticket #{parent_id}'s PR"));
+    let children = accepted
+        .iter()
+        .map(|(id, title)| format!("- #{id} {title}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Integration branch for ticket #{parent_id}'s cross-project child tickets.\n\n\
+         Merge this PR with a **merge commit**, and merge it **before** {parent_pr} — the dependent \
+         repos pin this branch's tip revision, and a squash or rebase merge rewrites it, breaking \
+         the rev pin.\n\n\
+         Accepted child tickets:\n{children}"
+    )
+}
+
+/// The PR URL recorded by an earlier accept's marker note: a note carrying
+/// the marker and the repo URL, with the PR URL on a `PR: <url>` line.
+fn integration_pr_url_from_note(body: &str, repo_url: &str) -> Option<String> {
+    if !body.contains(INTEGRATION_PR_MARKER) || !body.contains(repo_url) {
+        return None;
+    }
+    body.lines()
+        .find_map(|l| l.strip_prefix("PR: "))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// Complete a successfully merged child (`review → completed`) and note the
@@ -1855,13 +2540,14 @@ mod tests {
             42,
             ChildGit {
                 branch: "agent/task-42-child".into(),
+                diff_base: Some("agent/task-10-parent".into()),
                 commits_ahead: Some(2),
                 diff: ChildDiff::Present("diff --git a/x b/x".into()),
+                cross_project: None,
             },
         );
         GitContext {
             parent_branch: "agent/task-10-parent".into(),
-            diff_base: Some("agent/task-10-parent".into()),
             children,
         }
     }
@@ -1961,13 +2647,14 @@ mod tests {
             child_id,
             ChildGit {
                 branch: "agent/task-43-gone".into(),
+                diff_base: diff_base.map(str::to_string),
                 commits_ahead: None,
                 diff,
+                cross_project: None,
             },
         );
         GitContext {
             parent_branch: "agent/task-10-parent".into(),
-            diff_base: diff_base.map(str::to_string),
             children,
         }
     }
@@ -2056,8 +2743,8 @@ mod tests {
     async fn collect_git_context_diffs_against_the_local_parent() {
         let repo = scratch_repo_with_child("local-parent");
         let ctx = collect_git_context(&repo, "agent/task-10-parent", &[(42, "agent/task-42-child".into())]).await;
-        assert_eq!(ctx.diff_base.as_deref(), Some("agent/task-10-parent"));
         let cg = &ctx.children[&42];
+        assert_eq!(cg.diff_base.as_deref(), Some("agent/task-10-parent"));
         assert_eq!(cg.commits_ahead, Some(1));
         match &cg.diff {
             ChildDiff::Present(d) => assert!(d.contains("child.txt"), "{d}"),
@@ -2073,8 +2760,8 @@ mod tests {
         let repo = scratch_repo_with_child("missing-parent");
         git_in(&repo, &["branch", "-D", "agent/task-10-parent"]);
         let ctx = collect_git_context(&repo, "agent/task-10-parent", &[(42, "agent/task-42-child".into())]).await;
-        assert_eq!(ctx.diff_base, None);
         let cg = &ctx.children[&42];
+        assert_eq!(cg.diff_base, None);
         assert_eq!(cg.diff, ChildDiff::ParentBranchMissing);
         assert_eq!(cg.commits_ahead, None);
     }
@@ -2094,8 +2781,8 @@ mod tests {
         );
         git_in(&repo, &["branch", "-D", "agent/task-10-parent"]);
         let ctx = collect_git_context(&repo, "agent/task-10-parent", &[(42, "agent/task-42-child".into())]).await;
-        assert_eq!(ctx.diff_base.as_deref(), Some("origin/agent/task-10-parent"));
         let cg = &ctx.children[&42];
+        assert_eq!(cg.diff_base.as_deref(), Some("origin/agent/task-10-parent"));
         assert_eq!(cg.commits_ahead, Some(1));
         match &cg.diff {
             ChildDiff::Present(d) => assert!(d.contains("child.txt"), "{d}"),
@@ -2476,5 +3163,298 @@ mod tests {
             2,
             "no run-list fetch — the breaker fires before the trigger check"
         );
+    }
+
+    // ── cross-project children (scratch git repos, #184) ───────────────────
+
+    /// A "child project" for cross-project tests: a bare origin (with one
+    /// commit on `master`) plus the project config pointing at it. The
+    /// returned dir is the test's scratch root — `src` inside it is a
+    /// working clone source for pushing branches.
+    fn child_project(tag: &str) -> (PathBuf, ProjectRepoConfig) {
+        let base = std::env::temp_dir().join(format!("remoter-supervise-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        git_in(&src, &["init", "-b", "master"]);
+        std::fs::write(src.join("file.txt"), "base").unwrap();
+        git_in(&src, &["add", "."]);
+        git_in(&src, &["commit", "-m", "init"]);
+        git_in(&base, &["clone", "--bare", "src", "origin.git"]);
+        let cfg = ProjectRepoConfig {
+            project_id: 2,
+            repo_url: base.join("origin.git").to_string_lossy().to_string(),
+            base_branch: None,
+            staging_auto_start: false,
+            reference_repos: Vec::new(),
+        };
+        (base, cfg)
+    }
+
+    /// Push a child branch (one commit setting `file.txt` to `content` on top
+    /// of master) to the child project's origin.
+    fn push_child_branch(base: &Path, cfg: &ProjectRepoConfig, branch: &str, content: &str) {
+        let src = base.join("src");
+        git_in(&src, &["checkout", "-b", branch, "master"]);
+        std::fs::write(src.join("file.txt"), content).unwrap();
+        git_in(&src, &["commit", "-am", "child work"]);
+        git_in(&src, &["push", &cfg.repo_url, branch]);
+    }
+
+    /// `git show <branch>:file.txt` in the child project's bare origin.
+    fn origin_file(base: &Path, branch: &str) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(base.join("origin.git"))
+            .args(["show", &format!("{branch}:file.txt")])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git show failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    /// The supervise diff of a cross-project child is computed in the CHILD
+    /// project's clone against the parent's integration branch (created and
+    /// pushed on first sight).
+    #[tokio::test]
+    async fn cross_project_child_git_diffs_against_the_integration_branch() {
+        let (base, cfg) = child_project("xp-git");
+        push_child_branch(&base, &cfg, "agent/task-42-child", "child");
+        let ws = base.join("ws");
+
+        let cg = cross_project_child_git_in(&ws, 10, "parent work", 42, "agent/task-42-child", &cfg).await;
+
+        assert_eq!(cg.diff_base.as_deref(), Some("agent/feature-10-parent-work"));
+        assert_eq!(cg.commits_ahead, Some(1));
+        match &cg.diff {
+            ChildDiff::Present(d) => assert!(d.contains("file.txt"), "{d}"),
+            other => panic!("expected a present diff, got {other:?}"),
+        }
+        assert_eq!(cg.cross_project, Some(Some(cfg.repo_url.clone())));
+        // The integration branch was pushed — the isolation invariant
+        // survives a daemon host death.
+        git_in(
+            &base.join("origin.git"),
+            &["rev-parse", "--verify", "agent/feature-10-parent-work"],
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A cross-project child whose branch exists nowhere degrades to
+    /// `ChildBranchMissing` — the integration branch is still ensured.
+    #[tokio::test]
+    async fn cross_project_child_git_missing_child_branch() {
+        let (base, cfg) = child_project("xp-missing");
+        let ws = base.join("ws");
+
+        let cg = cross_project_child_git_in(&ws, 10, "parent work", 42, "agent/task-42-child", &cfg).await;
+
+        assert_eq!(cg.diff, ChildDiff::ChildBranchMissing);
+        assert_eq!(cg.diff_base.as_deref(), Some("agent/feature-10-parent-work"));
+        git_in(
+            &base.join("origin.git"),
+            &["rev-parse", "--verify", "agent/feature-10-parent-work"],
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The cross-project accept merges the child branch into the integration
+    /// branch, pushes it, and removes the throwaway merge worktree.
+    #[tokio::test]
+    async fn merge_into_integration_branch_merges_and_pushes() {
+        let (base, cfg) = child_project("xp-merge");
+        push_child_branch(&base, &cfg, "agent/task-42-child", "child");
+        let ws = base.join("ws");
+
+        let result = merge_into_integration_branch(&ws, 10, "parent work", 42, &cfg, "agent/task-42-child")
+            .await
+            .unwrap();
+
+        match result {
+            IntegrationMerge::Merged(branch) => assert_eq!(branch, "agent/feature-10-parent-work"),
+            IntegrationMerge::Conflicted { unmerged, .. } => {
+                panic!("expected a clean merge, got conflicts: {unmerged:?}")
+            }
+        }
+        assert_eq!(
+            origin_file(&base, "agent/feature-10-parent-work"),
+            "child",
+            "the pushed integration branch must carry the child's change"
+        );
+        assert!(
+            !ws.join("p2/wt-integration-10").exists(),
+            "the throwaway merge worktree must be removed — a leftover would pin the integration branch"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A conflicted cross-project accept reports the unmerged paths and
+    /// leaves the origin integration branch untouched (the child is bounced
+    /// to resolve the conflict in its own repo).
+    #[tokio::test]
+    async fn merge_into_integration_branch_conflict_reports_unmerged_paths() {
+        let (base, cfg) = child_project("xp-conflict");
+        push_child_branch(&base, &cfg, "agent/task-42-child", "child");
+        // The integration branch diverges: an earlier accepted child touched
+        // the same line.
+        let src = base.join("src");
+        git_in(&src, &["checkout", "-b", "agent/feature-10-parent-work", "master"]);
+        std::fs::write(src.join("file.txt"), "other").unwrap();
+        git_in(&src, &["commit", "-am", "other child work"]);
+        git_in(&src, &["push", &cfg.repo_url, "agent/feature-10-parent-work"]);
+        let ws = base.join("ws");
+
+        let result = merge_into_integration_branch(&ws, 10, "parent work", 42, &cfg, "agent/task-42-child")
+            .await
+            .unwrap();
+
+        match result {
+            IntegrationMerge::Conflicted {
+                integration_branch,
+                unmerged,
+            } => {
+                assert_eq!(integration_branch, "agent/feature-10-parent-work");
+                assert_eq!(unmerged, vec!["file.txt".to_string()]);
+            }
+            IntegrationMerge::Merged(_) => panic!("expected a conflict, got a clean merge"),
+        }
+        assert_eq!(
+            origin_file(&base, "agent/feature-10-parent-work"),
+            "other",
+            "a failed merge must not touch the origin integration branch"
+        );
+        assert!(!ws.join("p2/wt-integration-10").exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The prompt marks a cross-project child with its project/repo and the
+    /// read-only mount, and diffs against the integration branch; container
+    /// instructions distinguish same-project (git objects) from cross-project
+    /// (mounted) children.
+    #[test]
+    fn render_prompt_marks_cross_project_child() {
+        let mut c = child(42, "review", false, None, Some(7));
+        c.project_name = "child-proj".into();
+        let mut children = HashMap::new();
+        children.insert(
+            42,
+            ChildGit {
+                branch: "agent/task-42-child".into(),
+                diff_base: Some("agent/feature-10-parent-work".into()),
+                commits_ahead: Some(1),
+                diff: ChildDiff::Present("diff --git a/file.txt b/file.txt".into()),
+                cross_project: Some(Some("https://forge/child-repo".into())),
+            },
+        );
+        let ctx = GitContext {
+            parent_branch: "agent/task-10-parent".into(),
+            children,
+        };
+        let p = render_prompt(
+            &summary(),
+            &child(10, "review", false, None, Some(7)),
+            &[c],
+            Some(&ctx),
+            true,
+        );
+        assert!(
+            p.contains("Project: child-proj (cross-project, repo https://forge/child-repo)"),
+            "{p}"
+        );
+        assert!(p.contains("`.refs/task-42`"), "{p}");
+        assert!(
+            p.contains("#### Diff (`agent/feature-10-parent-work`...`agent/task-42-child`)"),
+            "{p}"
+        );
+        assert!(p.contains("same-project child worktrees"), "{p}");
+        assert!(p.contains("`.refs/task-<childId>/`"), "{p}");
+    }
+
+    /// A cross-project child in an unmanaged project is called out — the
+    /// supervisor reviews its report and thread only.
+    #[test]
+    fn render_prompt_cross_project_unmanaged_child() {
+        let mut c = child(42, "review", false, None, Some(7));
+        c.project_name = "child-proj".into();
+        let mut children = HashMap::new();
+        children.insert(
+            42,
+            ChildGit {
+                branch: "agent/task-42-child".into(),
+                diff_base: None,
+                commits_ahead: None,
+                diff: ChildDiff::ProjectUnmanaged,
+                cross_project: Some(None),
+            },
+        );
+        let ctx = GitContext {
+            parent_branch: "agent/task-10-parent".into(),
+            children,
+        };
+        let p = render_prompt(
+            &summary(),
+            &child(10, "review", false, None, Some(7)),
+            &[c],
+            Some(&ctx),
+            false,
+        );
+        assert!(
+            p.contains("Project: child-proj (cross-project — not agent-managed on this daemon)"),
+            "{p}"
+        );
+        assert!(
+            p.contains("not agent-managed on this daemon — there is no git context; review the report and thread"),
+            "{p}"
+        );
+    }
+
+    /// The integration PR body states the merge contract (merge commit,
+    /// before the parent's PR, squash/rebase breaks the rev pin) and lists
+    /// the accepted children.
+    #[test]
+    fn integration_pr_body_states_the_merge_contract() {
+        let body = integration_pr_body(
+            10,
+            Some("https://forge/parent/pull/3"),
+            &[(42, "child work".into()), (43, "more work".into())],
+        );
+        assert!(body.contains("ticket #10"), "{body}");
+        assert!(body.contains("**merge commit**"), "{body}");
+        assert!(
+            body.contains("**before** the parent's PR (https://forge/parent/pull/3)"),
+            "{body}"
+        );
+        assert!(body.contains("squash"), "{body}");
+        assert!(body.contains("- #42 child work"), "{body}");
+        assert!(body.contains("- #43 more work"), "{body}");
+
+        let no_parent_pr = integration_pr_body(10, None, &[]);
+        assert!(no_parent_pr.contains("ticket #10's PR"), "{no_parent_pr}");
+    }
+
+    /// The idempotency key: only a note carrying the marker AND the child
+    /// repo URL yields its recorded `PR: <url>` line.
+    #[test]
+    fn integration_pr_url_from_note_finds_only_the_matching_record() {
+        let note = "opened the integration PR (draft) for ticket #10's cross-project work in \
+                    `https://forge/child` — merge it with a MERGE COMMIT before the parent's PR\n\
+                    PR: https://forge/child/pull/7";
+        assert_eq!(
+            integration_pr_url_from_note(note, "https://forge/child"),
+            Some("https://forge/child/pull/7".to_string())
+        );
+        assert_eq!(
+            integration_pr_url_from_note("unrelated note", "https://forge/child"),
+            None
+        );
+        // The marker note for ANOTHER repo's integration PR must not match.
+        assert_eq!(integration_pr_url_from_note(note, "https://forge/other"), None);
     }
 }
