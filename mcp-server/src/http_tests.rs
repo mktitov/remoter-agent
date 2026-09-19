@@ -1018,3 +1018,77 @@ fn advertised_tool_schemas_document_markdown_and_plain_text_fields() {
         );
     }
 }
+
+fn whoami_json() -> serde_json::Value {
+    serde_json::json!({
+        "id": 3,
+        "name": "agent",
+        "kind": "agent",
+        "workspaces": [{"id": 1, "name": "My", "role": "member"}],
+    })
+}
+
+/// Startup validation survives a transient 5xx blip: 503, 503, then 200.
+#[tokio::test]
+async fn validate_with_retry_recovers_from_transient_503() {
+    let server = MockServer::start().await;
+    // Mounted first, matched first; after 2 hits wiremock falls through to 200.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/auth/me"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(2)
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/auth/me"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(whoami_json()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RemoterClient::new(server.uri(), "dummy".into(), None);
+    let whoami = crate::validate_with_retry(&client, 5, std::time::Duration::from_millis(1))
+        .await
+        .unwrap();
+    assert_eq!(whoami.id, 3);
+}
+
+/// 401 is permanent: exactly one request, no retries.
+#[tokio::test]
+async fn validate_with_retry_fails_fast_on_401() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/auth/me"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": "Unauthorized",
+            "message": "token revoked",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RemoterClient::new(server.uri(), "dummy".into(), None);
+    let err = crate::validate_with_retry(&client, 5, std::time::Duration::from_millis(1))
+        .await
+        .unwrap_err();
+    assert!(!err.is_retryable());
+}
+
+/// A persistent 503 exhausts all attempts and returns the last error.
+#[tokio::test]
+async fn validate_with_retry_exhausts_attempts_on_persistent_503() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/auth/me"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let client = RemoterClient::new(server.uri(), "dummy".into(), None);
+    let err = crate::validate_with_retry(&client, 3, std::time::Duration::from_millis(1))
+        .await
+        .unwrap_err();
+    assert!(err.is_retryable());
+}
