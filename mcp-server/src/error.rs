@@ -9,6 +9,9 @@ use rmcp::model::ErrorData;
 pub struct McpError {
     code: i32,
     message: String,
+    /// HTTP status from the backend; `None` for transport-level failures
+    /// (connect/timeout/DNS) and for local errors raised before any HTTP call.
+    status: Option<reqwest::StatusCode>,
 }
 
 impl McpError {
@@ -16,6 +19,7 @@ impl McpError {
         Self {
             code: -32603,
             message: msg.into(),
+            status: None,
         }
     }
 
@@ -25,6 +29,7 @@ impl McpError {
         Self {
             code: -32602,
             message: msg.into(),
+            status: None,
         }
     }
 
@@ -50,13 +55,29 @@ impl McpError {
         Self {
             code,
             message: backend_msg.unwrap_or_else(|| default_msg.to_string()),
+            status: Some(status),
+        }
+    }
+
+    /// Whether a failed request is worth retrying: transport-level failures
+    /// (no status), 429, and any 5xx are transient; 401/403 and other 4xx are
+    /// permanent configuration/auth problems and fail immediately.
+    pub fn is_retryable(&self) -> bool {
+        match self.status {
+            None => true,
+            Some(s) => s == reqwest::StatusCode::TOO_MANY_REQUESTS || s.is_server_error(),
         }
     }
 }
 
 impl From<reqwest::Error> for McpError {
     fn from(e: reqwest::Error) -> Self {
-        Self::internal(format!("HTTP request failed: {e}"))
+        Self {
+            code: -32603,
+            message: format!("HTTP request failed: {e}"),
+            // `e.status()` is `Some` only when the server actually responded.
+            status: e.status(),
+        }
     }
 }
 
@@ -112,5 +133,34 @@ mod tests {
         let e = McpError::invalid_params("exactly one of taskId/featureId must be set");
         assert_eq!(e.code, -32602);
         assert!(e.message.contains("taskId"));
+    }
+
+    #[test]
+    fn retryable_statuses() {
+        for status in [429, 500, 502, 503, 504] {
+            let e = McpError::from_http(reqwest::StatusCode::from_u16(status).unwrap(), String::new());
+            assert!(e.is_retryable(), "HTTP {status} must be retryable");
+        }
+    }
+
+    #[test]
+    fn non_retryable_statuses() {
+        for status in [400, 401, 403, 404, 409] {
+            let e = McpError::from_http(reqwest::StatusCode::from_u16(status).unwrap(), String::new());
+            assert!(!e.is_retryable(), "HTTP {status} must not be retryable");
+        }
+    }
+
+    #[test]
+    fn transport_error_without_status_is_retryable() {
+        // A connect failure has no HTTP status; build one against a closed port.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt.block_on(async { reqwest::get("http://127.0.0.1:1/").await.unwrap_err() });
+        assert!(err.status().is_none());
+        let e = McpError::from(err);
+        assert!(e.is_retryable(), "transport errors must be retryable");
     }
 }

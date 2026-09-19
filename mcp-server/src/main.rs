@@ -12,8 +12,11 @@
 //!     login JWT, or an agent's static token; `REMOTER_AGENT_TOKEN` is accepted
 //!     as a legacy alias)
 //!
-//! On startup it calls `GET /auth/me` to validate the token. On failure it
-//! exits with a clear error. On success it serves MCP over stdio.
+//! On startup it calls `GET /auth/me` to validate the token. Transient
+//! failures (5xx, 429, network errors) are retried with exponential backoff
+//! (see [`validate_with_retry`]); permanent failures (401/403, other 4xx) and
+//! exhausted attempts exit with a clear error. On success it serves MCP over
+//! stdio.
 
 mod client;
 mod error;
@@ -21,6 +24,7 @@ mod schema;
 mod tools;
 
 use std::env;
+use std::time::Duration;
 
 use rmcp::{
     ServiceExt,
@@ -284,6 +288,56 @@ fn resolve_workspace(whoami: &mut client::WhoAmI, configured: Option<i32>) -> Re
     }
 }
 
+/// Startup token validation: retry transient failures (5xx, 429, network
+/// errors) with exponential backoff + jitter so a brief backend/proxy blip
+/// (e.g. an nginx 503 while several runs start in parallel) does not kill the
+/// MCP server and leave the agent session silently without tools. 401/403 and
+/// other 4xx are permanent and fail on the first attempt.
+const MAX_VALIDATE_ATTEMPTS: u32 = 5;
+const VALIDATE_BASE_DELAY: Duration = Duration::from_secs(1);
+
+async fn validate_with_retry(
+    client: &RemoterClient,
+    max_attempts: u32,
+    base_delay: Duration,
+) -> Result<client::WhoAmI, error::McpError> {
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match client.validate().await {
+            Ok(whoami) => return Ok(whoami),
+            Err(e) if e.is_retryable() && attempt < max_attempts => {
+                let delay = retry_delay(base_delay, attempt);
+                eprintln!(
+                    "remoter-mcp: token validation attempt {attempt}/{max_attempts} failed ({e}), retrying in {} ms",
+                    delay.as_millis()
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(e) => {
+                if attempt > 1 {
+                    eprintln!("remoter-mcp: token validation failed after {attempt}/{max_attempts} attempts");
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
+/// Delay before retry number `attempt` (1-based): `base * 2^(attempt-1)` plus
+/// up to +50% jitter derived from the system clock (no RNG dependency).
+/// With the defaults this waits 1s/2s/4s/8s (+jitter) between 5 attempts —
+/// ≤ ~23 s total.
+fn retry_delay(base: Duration, attempt: u32) -> Duration {
+    let scaled = base.saturating_mul(1u32 << attempt.saturating_sub(1).min(10));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let jitter_frac = f64::from(nanos % 500) / 1000.0; // [0, 0.5)
+    scaled + scaled.mul_f64(jitter_frac)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let role = parse_role_args();
@@ -295,7 +349,7 @@ async fn main() -> anyhow::Result<()> {
     let client = RemoterClient::new(base_url, token, workspace_id);
 
     // Validate the token before serving (clear failure mode on bad/revoked token).
-    let mut whoami = match client.validate().await {
+    let mut whoami = match validate_with_retry(&client, MAX_VALIDATE_ATTEMPTS, VALIDATE_BASE_DELAY).await {
         Ok(w) => w,
         Err(e) => {
             eprintln!("error: token validation failed: {e}");
@@ -502,5 +556,31 @@ mod tests {
         ]);
         let err = resolve_workspace(&mut me, None).unwrap_err();
         assert!(err.contains("multiple workspaces"), "{err}");
+    }
+
+    #[test]
+    fn retry_delay_grows_exponentially_within_jitter_bounds() {
+        let base = std::time::Duration::from_secs(1);
+        for (attempt, expected_secs) in [(1, 1u64), (2, 2), (3, 4), (4, 8)] {
+            for _ in 0..50 {
+                let d = crate::retry_delay(base, attempt);
+                let min = std::time::Duration::from_secs(expected_secs);
+                let max = min + min / 2;
+                assert!(
+                    d >= min && d < max,
+                    "attempt {attempt}: {d:?} not in [{min:?}, {max:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retry_delay_stays_within_startup_budget() {
+        // 5 attempts with the production defaults: 4 waits of 1/2/4/8 s plus
+        // up to +50% jitter must stay under the 30 s startup budget.
+        let total: std::time::Duration = (1..crate::MAX_VALIDATE_ATTEMPTS)
+            .map(|a| crate::retry_delay(crate::VALIDATE_BASE_DELAY, a))
+            .sum();
+        assert!(total < std::time::Duration::from_secs(30), "{total:?}");
     }
 }

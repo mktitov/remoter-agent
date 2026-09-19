@@ -424,6 +424,19 @@ impl AgentDriver for AcpDriver {
             StopReason::EndTurn => {
                 let (model, thinking) = outcome_model_thinking(&spec.config_options);
                 let sid = session_id.0.to_string();
+                // A remoter-mcp startup failure leaves the agent with no
+                // mcp__remoter__* tools for the whole session; surface that in
+                // the run log instead of degrading silently.
+                if kimi_usage_enabled
+                    && let Some(dir) = sessions_dir_after.as_deref()
+                    && kimi_usage::session_has_remoter_tools(dir, &sid) == Some(false)
+                {
+                    tracing::warn!(session_id = %sid, "session ran without mcp__remoter__* tools; remoter-mcp likely failed to start");
+                    spec.logger.log_error(
+                        "remoter-mcp не поднялся: агент работает без инструментов mcp__remoter__* \
+                         (прогресс, комментарии и отчёт тикета не будут записываться)",
+                    );
+                }
                 let (input_tokens, output_tokens) = if let Some(u) = response.usage.as_ref() {
                     (Some(u.input_tokens as i64), Some(u.output_tokens as i64))
                 } else {

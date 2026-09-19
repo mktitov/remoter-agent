@@ -125,6 +125,39 @@ async fn poll_session_usage_with(
     }
 }
 
+/// Tool-name prefix of the remoter MCP server in the model's tool list.
+const REMOTER_TOOL_PREFIX: &str = "mcp__remoter__";
+
+/// Reads the latest `llm.tools_snapshot` record in the session's wire files
+/// and reports whether the remoter MCP tools (`mcp__remoter__*`) were offered
+/// to the model — `Some(false)` means remoter-mcp failed to start and the
+/// agent ran the whole turn without the ticket tools. Returns `None` when no
+/// snapshot record exists (unknown or changed kimi wire format); callers must
+/// not warn in that case.
+pub fn session_has_remoter_tools(sessions_dir: &Path, session_id: &str) -> Option<bool> {
+    let mut snapshot: Option<serde_json::Value> = None;
+    for path in wire_files(sessions_dir, session_id) {
+        let Ok(file) = std::fs::File::open(&path) else { continue };
+        let reader = std::io::BufReader::new(file);
+        for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
+            if line.contains("\"llm.tools_snapshot\"")
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
+                && v.get("type").and_then(|t| t.as_str()) == Some("llm.tools_snapshot")
+            {
+                snapshot = Some(v);
+            }
+        }
+    }
+    let snapshot = snapshot?;
+    let tools = snapshot.get("tools")?.as_array()?;
+    Some(
+        tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .any(|name| name.starts_with(REMOTER_TOOL_PREFIX)),
+    )
+}
+
 /// Finds all `<sessions_dir>/*/<session_id>/agents/<agent>/wire.jsonl` files.
 fn wire_files(sessions_dir: &Path, session_id: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -242,6 +275,63 @@ mod tests {
         let (input, output) = session_usage(&dir, "sess-d", 0).unwrap();
         assert_eq!(input, 19);
         assert_eq!(output, 9);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn snapshot_line(tool_names: &[&str]) -> String {
+        let tools = tool_names
+            .iter()
+            .map(|n| format!(r#"{{"name":"{n}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(r#"{{"type":"llm.tools_snapshot","agentId":"main","tools":[{tools}]}}"#)
+    }
+
+    #[test]
+    fn remoter_tools_present_in_snapshot() {
+        let dir = test_dir("tools-present");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_wire(
+            &dir,
+            "sess-e",
+            &[
+                fixture_line(1, 1),
+                snapshot_line(&["Read", "Bash", "mcp__remoter__add_action"]),
+            ],
+        );
+        assert_eq!(session_has_remoter_tools(&dir, "sess-e"), Some(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remoter_tools_missing_from_snapshot() {
+        let dir = test_dir("tools-missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_wire(&dir, "sess-f", &[fixture_line(1, 1), snapshot_line(&["Read", "Bash"])]);
+        assert_eq!(session_has_remoter_tools(&dir, "sess-f"), Some(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn latest_snapshot_wins() {
+        let dir = test_dir("tools-latest");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_wire(
+            &dir,
+            "sess-g",
+            &[snapshot_line(&["mcp__remoter__get_task"]), snapshot_line(&["Read"])],
+        );
+        assert_eq!(session_has_remoter_tools(&dir, "sess-g"), Some(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_snapshot_record_returns_none() {
+        let dir = test_dir("tools-unknown");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_wire(&dir, "sess-h", &[fixture_line(1, 1)]);
+        assert_eq!(session_has_remoter_tools(&dir, "sess-h"), None);
+        assert_eq!(session_has_remoter_tools(&dir, "no-such-session"), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
