@@ -558,10 +558,17 @@ mod tests {
         (repo, home)
     }
 
+    /// Socket path for the bind tests: deliberately NOT under
+    /// `std::env::temp_dir()` — in the nix sandbox TMPDIR is deep enough that
+    /// the path exceeds SUN_LEN and the bind fails for unrelated reasons.
+    fn test_sock(name: &str) -> PathBuf {
+        PathBuf::from(format!("/tmp/remoter-image-sock-{name}-{}", std::process::id()))
+    }
+
     #[test]
     fn ssh_access_args_prefers_agent_forwarding() {
         let (repo, home) = setup_home("ssh-agent");
-        let sock = repo.join("agent.sock");
+        let sock = test_sock("agent");
         let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         let args = ssh_access_args(Some(&sock), Some(&home)).unwrap();
         let joined = args.join(" ");
@@ -570,6 +577,7 @@ mod tests {
         assert!(joined.contains("ssh_known_hosts_remoter"));
         assert!(joined.contains("GIT_SSH_COMMAND"));
         assert!(!joined.contains("/root/.ssh"));
+        let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -610,9 +618,10 @@ mod tests {
         assert!(ssh_access_args(None, Some(&home)).is_err());
         // Agent mode: ~/.ssh is deliberately not mounted, so the container
         // would have no trusted host key at all.
-        let sock = repo.join("agent.sock");
+        let sock = test_sock("nokh");
         let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         assert!(ssh_access_args(Some(&sock), Some(&home)).is_err());
+        let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_dir_all(&repo);
     }
 

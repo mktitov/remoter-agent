@@ -75,6 +75,11 @@
           buildInputs = [ pkgs.openssl ];   # required by some dev-dependencies
           env = {
             CC = "${pkgs.stdenv.cc}/bin/cc";
+            # Version identity for the startup log / --version (see version.rs
+            # and the crates' build.rs). `self.rev`/`self.lastModifiedDate`
+            # also exist for github:-input sources, where .git is absent.
+            REMOTER_AGENT_GIT_REV = self.rev or "dirty";
+            REMOTER_AGENT_GIT_COMMIT_DATE = self.lastModifiedDate or "unknown";
           } // (pkgs.lib.optionalAttrs (pkgs.stdenv.isLinux && pkgs.stdenv.hostPlatform.isx86_64) {
             CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER = "${pkgs.stdenv.cc}/bin/cc";
           });
@@ -101,6 +106,11 @@
           buildInputs = [ pkgs.openssl ];
           env = {
             CC = "${pkgs.stdenv.cc}/bin/cc";
+            # Version identity for the startup log / --version (see version.rs
+            # and the crates' build.rs). `self.rev`/`self.lastModifiedDate`
+            # also exist for github:-input sources, where .git is absent.
+            REMOTER_AGENT_GIT_REV = self.rev or "dirty";
+            REMOTER_AGENT_GIT_COMMIT_DATE = self.lastModifiedDate or "unknown";
           } // (pkgs.lib.optionalAttrs (pkgs.stdenv.isLinux && pkgs.stdenv.hostPlatform.isx86_64) {
             CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER = "${pkgs.stdenv.cc}/bin/cc";
           });

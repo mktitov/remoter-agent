@@ -15,6 +15,11 @@ use tracing_subscriber::prelude::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args().any(|arg| arg == "--version") {
+        println!("{}", remoter_agent::version::line("remoter-agent"));
+        return Ok(());
+    }
+
     // Log shipping (ticket: agent logs in the Users tab): besides stdout, every
     // tracing event is mirrored into a queue that a background task batches to
     // the backend (`source = "daemon"`).
@@ -24,6 +29,14 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer().with_filter(filter.clone()))
         .with(logs::ShipperLayer::new(log_sink.clone()).with_filter(filter))
         .init();
+
+    // First log line of the process: which master commit this binary is.
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        git_rev = remoter_agent::version::GIT_REV,
+        git_commit_date = remoter_agent::version::GIT_COMMIT_DATE,
+        "remoter-agent starting"
+    );
 
     let config = Arc::new(Config::load()?);
     config.validate_execution()?;

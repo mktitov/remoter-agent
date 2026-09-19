@@ -25,4 +25,7 @@ pub mod session_log;
 pub mod staging;
 pub mod supervise;
 pub mod sync;
+// Shared with mcp-server: one version module for the whole workspace.
+#[path = "../../version.rs"]
+pub mod version;
 pub mod workspace;
