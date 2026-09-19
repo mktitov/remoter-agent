@@ -462,7 +462,10 @@ async fn missing_agent_binary_is_permanent() {
 /// Stall detection (#154): a hung turn with no ACP activity is detected after
 /// `stall_idle_secs`, cancelled via `session/cancel`, and — the fake agent
 /// honors the cancel and ends the turn inside the grace window — the attempt
-/// fails Stalled, far short of any run timeout.
+/// fails Stalled, far short of any run timeout. The idle limit is 10s rather
+/// than the 2s minimum: under a loaded nix sandbox the fake agent's startup
+/// can eat a 2s window before the prompt lands, failing the test for reasons
+/// unrelated to stall detection.
 #[tokio::test]
 async fn idle_turn_is_stalled_cancelled_and_fails_fast() {
     let dir = test_dir("stall");
@@ -471,7 +474,7 @@ async fn idle_turn_is_stalled_cancelled_and_fails_fast() {
     let started = std::time::Instant::now();
     let result = tokio::time::timeout(
         Duration::from_secs(60),
-        driver_with_stall(2, 2).run(spec(
+        driver_with_stall(10, 2).run(spec(
             &dir,
             "plan",
             None,
@@ -489,8 +492,8 @@ async fn idle_turn_is_stalled_cancelled_and_fails_fast() {
     let err = result.unwrap_err();
     assert!(matches!(err.source, DriverError::Stalled(_)), "{err}");
     assert!(err.to_string().contains("grace"), "{err}");
-    // idle (~2s, 1s poll granularity) + honored cancel — orders of magnitude
-    // below the default 300s idle limit / 60min run timeout.
+    // idle (~10s, 1s poll granularity) + honored cancel — an order of
+    // magnitude below the default 300s idle limit / 60min run timeout.
     assert!(elapsed < Duration::from_secs(30), "took {elapsed:?}");
 
     let events = read_capture(&capture);
@@ -506,7 +509,8 @@ async fn idle_turn_is_stalled_cancelled_and_fails_fast() {
 /// Stall with an agent that ignores `session/cancel` (#154): after the grace
 /// window the driver drops the connection and the ChildGuard's
 /// SIGTERM → SIGKILL escalation removes the whole process group — the hung
-/// agent AND its grandchild holding the stdout pipe.
+/// agent AND its grandchild holding the stdout pipe. The 10s idle limit (see
+/// the sibling stall test) leaves room for a slow sandboxed fake-agent start.
 #[tokio::test]
 async fn stalled_agent_ignoring_cancel_is_killed_with_its_process_group() {
     let dir = test_dir("stall-kill");
@@ -516,7 +520,7 @@ async fn stalled_agent_ignoring_cancel_is_killed_with_its_process_group() {
     let started = std::time::Instant::now();
     let result = tokio::time::timeout(
         Duration::from_secs(60),
-        driver_with_stall(2, 2).run(spec(
+        driver_with_stall(10, 2).run(spec(
             &dir,
             "plan",
             None,
@@ -536,7 +540,7 @@ async fn stalled_agent_ignoring_cancel_is_killed_with_its_process_group() {
 
     let err = result.unwrap_err();
     assert!(matches!(err.source, DriverError::Stalled(_)), "{err}");
-    // idle (~2s) + grace (2s) — the turn never ends on its own.
+    // idle (~10s) + grace (2s) — the turn never ends on its own.
     assert!(elapsed < Duration::from_secs(30), "took {elapsed:?}");
 
     let events = read_capture(&capture);
