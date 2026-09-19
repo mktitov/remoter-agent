@@ -22,6 +22,9 @@ mod client;
 mod error;
 mod schema;
 mod tools;
+// Shared with agent-runner: one version module for the whole workspace.
+#[path = "../../version.rs"]
+mod version;
 
 use std::env;
 use std::time::Duration;
@@ -150,8 +153,7 @@ impl Role {
     }
 }
 
-const USAGE: &str =
-    "usage: remoter-mcp [--role full|dev-agent-plan|dev-agent-implement|dev-agent-supervise|dev-agent-review]";
+const USAGE: &str = "usage: remoter-mcp [--version] [--role full|dev-agent-plan|dev-agent-implement|dev-agent-supervise|dev-agent-review]";
 
 /// Parse the optional `--role` CLI argument from an iterator (testable).
 pub(crate) fn parse_role<I>(mut args: I) -> Role
@@ -340,7 +342,28 @@ fn retry_delay(base: Duration, attempt: u32) -> Duration {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if env::args().any(|arg| arg == "--version") {
+        println!("{}", version::line("remoter-mcp"));
+        return Ok(());
+    }
+
     let role = parse_role_args();
+
+    // Logs go to stderr: stdout is the MCP transport.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .init();
+
+    // First log line of the process: which master commit this binary is.
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        git_rev = version::GIT_REV,
+        git_commit_date = version::GIT_COMMIT_DATE,
+        "remoter-mcp starting"
+    );
 
     let base_url = require_env("REMOTER_API_URL");
     let token = read_token();

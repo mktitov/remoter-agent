@@ -16,6 +16,10 @@ serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
 schemars = "0.8"
 anyhow = "1"
+# Startup version log (and any future tracing) goes to stderr: stdout is the
+# MCP transport.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Base64 for attachment payloads (add_attachment input, read_attachment binary
 # output) — same crate as the main backend.
 base64ct = { version = "1", features = ["alloc"] }
