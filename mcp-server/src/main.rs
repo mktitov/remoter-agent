@@ -90,7 +90,14 @@ impl Role {
             // a review run, so the tool would 403 for everyone else.
             // add/delete_task_question are dev-agent tools: humans ask and
             // answer questions in the UI.
-            Role::Full => &["set_task_review", "add_task_question", "delete_task_question"],
+            // set_task_goal is implement/plan-only (remoter#199 question #72);
+            // humans link goals in the UI.
+            Role::Full => &[
+                "set_task_review",
+                "add_task_question",
+                "delete_task_question",
+                "set_task_goal",
+            ],
             Role::DevAgentImplement => &[
                 "start_task",
                 "advance_task",
@@ -107,6 +114,8 @@ impl Role {
                 "unassign_self",
                 "add_task_question",
                 "delete_task_question",
+                // Goal linking is implement/plan-only (remoter#199 q#72).
+                "set_task_goal",
             ],
             // Reviewer: read-only discovery plus set_task_review. Every
             // mutating tool (board transitions, actions, tasks, comments,
@@ -132,6 +141,7 @@ impl Role {
                 "remove_link",
                 "add_task_question",
                 "delete_task_question",
+                "set_task_goal",
             ],
             Role::DevAgentPlan => &[
                 "start_task",

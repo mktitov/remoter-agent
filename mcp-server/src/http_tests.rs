@@ -14,8 +14,8 @@ use crate::{
     Role,
     client::{RemoterClient, WhoAmI, WorkspaceMembership},
     tools::{
-        AssignTaskParams, CreateTaskParams, ListBoardParams, ListMyTasksParams, ListUsersParams, RemoterMcp,
-        ReviewVerdictParam, SearchTasksParams, SetTaskReviewParams, UpdateTaskParams,
+        AssignTaskParams, CreateTaskParams, ListBoardParams, ListGoalsParams, ListMyTasksParams, ListUsersParams,
+        RemoterMcp, ReviewVerdictParam, SearchTasksParams, SetTaskGoalParams, SetTaskReviewParams, UpdateTaskParams,
     },
 };
 
@@ -1091,4 +1091,175 @@ async fn validate_with_retry_exhausts_attempts_on_persistent_503() {
         .await
         .unwrap_err();
     assert!(err.is_retryable());
+}
+
+// ── Business goals (remoter#199 / remoter-agent#202) ─────────────────────
+
+#[tokio::test]
+async fn list_goals_with_explicit_project_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/1/goals"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"id": 3, "projectId": 1, "title": "Grow revenue"},
+            {"id": 4, "projectId": 1, "title": "Retention"},
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp(server.uri(), Role::Full, None);
+    let p: ListGoalsParams = serde_json::from_value(serde_json::json!({"projectId": 1})).unwrap();
+    let result = mcp.list_goals(Parameters(p)).await.unwrap();
+    let text = result_text(result);
+    assert!(text.contains("Grow revenue"), "{text}");
+    assert!(text.contains("Retention"), "{text}");
+}
+
+/// Daemon mode without projectId resolves the current ticket's project first.
+#[tokio::test]
+async fn list_goals_daemon_mode_defaults_to_ticket_project() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/70"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(task_detail_json(70, serde_json::json!([]))))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/1/goals"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"id": 3, "projectId": 1, "title": "Grow revenue"},
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp(server.uri(), Role::DevAgentImplement, Some(70));
+    let p: ListGoalsParams = serde_json::from_value(serde_json::json!({})).unwrap();
+    let result = mcp.list_goals(Parameters(p)).await.unwrap();
+    assert!(result_text(result).contains("Grow revenue"));
+}
+
+#[tokio::test]
+async fn list_goals_standalone_requires_project_id() {
+    let server = MockServer::start().await;
+    // No goals mock: the call must fail before any HTTP request.
+    let mcp = test_mcp(server.uri(), Role::Full, None);
+    let p: ListGoalsParams = serde_json::from_value(serde_json::json!({})).unwrap();
+    let err = mcp.list_goals(Parameters(p)).await.unwrap_err();
+    assert!(err.message.contains("projectId is required"), "{err:?}");
+}
+
+#[tokio::test]
+async fn set_task_goal_patches_goal_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/tasks/7/set-goal"))
+        .and(body_json(serde_json::json!({"goalId": 3})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 7, "goalId": 3,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp(server.uri(), Role::Full, None);
+    let p: SetTaskGoalParams = serde_json::from_value(serde_json::json!({"taskId": 7, "goalId": 3})).unwrap();
+    let result = mcp.set_task_goal(Parameters(p)).await.unwrap();
+    assert!(result_text(result).contains("\"goalId\": 3"));
+}
+
+/// Absent goalId serializes as an explicit null — that is how the task is
+/// unlinked from its goal.
+#[tokio::test]
+async fn set_task_goal_without_goal_id_unlinks() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/tasks/7/set-goal"))
+        .and(body_json(serde_json::json!({"goalId": null})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 7, "goalId": null,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp(server.uri(), Role::Full, None);
+    let p: SetTaskGoalParams = serde_json::from_value(serde_json::json!({"taskId": 7})).unwrap();
+    let result = mcp.set_task_goal(Parameters(p)).await.unwrap();
+    assert!(result_text(result).contains("\"goalId\": null"));
+}
+
+/// Daemon mode: the current ticket itself is in scope (no child-link check).
+#[tokio::test]
+async fn set_task_goal_daemon_mode_allows_current_ticket() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/tasks/70/set-goal"))
+        .and(body_json(serde_json::json!({"goalId": 3})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 70, "goalId": 3,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp(server.uri(), Role::DevAgentImplement, Some(70));
+    let p: SetTaskGoalParams = serde_json::from_value(serde_json::json!({"taskId": 70, "goalId": 3})).unwrap();
+    let result = mcp.set_task_goal(Parameters(p)).await.unwrap();
+    assert!(result_text(result).contains("\"id\": 70"));
+}
+
+/// Daemon mode: a subtask of the current ticket is in scope (from the child's
+/// perspective its link to the ticket carries "subtask").
+#[tokio::test]
+async fn set_task_goal_daemon_mode_allows_child() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/71"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(task_detail_json(71, serde_json::json!([link_json("subtask", 70)]))),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/tasks/71/set-goal"))
+        .and(body_json(serde_json::json!({"goalId": 3})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 71, "goalId": 3,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp(server.uri(), Role::DevAgentImplement, Some(70));
+    let p: SetTaskGoalParams = serde_json::from_value(serde_json::json!({"taskId": 71, "goalId": 3})).unwrap();
+    let result = mcp.set_task_goal(Parameters(p)).await.unwrap();
+    assert!(result_text(result).contains("\"id\": 71"));
+}
+
+/// Daemon mode: an unrelated task is rejected before any PATCH is sent.
+#[tokio::test]
+async fn set_task_goal_daemon_mode_rejects_unrelated_task() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/71"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(task_detail_json(71, serde_json::json!([]))))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/tasks/71/set-goal"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp(server.uri(), Role::DevAgentImplement, Some(70));
+    let p: SetTaskGoalParams = serde_json::from_value(serde_json::json!({"taskId": 71, "goalId": 3})).unwrap();
+    let err = mcp.set_task_goal(Parameters(p)).await.unwrap_err();
+    assert!(err.message.contains("not the current ticket or its subtask"), "{err:?}");
 }
