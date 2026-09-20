@@ -870,6 +870,7 @@ async fn run_attempt(
                 &rc.config,
                 &rc.image_locks,
                 project,
+                rc.parent.id,
                 run_id,
                 env.cwd,
                 env.devenv,
