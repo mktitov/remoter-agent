@@ -758,7 +758,11 @@ pub async fn execute(rc: SuperviseContext) {
 
         // Act on the verdicts — merge-conflict nudges extend the session and
         // accumulate tokens, so this happens before the run row is finished.
-        process_verdicts(&rc, run.id, run.created_at, &mut outcome, &logger, devenv, &branch).await;
+        // Accepting a cross-project child opens/refreshes the draft
+        // integration PR; its URL goes onto this run's finish body so it
+        // surfaces in the parent's `TaskDetail.prUrl` and run history (#207).
+        let integration_pr_url =
+            process_verdicts(&rc, run.id, run.created_at, &mut outcome, &logger, devenv, &branch).await;
         if rc.cancel.is_cancelled() {
             run::finish_failed(
                 &rc.client,
@@ -772,18 +776,33 @@ pub async fn execute(rc: SuperviseContext) {
             return;
         }
 
-        let mut body = crate::client::FinishRunBody::succeeded();
-        body.session_id = outcome.session_id.clone();
-        body.summary = Some(outcome.text.clone());
-        body.input_tokens = outcome.input_tokens;
-        body.output_tokens = outcome.output_tokens;
-        body.model = outcome.model.clone();
-        body.thinking = outcome.thinking.clone();
+        let body = supervise_finish_body(&outcome, integration_pr_url);
         run::finish_reporting(&rc.client, run.id, &body).await;
         note(&rc.client, parent_id, format!("supervise run #{} finished", run.id)).await;
         tracing::info!(task_id = parent_id, run_id = run.id, "supervise run succeeded");
         return;
     }
+}
+
+/// The succeeded-run finish body of a supervise run (split out for tests).
+///
+/// `integration_pr_url` is the draft integration PR a cross-project accept
+/// opened or refreshed during this run. Recording it on the run row surfaces
+/// the PR in the parent's `TaskDetail.prUrl` and run history (View PR). A
+/// deliberate effect (docs/specs/cross-repo-projects.md §6): until the final
+/// integration run lands the parent's own PR, the parent's `latest_pr_url`
+/// points at the integration PR in the CHILD repo — correct, because the
+/// integration PR is the one that merges first.
+fn supervise_finish_body(outcome: &RunOutcome, integration_pr_url: Option<String>) -> client::FinishRunBody {
+    let mut body = client::FinishRunBody::succeeded();
+    body.session_id = outcome.session_id.clone();
+    body.summary = Some(outcome.text.clone());
+    body.input_tokens = outcome.input_tokens;
+    body.output_tokens = outcome.output_tokens;
+    body.model = outcome.model.clone();
+    body.thinking = outcome.thinking.clone();
+    body.pr_url = integration_pr_url;
+    body
 }
 
 /// Working directory for the supervise session (see `execute`).
@@ -1507,6 +1526,12 @@ pub(crate) fn conversation_section(p: &mut String, comments: &[CommentDto]) {
 /// crashed run would re-apply the verdict of a previous review cycle — e.g.
 /// bounce the child with a stale `changes_requested` nobody looked at (review
 /// #110).
+///
+/// Returns the integration PR URL of an accepted cross-project child, when
+/// one was opened or refreshed during this run (#207 — the caller records it
+/// on the run's finish body). When several accepts yield a PR (children in
+/// different repos), the last one wins; every URL is also in the parent's
+/// thread notes.
 async fn process_verdicts(
     rc: &SuperviseContext,
     run_id: i32,
@@ -1515,10 +1540,11 @@ async fn process_verdicts(
     logger: &SessionLogger,
     devenv: bool,
     branch: &str,
-) {
+) -> Option<String> {
+    let mut integration_pr_url = None;
     for child_id in &rc.review_children {
         if rc.cancel.is_cancelled() {
-            return;
+            return integration_pr_url;
         }
         let detail = match rc.client.task_detail(*child_id).await {
             Ok(d) => d,
@@ -1549,7 +1575,11 @@ async fn process_verdicts(
                 )
                 .await;
             }
-            Some("approve") => accept_child(rc, run_id, outcome, logger, devenv, branch, &detail).await,
+            Some("approve") => {
+                if let Some(url) = accept_child(rc, run_id, outcome, logger, devenv, branch, &detail).await {
+                    integration_pr_url = Some(url);
+                }
+            }
             Some("changes_requested") => bounce_child(rc, &detail).await,
             _ => {
                 note(
@@ -1561,6 +1591,7 @@ async fn process_verdicts(
             }
         }
     }
+    integration_pr_url
 }
 
 /// Records a give-up signature so the supervision loop stops re-triggering
@@ -1647,6 +1678,10 @@ async fn bounce_child_with_reason(rc: &SuperviseContext, child: &TaskDetail, rea
 /// `approve`: absorb the child's branch into the parent's branch, then
 /// complete the child (`review → completed` under the parent-scoped agent
 /// rights). Conflicts are delegated to the agent on the resumed session.
+///
+/// Returns the integration PR URL when a cross-project accept opened or
+/// refreshed one (#207); `None` for same-project accepts and every give-up
+/// path.
 async fn accept_child(
     rc: &SuperviseContext,
     run_id: i32,
@@ -1655,7 +1690,7 @@ async fn accept_child(
     devenv: bool,
     branch: &str,
     child: &TaskDetail,
-) {
+) -> Option<String> {
     let Some(project) = &rc.project else {
         record_give_up(rc, child.id, child.review_verdict.as_deref(), "no-repo");
         note(
@@ -1666,20 +1701,17 @@ async fn accept_child(
                 .to_string(),
         )
         .await;
-        return;
+        return None;
     };
     let root = &rc.config.workspace_root;
     // Cross-project child (docs/specs/cross-repo-projects.md): the merge
     // target is the parent's integration branch in the CHILD project's clone
     // — the parent's own branch does not exist there.
     if child.project_id != project.project_id {
-        accept_cross_project_child(rc, child).await;
-        return;
+        return accept_cross_project_child(rc, child).await;
     }
     let repo = workspace::repo_dir(root, project.project_id);
-    let Some(parent_branch) = parent_branch(rc).await else {
-        return;
-    };
+    let parent_branch = parent_branch(rc).await?;
     let child_branch = workspace::existing_branch(root, project.project_id, child.id)
         .await
         .unwrap_or_else(|| workspace::branch_name(child.id, &child.title));
@@ -1717,7 +1749,7 @@ async fn accept_child(
                 ),
             )
             .await;
-            return;
+            return None;
         }
         Err(e) => {
             record_give_up(
@@ -1736,7 +1768,7 @@ async fn accept_child(
                 ),
             )
             .await;
-            return;
+            return None;
         }
     }
 
@@ -1761,7 +1793,7 @@ async fn accept_child(
             ),
         )
         .await;
-        return;
+        return None;
     }
 
     // The merge needs the parent's branch checked out: reuse the parent's
@@ -1784,7 +1816,7 @@ async fn accept_child(
         record_give_up(rc, child.id, child.review_verdict.as_deref(), "worktree-prepare-failed");
         note(&rc.client, child.id, format!("supervisor approved, but the parent's worktree could not be prepared ({e}) — left in review for a human"))
             .await;
-        return;
+        return None;
     }
     if !workspace::local_branch_exists(&repo, &parent_branch).await {
         record_give_up(rc, child.id, child.review_verdict.as_deref(), "parent-branch-missing");
@@ -1798,7 +1830,7 @@ async fn accept_child(
             ),
         )
         .await;
-        return;
+        return None;
     }
 
     if let Ok(status) = workspace::dirty_status(&wt).await
@@ -1815,7 +1847,7 @@ async fn accept_child(
             ),
         )
         .await;
-        return;
+        return None;
     }
 
     let message = format!("Merge child #{} ({child_branch}) into {parent_branch}", child.id);
@@ -1846,6 +1878,7 @@ async fn accept_child(
             .await;
         }
     }
+    None
 }
 
 /// `approve` for a cross-project child (docs/specs/cross-repo-projects.md):
@@ -1855,8 +1888,9 @@ async fn accept_child(
 /// `implement` with the conflicted paths — no agent nudge loop here (the
 /// ticket's explicit choice): the child resolves against the integration
 /// branch in its own repo. An unmanaged child project is skipped with a
-/// thread note on the parent — never a run failure.
-async fn accept_cross_project_child(rc: &SuperviseContext, child: &TaskDetail) {
+/// thread note on the parent — never a run failure. Returns the integration
+/// PR URL when one is open after the accept (#207).
+async fn accept_cross_project_child(rc: &SuperviseContext, child: &TaskDetail) -> Option<String> {
     let Some(child_project) = client::project_repo_config(&rc.client, child.project_id).await else {
         note(
             &rc.client,
@@ -1869,7 +1903,7 @@ async fn accept_cross_project_child(rc: &SuperviseContext, child: &TaskDetail) {
             ),
         )
         .await;
-        return;
+        return None;
     };
     let root = &rc.config.workspace_root;
     let child_branch = workspace::existing_branch(root, child.project_id, child.id)
@@ -1887,7 +1921,7 @@ async fn accept_cross_project_child(rc: &SuperviseContext, child: &TaskDetail) {
     {
         Ok(IntegrationMerge::Merged(integration_branch)) => {
             complete_child(rc, child.id, &child_branch, &integration_branch).await;
-            ensure_integration_pr(rc, child, &child_project, &integration_branch).await;
+            ensure_integration_pr(rc, child, &child_project, &integration_branch).await
         }
         Ok(IntegrationMerge::Conflicted {
             integration_branch,
@@ -1899,6 +1933,7 @@ async fn accept_cross_project_child(rc: &SuperviseContext, child: &TaskDetail) {
                 &cross_project_conflict_reason(&child_branch, &integration_branch, &unmerged),
             )
             .await;
+            None
         }
         Err(e) => {
             record_give_up(
@@ -1913,6 +1948,7 @@ async fn accept_cross_project_child(rc: &SuperviseContext, child: &TaskDetail) {
                 format!("supervisor approved, but merging into the integration branch failed: {e} — left in review for a human"),
             )
             .await;
+            None
         }
     }
 }
@@ -2002,13 +2038,15 @@ const INTEGRATION_PR_MARKER: &str = "integration PR (draft)";
 /// (later accepts) the draft PR `integration branch → child project base` in
 /// the child's repo. Fail-open throughout — warn + thread note, never fail
 /// the accept: the merge is already pushed and the child completed. No forge
-/// configured on the child project → silently skipped.
+/// configured on the child project → silently skipped. Returns the PR's URL
+/// when one is open afterwards (created now or found via the marker note);
+/// the caller records it on the supervise run's finish body (#207).
 async fn ensure_integration_pr(
     rc: &SuperviseContext,
     child: &TaskDetail,
     child_project: &ProjectRepoConfig,
     integration_branch: &str,
-) {
+) -> Option<String> {
     let parent_id = rc.parent.id;
 
     let cfg = match rc.client.forge_config(child_project.project_id).await {
@@ -2024,12 +2062,10 @@ async fn ensure_integration_pr(
                 ),
             )
             .await;
-            return;
+            return None;
         }
     };
-    let Some(kind) = cfg.forge_kind.as_deref() else {
-        return;
-    };
+    let kind = cfg.forge_kind.as_deref()?;
     let kind = match crate::forge::ForgeKind::from_token(kind) {
         Ok(k) => k,
         Err(e) => {
@@ -2039,7 +2075,7 @@ async fn ensure_integration_pr(
                 format!("could not open the integration PR for child #{}: {e}", child.id),
             )
             .await;
-            return;
+            return None;
         }
     };
     let Some(token) = cfg.forge_token.as_deref() else {
@@ -2052,7 +2088,7 @@ async fn ensure_integration_pr(
             ),
         )
         .await;
-        return;
+        return None;
     };
 
     // The body lists every accepted cross-project child in this project, so
@@ -2061,7 +2097,7 @@ async fn ensure_integration_pr(
         Ok(d) => d,
         Err(e) => {
             tracing::warn!(parent_id, error = %e, "supervise: could not fetch the parent detail for the integration PR");
-            return;
+            return None;
         }
     };
     let child_ids: Vec<i32> = parent_detail
@@ -2106,7 +2142,7 @@ async fn ensure_integration_pr(
                     ),
                 )
                 .await;
-                return;
+                return None;
             }
         },
     };
@@ -2158,6 +2194,9 @@ async fn ensure_integration_pr(
                     .await;
                 }
             }
+            // The PR stays open even when the refresh failed — the run row
+            // still records its URL.
+            Some(url)
         }
         None => {
             match crate::forge::create_pr(
@@ -2187,6 +2226,7 @@ async fn ensure_integration_pr(
                         ),
                     )
                     .await;
+                    Some(url)
                 }
                 Err(e) => {
                     note(
@@ -2195,6 +2235,7 @@ async fn ensure_integration_pr(
                         format!("could not open the integration PR for child #{}: {e}", child.id),
                     )
                     .await;
+                    None
                 }
             }
         }
@@ -3437,6 +3478,28 @@ mod tests {
 
         let no_parent_pr = integration_pr_body(10, None, &[]);
         assert!(no_parent_pr.contains("ticket #10's PR"), "{no_parent_pr}");
+    }
+
+    /// #207: the integration PR URL of a cross-project accept lands on the
+    /// supervise run's finish body (surfacing in the parent's
+    /// `TaskDetail.prUrl`); a run without a cross-project accept records none.
+    #[test]
+    fn supervise_finish_body_records_the_integration_pr_url() {
+        let outcome = RunOutcome {
+            session_id: Some("sess-1".to_string()),
+            text: "reviewed".to_string(),
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+            model: None,
+            thinking: None,
+        };
+        let body = supervise_finish_body(&outcome, Some("https://forge/child/pull/7".to_string()));
+        assert_eq!(body.pr_url.as_deref(), Some("https://forge/child/pull/7"));
+        assert_eq!(body.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(body.summary.as_deref(), Some("reviewed"));
+
+        let body = supervise_finish_body(&outcome, None);
+        assert_eq!(body.pr_url, None);
     }
 
     /// The idempotency key: only a note carrying the marker AND the child

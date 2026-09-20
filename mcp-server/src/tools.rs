@@ -110,8 +110,14 @@ fn is_child_of_ticket(links: Option<&[TaskLinkRef]>, ticket_id: i32) -> bool {
 }
 
 // ── Parameter structs ─────────────────────────────────────────────────────────
+//
+// Every params struct carries `deny_unknown_fields` (#207): optional fields
+// (e.g. `set_task_report`'s `report`, where absent = clear) make an unknown
+// key silently change the call's meaning — a typo'd call must fail
+// deserialization instead of running with defaults.
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListMyTasksParams {
     /// Filter by board status: "backlog", "todo", "in_progress", "review", "completed".
     #[serde(rename = "status")]
@@ -127,9 +133,11 @@ pub struct ListMyTasksParams {
 /// `Parameters<T>` argument the rmcp macro emits `{}` as the input schema,
 /// which strict clients reject because it lacks `"type": "object"`.
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WhoAmIParams {}
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TaskIdParams {
     /// The task ID.
     #[serde(rename = "taskId")]
@@ -137,6 +145,7 @@ pub struct TaskIdParams {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ActionIdParams {
     /// The action ID (not the task ID).
     #[serde(rename = "actionId")]
@@ -144,6 +153,7 @@ pub struct ActionIdParams {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RejectActionParams {
     /// The action ID.
     #[serde(rename = "actionId")]
@@ -168,6 +178,7 @@ pub struct UpdateActionParams {
 impl<'de> serde::Deserialize<'de> for UpdateActionParams {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Helper {
             #[serde(rename = "actionId")]
             action_id: i32,
@@ -189,6 +200,7 @@ impl<'de> serde::Deserialize<'de> for UpdateActionParams {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteActionParams {
     /// The action ID (not the task ID).
     #[serde(rename = "actionId")]
@@ -196,6 +208,7 @@ pub struct DeleteActionParams {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AdvanceTaskParams {
     #[serde(rename = "taskId")]
     pub task_id: i32,
@@ -204,6 +217,7 @@ pub struct AdvanceTaskParams {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AddActionParams {
     #[serde(rename = "taskId")]
     pub task_id: i32,
@@ -248,6 +262,7 @@ pub struct AddAttachmentParams {
 impl<'de> serde::Deserialize<'de> for AddAttachmentParams {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Helper {
             #[serde(rename = "taskId")]
             task_id: Option<i32>,
@@ -299,6 +314,7 @@ impl<'de> serde::Deserialize<'de> for AddAttachmentParams {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListAttachmentsParams {
     /// List attachments of this task (exactly one of taskId/featureId/outcomeId).
     #[serde(rename = "taskId")]
@@ -313,6 +329,7 @@ pub struct ListAttachmentsParams {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReadAttachmentParams {
     /// The attachment ID (from list_attachments or an add_attachment result).
     #[serde(rename = "attachmentId")]
@@ -320,6 +337,7 @@ pub struct ReadAttachmentParams {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AddTaskCommentParams {
     #[serde(rename = "taskId")]
     pub task_id: i32,
@@ -329,6 +347,7 @@ pub struct AddTaskCommentParams {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListTaskCommentsParams {
     #[serde(rename = "taskId")]
     pub task_id: i32,
@@ -344,12 +363,14 @@ pub struct ListTaskCommentsParams {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListTaskQuestionsParams {
     #[serde(rename = "taskId")]
     pub task_id: i32,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AddTaskQuestionParams {
     #[serde(rename = "taskId")]
     pub task_id: i32,
@@ -364,6 +385,7 @@ pub struct AddTaskQuestionParams {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteTaskQuestionParams {
     #[serde(rename = "taskId")]
     pub task_id: i32,
@@ -373,6 +395,7 @@ pub struct DeleteTaskQuestionParams {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SetTaskReportParams {
     #[serde(rename = "taskId")]
     pub task_id: i32,
@@ -418,6 +441,7 @@ impl ReviewVerdictParam {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SetTaskReviewParams {
     #[serde(rename = "taskId")]
     pub task_id: i32,
@@ -428,6 +452,7 @@ pub struct SetTaskReviewParams {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AddTaskLinkParams {
     #[serde(rename = "taskId")]
     pub task_id: i32,
@@ -439,6 +464,7 @@ pub struct AddTaskLinkParams {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RemoveTaskLinkParams {
     #[serde(rename = "taskId")]
     pub task_id: i32,
@@ -448,6 +474,7 @@ pub struct RemoveTaskLinkParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateTaskParams {
     /// The task title.
     pub title: String,
@@ -475,6 +502,7 @@ pub struct CreateTaskParams {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AssignTaskParams {
     /// The task ID.
     #[serde(rename = "taskId")]
@@ -487,6 +515,7 @@ pub struct AssignTaskParams {
 
 /// No-parameter tools still need an empty params struct (see `WhoAmIParams`).
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListUsersParams {}
 
 #[derive(Debug, schemars::JsonSchema)]
@@ -507,6 +536,7 @@ pub struct UpdateTaskParams {
 impl<'de> serde::Deserialize<'de> for UpdateTaskParams {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Helper {
             #[serde(rename = "taskId")]
             task_id: i32,
@@ -531,6 +561,7 @@ impl<'de> serde::Deserialize<'de> for UpdateTaskParams {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListFeaturesParams {
     /// The project ID.
     #[serde(rename = "projectId")]
@@ -539,9 +570,11 @@ pub struct ListFeaturesParams {
 
 /// No-parameter tools still need an empty params struct (see `WhoAmIParams`).
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListProjectsParams {}
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SearchTasksParams {
     /// Search query: an exact task id or `#id`, or a case-insensitive title substring.
     pub query: String,
@@ -550,6 +583,7 @@ pub struct SearchTasksParams {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListBoardParams {
     /// Scope the board to one project.
     #[serde(rename = "projectId")]
@@ -1475,10 +1509,10 @@ mod tests {
 
         let p: ListAttachmentsParams = serde_json::from_value(serde_json::json!({"outcomeId": 9})).unwrap();
         assert_eq!(p.outcome_id, Some(9));
-        // snake_case outcome_id is not mapped — the MCP surface is camelCase
-        // (all owner fields are optional, so the unknown key is ignored).
-        let p: ListAttachmentsParams = serde_json::from_value(serde_json::json!({"outcome_id": 9})).unwrap();
-        assert_eq!(p.outcome_id, None);
+        // snake_case outcome_id is not mapped — the MCP surface is camelCase,
+        // and deny_unknown_fields turns the unknown key into an error rather
+        // than silently listing the wrong owner's attachments (#207).
+        assert!(serde_json::from_value::<ListAttachmentsParams>(serde_json::json!({"outcome_id": 9})).is_err());
     }
 
     #[test]
@@ -1587,6 +1621,24 @@ mod tests {
 
         // snake_case task_id is not accepted — the MCP surface is camelCase.
         assert!(serde_json::from_value::<SetTaskReportParams>(serde_json::json!({"task_id": 7})).is_err());
+    }
+
+    /// Regression (#207): an unknown field in `set_task_report` params (e.g.
+    /// `body` — the REST API's field name — instead of `report`) must fail
+    /// deserialization. Without `deny_unknown_fields` the unknown key was
+    /// ignored, `report` defaulted to `None`, and absent = clear — a typo'd
+    /// call silently erased the ticket's report.
+    #[test]
+    fn set_task_report_rejects_unknown_fields() {
+        for body in [
+            serde_json::json!({"taskId": 7, "body": "did the thing"}),
+            serde_json::json!({"taskId": 7, "report": "ok", "reprot": "typo"}),
+        ] {
+            match serde_json::from_value::<SetTaskReportParams>(body.clone()) {
+                Err(err) => assert!(err.to_string().contains("unknown field"), "{err}"),
+                Ok(_) => panic!("params with an unknown field must fail deserialization: {body}"),
+            }
+        }
     }
 
     /// `add_link`'s description must warn that blocking tasks related in the
@@ -2013,16 +2065,17 @@ mod tests {
         assert_eq!(p.task_kind, Some(TaskKindParam::Bug));
 
         // snake_case feature_id/assignee_id are not mapped — the MCP surface
-        // is camelCase (both fields are optional, so unknown keys are ignored).
-        let p: CreateTaskParams = serde_json::from_value(serde_json::json!({
-            "title": "x",
-            "description": "y",
-            "feature_id": 7,
-            "assignee_id": 3,
-        }))
-        .unwrap();
-        assert_eq!(p.feature_id, None);
-        assert_eq!(p.assignee_id, None);
+        // is camelCase, and deny_unknown_fields turns the unknown keys into a
+        // deserialization error rather than silently dropping them (#207).
+        assert!(
+            serde_json::from_value::<CreateTaskParams>(serde_json::json!({
+                "title": "x",
+                "description": "y",
+                "feature_id": 7,
+                "assignee_id": 3,
+            }))
+            .is_err()
+        );
     }
 
     /// Unknown taskKind values are rejected at param parsing, before anything
