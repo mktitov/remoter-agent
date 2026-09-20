@@ -393,6 +393,10 @@ impl Daemon {
                 // is either a human UI move or the daemon's own authoritative
                 // status write at run end — never cancel for that; the run
                 // finishes and its status write simply becomes a no-op conflict.
+                // `waiting` rides along with the forward hop (remoter#162): the
+                // agent may pause the ticket mid-turn via request_human_action —
+                // the live run must not be cancelled for that; it ends on its
+                // own and its success status write soft-skips.
                 let expected = match entry.kind {
                     RunKind::Plan => "plan",
                     RunKind::Implement => "in_progress",
@@ -402,12 +406,14 @@ impl Daemon {
                     // it out cancels the run.
                     RunKind::Supervise | RunKind::Review => "review",
                 };
-                let forward = match entry.kind {
-                    RunKind::Plan => "plan_review",
-                    RunKind::Implement => "review",
-                    RunKind::Supervise | RunKind::Review => "review",
+                let forward: &[&str] = match entry.kind {
+                    RunKind::Plan => &["plan_review", "waiting"],
+                    RunKind::Implement => &["review", "waiting"],
+                    RunKind::Supervise | RunKind::Review => &["review"],
                 };
-                let alive = statuses.get(task_id).is_some_and(|s| s == expected || s == forward);
+                let alive = statuses
+                    .get(task_id)
+                    .is_some_and(|s| s == expected || forward.contains(&s.as_str()));
                 if !alive {
                     if entry.cancelled_at.is_none() {
                         tracing::info!(task_id, "cancelling run");
@@ -889,12 +895,40 @@ kind = "stub"
     }
 
     fn running_run(_task_id: i32, cancelled_at: Option<Instant>) -> RunningEntry {
+        running_run_kind(RunKind::Implement, cancelled_at)
+    }
+
+    fn running_run_kind(kind: RunKind, cancelled_at: Option<Instant>) -> RunningEntry {
         RunningEntry {
             cancel: CancellationToken::new(),
-            kind: RunKind::Implement,
+            kind,
             project_id: 1,
             join: tokio::spawn(std::future::pending()),
             cancelled_at,
+        }
+    }
+
+    /// remoter#162: the agent may pause its own ticket mid-run via
+    /// `request_human_action` — `waiting` rides the forward hop, so
+    /// housekeeping must not cancel the live run.
+    #[tokio::test]
+    async fn housekeeping_keeps_runs_alive_when_ticket_waits() {
+        for kind in [RunKind::Plan, RunKind::Implement] {
+            let url = spawn_mock_backend(vec![(
+                200,
+                r#"[{"id":7,"projectId":1,"projectName":"proj","featureId":1,"featureDescription":"feat","title":"t","description":"d","taskStatus":"waiting","actionsTotal":0,"actionsCompleted":0,"timeSpent":0,"blocked":false,"agentReviewRequested":false,"goalId":null}]"#,
+            )])
+            .await;
+            let mut daemon = test_daemon(&url);
+            daemon.running.insert(7, running_run_kind(kind, None));
+
+            daemon.housekeeping().await;
+
+            let entry = daemon.running.get(&7).expect("run must stay tracked");
+            assert!(
+                !entry.cancel.is_cancelled() && entry.cancelled_at.is_none(),
+                "{kind:?} run must survive the ticket moving to waiting"
+            );
         }
     }
 
