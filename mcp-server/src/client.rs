@@ -135,6 +135,10 @@ pub struct TaskSummary {
     /// on the backend's TaskSummary; defaulted for older backends).
     #[serde(default)]
     pub agent_review_requested: bool,
+    /// The business goal the task is linked to (`goalId`). Additive field —
+    /// absent on backends older than the goals rollout (remoter#199).
+    #[serde(default)]
+    pub goal_id: Option<i32>,
 }
 
 /// A task detail with actions and assignment info (from `GET /tasks/{id}?include=actions`).
@@ -190,6 +194,10 @@ pub struct TaskDetail {
     /// (always present on the backend's TaskDetail; defaulted for older backends).
     #[serde(default)]
     pub agent_review_available: bool,
+    /// The business goal the task is linked to (`goalId`). Additive field —
+    /// absent on backends older than the goals rollout (remoter#199).
+    #[serde(default)]
+    pub goal_id: Option<i32>,
 }
 
 /// One comment in a ticket's thread (`GET /tasks/{id}/comments`; entity JSON
@@ -349,6 +357,29 @@ impl RemoterClient {
     /// `GET /projects` — list all projects.
     pub async fn list_projects(&self) -> Result<Vec<ProjectDto>, McpError> {
         self.get("/api/v1/projects").await
+    }
+
+    /// `GET /projects/{id}/goals` — the project's business goals (archived
+    /// goals are excluded by the backend). Forwarded as raw JSON: the goal
+    /// read-model is owned by the backend (remoter docs/specs/business-goals.md),
+    /// and the MCP layer does not mirror its field set.
+    pub async fn list_goals(&self, project_id: i32) -> Result<serde_json::Value, McpError> {
+        self.get(&format!("/api/v1/projects/{project_id}/goals")).await
+    }
+
+    /// `PATCH /tasks/{id}/set-goal` — link the task to a business goal
+    /// (`Some`) or unlink it (`None` → `"goalId": null`). The backend
+    /// validates that the goal belongs to the task's project (404 on an
+    /// unknown goal).
+    pub async fn set_task_goal(&self, task_id: i32, goal_id: Option<i32>) -> Result<serde_json::Value, McpError> {
+        let body = serde_json::json!({ "goalId": goal_id });
+        let resp = self
+            .http
+            .patch(format!("{}/api/v1/tasks/{task_id}/set-goal", self.base_url))
+            .json(&body)
+            .send()
+            .await?;
+        Self::decode(resp).await
     }
 
     /// `GET /tasks?search=` — compact task search by `#id`/id/title substring.

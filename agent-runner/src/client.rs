@@ -205,6 +205,10 @@ pub struct TaskSummary {
     /// starting the run clears the flag server-side. Absent on older backends.
     #[serde(default)]
     pub agent_review_requested: bool,
+    /// The business goal the task is linked to (`goalId`). Additive field —
+    /// absent on backends older than the goals rollout (remoter#199).
+    #[serde(default)]
+    pub goal_id: Option<i32>,
 }
 
 /// One action inside `TaskDetail`; extra fields are ignored.
@@ -352,6 +356,10 @@ pub struct TaskDetail {
     /// flag; default `true` keeps current behavior (additive deploy).
     #[serde(default = "default_true")]
     pub supervision_enabled: bool,
+    /// The business goal the task is linked to (`goalId`). Additive field —
+    /// absent on backends older than the goals rollout (remoter#199).
+    #[serde(default)]
+    pub goal_id: Option<i32>,
 }
 
 /// An `agent_runs` row as the backend serializes it (entity = snake_case).
@@ -508,6 +516,31 @@ impl RemoterClient {
     /// ones (non-NULL `repo_url`) itself (spec §4.4/§5.1).
     pub async fn projects(&self) -> Result<Vec<ProjectDto>, ClientError> {
         self.get(&format!("{}/api/v1/projects", self.base_url)).await
+    }
+
+    /// `GET /projects/{id}/goals` — the project's business goals (archived
+    /// goals are excluded by the backend). Forwarded as raw JSON: the goal
+    /// read-model is owned by the backend (remoter docs/specs/business-goals.md).
+    pub async fn list_goals(&self, project_id: i32) -> Result<serde_json::Value, ClientError> {
+        self.get(&format!("{}/api/v1/projects/{project_id}/goals", self.base_url))
+            .await
+    }
+
+    /// `PATCH /tasks/{id}/set-goal` — link the task to a business goal
+    /// (`Some`) or unlink it (`None` → `"goalId": null`). The backend
+    /// validates that the goal belongs to the task's project (404 on an
+    /// unknown goal).
+    pub async fn set_task_goal(&self, task_id: i32, goal_id: Option<i32>) -> Result<(), ClientError> {
+        let resp = self
+            .auth_request(
+                self.http
+                    .patch(format!("{}/api/v1/tasks/{task_id}/set-goal", self.base_url)),
+            )
+            .json(&serde_json::json!({ "goalId": goal_id }))
+            .send()
+            .await
+            .map_err(ClientError::transport)?;
+        Self::decode_unit(resp).await
     }
 
     /// `GET /projects/{id}/forge-config` — the gated forge payload incl. the
@@ -860,5 +893,50 @@ mod tests {
         requested["agentReviewRequested"] = serde_json::json!(true);
         let summary: TaskSummary = serde_json::from_value(requested).expect("TaskSummary decodes");
         assert!(summary.agent_review_requested);
+    }
+
+    /// `goalId` defaults to `None` when absent — an older backend without the
+    /// goals rollout (remoter#199) must keep decoding both read models; a
+    /// present value passes through.
+    #[test]
+    fn goal_id_defaults_to_none_when_absent() {
+        let summary_json = serde_json::json!({
+            "id": 71,
+            "projectId": 1,
+            "projectName": "remoter",
+            "featureId": 2,
+            "featureDescription": "agent",
+            "title": "ticket",
+            "description": "do the thing",
+            "taskStatus": "review",
+            "actionsTotal": 0,
+            "actionsCompleted": 0,
+            "timeSpent": 0
+        });
+        let summary: TaskSummary = serde_json::from_value(summary_json.clone()).expect("TaskSummary decodes");
+        assert_eq!(summary.goal_id, None);
+        let mut with_goal = summary_json;
+        with_goal["goalId"] = serde_json::json!(5);
+        let summary: TaskSummary = serde_json::from_value(with_goal).expect("TaskSummary decodes");
+        assert_eq!(summary.goal_id, Some(5));
+
+        let detail_json = serde_json::json!({
+            "id": 71,
+            "projectId": 1,
+            "projectName": "remoter",
+            "featureId": 2,
+            "featureDescription": "agent",
+            "title": "ticket",
+            "description": "do the thing",
+            "taskStatus": "implement",
+            "assigneeId": 7,
+            "assigneeName": "bot"
+        });
+        let detail: TaskDetail = serde_json::from_value(detail_json.clone()).expect("TaskDetail decodes");
+        assert_eq!(detail.goal_id, None);
+        let mut with_goal = detail_json;
+        with_goal["goalId"] = serde_json::json!(9);
+        let detail: TaskDetail = serde_json::from_value(with_goal).expect("TaskDetail decodes");
+        assert_eq!(detail.goal_id, Some(9));
     }
 }
