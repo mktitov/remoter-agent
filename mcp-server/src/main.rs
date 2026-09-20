@@ -92,11 +92,15 @@ impl Role {
             // answer questions in the UI.
             // set_task_goal is implement/plan-only (remoter#199 question #72);
             // humans link goals in the UI.
+            // request_human_action is plan/implement-only (remoter#162): the
+            // waiting status exists so a running agent can hand a human-only
+            // step to a human; humans move tickets in the UI.
             Role::Full => &[
                 "set_task_review",
                 "add_task_question",
                 "delete_task_question",
                 "set_task_goal",
+                "request_human_action",
             ],
             Role::DevAgentImplement => &[
                 "start_task",
@@ -116,6 +120,9 @@ impl Role {
                 "delete_task_question",
                 // Goal linking is implement/plan-only (remoter#199 q#72).
                 "set_task_goal",
+                // Waiting is for the agent working its own ticket, not the
+                // supervisor (remoter#162).
+                "request_human_action",
             ],
             // Reviewer: read-only discovery plus set_task_review. Every
             // mutating tool (board transitions, actions, tasks, comments,
@@ -142,6 +149,7 @@ impl Role {
                 "add_task_question",
                 "delete_task_question",
                 "set_task_goal",
+                "request_human_action",
             ],
             Role::DevAgentPlan => &[
                 "start_task",
@@ -472,6 +480,9 @@ impl ServerHandler for RemoterMcp {
                  belonging to it for a cross-project subtask), update_task to edit them, and add_attachment/list_attachments/read_attachment for artifacts. \
                  Read the human's answers to the ticket's open questions via list_task_questions (also embedded in get_task); \
                  delete questions that are obsolete or already answered with delete_task_question to keep the context clean. \
+                 If the next step can only be performed by a human (external permissions, credentials, a manual environment \
+                 change), call request_human_action with a precise, actionable description and end your turn — the ticket \
+                 waits in the `waiting` status until the human confirms. \
                  add_attachment prefers filePath (local file read by remoter-mcp), with contentBase64 as a fallback. \
                  Agents cannot delete attachments."
                 .into(),
@@ -484,6 +495,9 @@ impl ServerHandler for RemoterMcp {
                  options whenever possible) instead of writing an \"Open questions\" text section in the plan; \
                  read the human's answers via list_task_questions (also embedded in get_task) and clean up with \
                  delete_task_question. \
+                 If the work cannot proceed without a step only a human can perform (external permissions, credentials, \
+                 manual environment changes), call request_human_action with a precise, actionable description — the \
+                 ticket waits in the `waiting` status until the human confirms. \
                  Attachments: add_attachment (returns a markdown link) prefers filePath (local file read by remoter-mcp), \
                  with contentBase64 as a fallback; list_attachments, read_attachment; add_task_comment posts to the task thread. \
                  Agents cannot delete attachments."

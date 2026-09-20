@@ -579,6 +579,18 @@ pub struct SetTaskGoalParams {
     pub goal_id: Option<i32>,
 }
 
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct RequestHumanActionParams {
+    /// The task ID. Optional in daemon mode (defaults to the current ticket);
+    /// required in standalone mode.
+    #[serde(rename = "taskId")]
+    pub task_id: Option<i32>,
+    /// What the human must do to unblock the work — a concrete, actionable
+    /// description of the manual step (becomes the ticket's waitingReason,
+    /// shown in the UI). Plain text, max 2000 characters.
+    pub description: String,
+}
+
 // ── Attachment helpers (pure, unit-tested) ────────────────────────────────────
 
 /// Exactly one owner (spec §3.5): feature → `owner_kind` 1, task → 2,
@@ -924,6 +936,31 @@ impl RemoterMcp {
     )]
     async fn unassign_self(&self, Parameters(p): Parameters<TaskIdParams>) -> Result<CallToolResult, McpErrorData> {
         let task = self.client.unassign_task(p.task_id).await.map_err(McpErrorData::from)?;
+        json_result(&task)
+    }
+
+    #[tool(
+        name = "request_human_action",
+        description = "Pause the ticket until a human performs a step only they can do (external permissions, credentials, manual environment changes): the task moves to the `waiting` status with your description shown to the human, and your current run ends. The daemon resumes the work automatically once the human confirms the action is done. taskId defaults to the current ticket in daemon mode. Do NOT use this for questions answerable in text (use add_task_question) or to delegate work to another agent."
+    )]
+    async fn request_human_action(
+        &self,
+        Parameters(p): Parameters<RequestHumanActionParams>,
+    ) -> Result<CallToolResult, McpErrorData> {
+        let task_id = match p.task_id.or(self.agent_task_id) {
+            Some(id) => id,
+            None => {
+                return Err(McpErrorData::invalid_params(
+                    "taskId is required in standalone mode (no current ticket)",
+                    None,
+                ));
+            }
+        };
+        let task = self
+            .client
+            .wait_task(task_id, &p.description)
+            .await
+            .map_err(McpErrorData::from)?;
         json_result(&task)
     }
 
@@ -1822,15 +1859,16 @@ mod tests {
     fn role_full_lists_all_tools() {
         let mcp = dummy_mcp(Role::Full);
         let names = tool_names(&mcp);
-        // 35 tools total; set_task_review is supervise-only,
-        // add/delete_task_question are dev-agent tools, and set_task_goal is
-        // implement/plan-only, so the Full count is 31.
+        // 36 tools total; set_task_review is supervise-only,
+        // add/delete_task_question are dev-agent tools, set_task_goal and
+        // request_human_action are implement/plan-only, so the Full count is 31.
         assert_eq!(names.len(), 31, "unexpected tools: {names:?}");
         for gated in [
             "set_task_review",
             "add_task_question",
             "delete_task_question",
             "set_task_goal",
+            "request_human_action",
         ] {
             assert!(
                 !names.contains(&gated.to_string()),
@@ -1847,11 +1885,11 @@ mod tests {
     fn role_implement_hides_four_board_tools() {
         let mcp = dummy_mcp(Role::DevAgentImplement);
         let names = tool_names(&mcp);
-        // 35 tools - 4 board tools - set_task_review (supervise-only) -
-        // add_task_question (plan-only) = 29; create_task/update_task/
-        // list_features/delete_task_question/list_goals/set_task_goal stay
-        // available.
-        assert_eq!(names.len(), 29, "unexpected tools: {names:?}");
+        // 36 tools - 4 board tools - set_task_review (supervise-only) -
+        // add_task_question (plan-only) = 30; create_task/update_task/
+        // list_features/delete_task_question/list_goals/set_task_goal/
+        // request_human_action stay available.
+        assert_eq!(names.len(), 30, "unexpected tools: {names:?}");
         for gated in [
             "start_task",
             "advance_task",
@@ -1873,6 +1911,7 @@ mod tests {
             "delete_task_question",
             "list_goals",
             "set_task_goal",
+            "request_human_action",
         ] {
             assert!(
                 names.contains(&available.to_string()),
@@ -1885,8 +1924,8 @@ mod tests {
     fn role_plan_hides_eight_tools() {
         let mcp = dummy_mcp(Role::DevAgentPlan);
         let names = tool_names(&mcp);
-        // 35 tools - 9 gated (6 board/action + create_task/update_task + set_task_review) = 26.
-        assert_eq!(names.len(), 26, "unexpected tools: {names:?}");
+        // 36 tools - 9 gated (6 board/action + create_task/update_task + set_task_review) = 27.
+        assert_eq!(names.len(), 27, "unexpected tools: {names:?}");
         for gated in [
             "start_task",
             "advance_task",
@@ -1909,6 +1948,7 @@ mod tests {
             "delete_task_question",
             "list_goals",
             "set_task_goal",
+            "request_human_action",
         ] {
             assert!(
                 names.contains(&available.to_string()),
@@ -1921,9 +1961,10 @@ mod tests {
     fn role_supervise_keeps_supervision_tools() {
         let mcp = dummy_mcp(Role::DevAgentSupervise);
         let names = tool_names(&mcp);
-        // 35 tools - 3 daemon-owned board tools (start/complete/unassign_self)
+        // 36 tools - 3 daemon-owned board tools (start/complete/unassign_self)
         // - add/delete_task_question (not the supervisor's job)
-        // - set_task_goal (implement/plan-only) = 29.
+        // - set_task_goal (implement/plan-only)
+        // - request_human_action (the working agent's own pause, remoter#162) = 29.
         // advance_task and set_task_review stay: parent-scoped transitions and
         // child reviews are the supervisor's job.
         assert_eq!(names.len(), 29, "unexpected tools: {names:?}");
@@ -1934,6 +1975,7 @@ mod tests {
             "add_task_question",
             "delete_task_question",
             "set_task_goal",
+            "request_human_action",
         ] {
             assert!(
                 !names.contains(&gated.to_string()),
@@ -1960,7 +2002,7 @@ mod tests {
     fn role_review_keeps_only_read_tools_and_set_task_review() {
         let mcp = dummy_mcp(Role::DevAgentReview);
         let names = tool_names(&mcp);
-        // 35 tools - 21 mutating tools = 14: read-only discovery plus
+        // 36 tools - 22 mutating tools = 14: read-only discovery plus
         // set_task_review for the review verdict.
         assert_eq!(names.len(), 14, "unexpected tools: {names:?}");
         for available in [
@@ -2006,6 +2048,7 @@ mod tests {
             "add_task_question",
             "delete_task_question",
             "set_task_goal",
+            "request_human_action",
         ] {
             assert!(
                 !names.contains(&gated.to_string()),
