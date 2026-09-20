@@ -1309,7 +1309,9 @@ const PLAN_INSTRUCTIONS: &str = "## Instructions\nYou are in PLAN-ONLY mode: exp
      or ships a half-finished feature. Order the future tickets by dependency and state which ticket \
      blocks which — the implement run wires these as `blocks`/`blocked_by` links via the `add_link` \
      MCP tool, so humans and agents can see which child ticket is ready for implementation and which \
-     are blocked.\n";
+     are blocked. Never wire a `blocks`/`blocked_by` link between a child ticket and its parent — or \
+     any ancestor/descendant in the subtask tree: the backend rejects such links, so dependencies only \
+     ever run between sibling tickets.\n";
 
 /// Cap for error text stored on the run row and posted to the thread — the
 /// full output stays in the daemon logs (spec §5.6).
@@ -1711,7 +1713,10 @@ fn render_prompt(
                  tickets with the `add_link` MCP tool: whenever ticket A must land before ticket B, call \
                  `add_link` with taskId A, relation `blocks`, otherTaskId B (equivalently `blocked_by` \
                  from B's perspective) — these blocker links are how humans and agents see which child \
-                 ticket is ready for implementation and which are blocked. Complete the matching action for every created ticket, do not commit \
+                 ticket is ready for implementation and which are blocked. Never wire a `blocks`/`blocked_by` \
+                 link between a created ticket and this ticket (its parent) or any other ancestor/descendant \
+                 in the subtask tree — the backend rejects such links; dependencies only ever run between \
+                 sibling tickets. Complete the matching action for every created ticket, do not commit \
                  any code, and end your turn — the created child tickets are the run outcome and no PR is opened.\n\n",
             );
             p.push_str(
@@ -2309,6 +2314,19 @@ mod tests {
         );
         assert!(p.contains("relation `blocks`"), "{p}");
         assert!(p.contains("`blocked_by`"), "{p}");
+    }
+
+    /// Blocker links never run along the subtask tree (#205): the backend
+    /// rejects `blocks`/`blocked_by` between ancestor and descendant, so both
+    /// prompts tell the agent to wire dependencies between sibling tickets
+    /// only.
+    #[test]
+    fn blocker_links_never_target_parent_or_ancestors() {
+        for kind in [RunKind::Plan, RunKind::Implement] {
+            let p = render_prompt(kind, &detail(vec![], vec![]), None, 999, "http://api", &[], "");
+            assert!(p.contains("the backend rejects such links"), "{kind:?}: {p}");
+            assert!(p.contains("sibling tickets"), "{kind:?}: {p}");
+        }
     }
 
     /// The `.refs/` block (docs/specs/cross-repo-projects.md): with reference

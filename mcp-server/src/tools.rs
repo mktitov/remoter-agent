@@ -1375,7 +1375,7 @@ impl RemoterMcp {
 
     #[tool(
         name = "add_link",
-        description = "Create a link between two tasks. Relation is from taskId's perspective: 'blocks' means taskId blocks otherTaskId; 'blocked_by' means taskId is blocked by otherTaskId; 'relates' is symmetric; 'parent' means taskId is the parent of otherTaskId; 'subtask' means taskId is a subtask (child) of otherTaskId."
+        description = "Create a link between two tasks. Relation is from taskId's perspective: 'blocks' means taskId blocks otherTaskId; 'blocked_by' means taskId is blocked by otherTaskId; 'relates' is symmetric; 'parent' means taskId is the parent of otherTaskId; 'subtask' means taskId is a subtask (child) of otherTaskId. 'blocks'/'blocked_by' between tasks related in the subtask tree (parent/child, any depth) are rejected by the backend — wire blocking dependencies only between sibling tasks."
     )]
     async fn add_link(&self, Parameters(p): Parameters<AddTaskLinkParams>) -> Result<CallToolResult, McpErrorData> {
         let link = self
@@ -1587,6 +1587,21 @@ mod tests {
 
         // snake_case task_id is not accepted — the MCP surface is camelCase.
         assert!(serde_json::from_value::<SetTaskReportParams>(serde_json::json!({"task_id": 7})).is_err());
+    }
+
+    /// `add_link`'s description must warn that blocking tasks related in the
+    /// subtask tree (parent/child, any depth) is rejected by the backend (#205).
+    #[test]
+    fn add_link_description_warns_against_relative_blocks() {
+        let router = RemoterMcp::tool_router();
+        let tool = router
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "add_link")
+            .expect("add_link tool must be registered");
+        let desc = tool.description.as_deref().unwrap_or("");
+        assert!(desc.contains("subtask tree"), "{desc}");
+        assert!(desc.contains("rejected by the backend"), "{desc}");
     }
 
     /// The human-facing discovery tools are registered and available in every
