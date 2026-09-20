@@ -1257,18 +1257,24 @@ async fn escalate(rc: &RunContext, run_id: i32, reason: &str, attempt: u32) {
     }
 }
 
-/// The resume token for this run (spec §5.4): the session of the NEWEST run
-/// in the ticket's history (`runs` is newest-first), but only when that run
-/// succeeded and has the same kind — i.e. a review → implement bounce resumes
-/// the succeeded implement session, and a re-plan resumes the succeeded plan
-/// session (never an implement one). Everything else starts fresh: plan →
-/// implement (the newest run is the succeeded plan run), any retry after a
-/// failure (the newest run is failed — resuming a poisoned session would just
-/// replay the same crash), and a plan run whose newest run is an implement
-/// run. Checking the newest run rather than "the latest succeeded run of the
-/// same kind" is what keeps a failure after a succeeded run from resuming.
+/// The resume token for this run (spec §5.4): the session of the NEWEST
+/// non-supervise run in the ticket's history (`runs` is newest-first), but
+/// only when that run succeeded and has the same kind — i.e. a review →
+/// implement bounce resumes the succeeded implement session, and a re-plan
+/// resumes the succeeded plan session (never an implement one). Supervise
+/// runs are transparent to the selection (#207): they sit between the
+/// parent's implement runs without touching the implement session, so
+/// skipping them keeps the bounce resume working across a supervision tick.
+/// Everything else starts fresh: plan → implement (the newest non-supervise
+/// run is the succeeded plan run), any retry after a failure (the newest
+/// non-supervise run is failed — resuming a poisoned session would just
+/// replay the same crash), and a plan run whose newest non-supervise run is
+/// an implement run. Checking the newest run rather than "the latest
+/// succeeded run of the same kind" is what keeps a failure after a succeeded
+/// run from resuming.
 fn resume_session_for(kind: RunKind, runs: &[crate::client::AgentRunDto]) -> Option<String> {
-    runs.first()
+    runs.iter()
+        .find(|r| r.kind != crate::supervise::SUPERVISE_RUN_KIND)
         .filter(|r| r.status == "succeeded" && r.kind == kind.as_str())
         .and_then(|r| r.session_id.clone())
 }
@@ -1410,7 +1416,9 @@ const DEPENDENCY_REPOS_INTRO: &str = "## Dependency repos\nThis feature spans in
      human-merged integration PR — never merge it yourself). Before finishing, pin each listed dependency \
      to the integration branch tip below (e.g. `cargo update -p <dep> --precise <rev>` for a git \
      dependency, or the rev of the corresponding flake input) and run the integration tests that \
-     exercise the pairing.\n\n";
+     exercise the pairing. Also before finishing, update the ticket report via the `set_task_report` MCP \
+     tool with a cross-repo summary: a short summary covering all repositories of the feature — a final \
+     run that ends without writing the report silently erases the ticket's existing report.\n\n";
 
 /// The "## Dependency repos" block (docs/specs/cross-repo-projects.md): only
 /// for the final integration run of a parent with cross-project supervised
@@ -2401,8 +2409,9 @@ mod tests {
     }
 
     /// The "## Dependency repos" block (cross-project children, #184): the
-    /// intro states the isolation invariant and the pin/integration-test
-    /// instructions; the block renders only when the section is non-empty.
+    /// intro states the isolation invariant, the pin/integration-test
+    /// instructions, and the final run's cross-repo report requirement
+    /// (#207); the block renders only when the section is non-empty.
     #[test]
     fn dependency_repos_block_contract() {
         assert!(
@@ -2427,6 +2436,14 @@ mod tests {
         );
         assert!(
             DEPENDENCY_REPOS_INTRO.contains("integration tests"),
+            "{DEPENDENCY_REPOS_INTRO}"
+        );
+        assert!(
+            DEPENDENCY_REPOS_INTRO.contains("`set_task_report`"),
+            "{DEPENDENCY_REPOS_INTRO}"
+        );
+        assert!(
+            DEPENDENCY_REPOS_INTRO.contains("cross-repo summary"),
             "{DEPENDENCY_REPOS_INTRO}"
         );
 
@@ -2797,6 +2814,33 @@ mod tests {
         assert_eq!(resume_session_for(RunKind::Implement, &[impl_ok]), None);
         assert_eq!(resume_session_for(RunKind::Implement, &[]), None);
         assert_eq!(resume_session_for(RunKind::Plan, &[]), None);
+    }
+
+    /// Supervise runs are transparent to resume selection (#207): a
+    /// succeeded supervise run sitting between implement runs does not break
+    /// the bounce resume — the next implement run resumes the newest
+    /// non-supervise run's session.
+    #[test]
+    fn resume_session_for_supervise_run_is_transparent() {
+        let supervise_ok = run_row(4, crate::supervise::SUPERVISE_RUN_KIND, "succeeded", None, None);
+        let impl_ok = run_row(3, "implement", "succeeded", Some("sess-impl".into()), None);
+        assert_eq!(
+            resume_session_for(RunKind::Implement, &[supervise_ok, impl_ok]),
+            Some("sess-impl".to_string())
+        );
+    }
+
+    /// Transparency must not re-enable resume over a failure: a supervise
+    /// run after a failed implement run leaves the failed run as the newest
+    /// non-supervise row, so the retry still starts fresh.
+    #[test]
+    fn resume_session_for_supervise_after_failure_is_fresh() {
+        let supervise_ok = run_row(4, crate::supervise::SUPERVISE_RUN_KIND, "succeeded", None, None);
+        let impl_failed = run_row(3, "implement", "failed", None, Some("boom".into()));
+        assert_eq!(
+            resume_session_for(RunKind::Implement, &[supervise_ok, impl_failed]),
+            None
+        );
     }
 
     /// The rebase nudge prompt names the base branch, instructs the agent to
