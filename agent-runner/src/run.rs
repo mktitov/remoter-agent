@@ -2529,6 +2529,7 @@ mod tests {
             review_verdict: None,
             completed_at: None,
             supervision_enabled: true,
+            goal_id: None,
         }
     }
 
@@ -3137,6 +3138,7 @@ kind = "stub"
                 time_spent: 0,
                 blocked: false,
                 agent_review_requested: false,
+                goal_id: None,
             },
             project: ProjectRepoConfig {
                 project_id: 1,

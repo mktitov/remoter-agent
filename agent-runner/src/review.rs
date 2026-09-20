@@ -846,6 +846,7 @@ mod tests {
             time_spent: 0,
             blocked: false,
             agent_review_requested: true,
+            goal_id: None,
         }
     }
 
@@ -876,6 +877,7 @@ mod tests {
             review_verdict: None,
             completed_at: None,
             supervision_enabled: true,
+            goal_id: None,
         }
     }
 

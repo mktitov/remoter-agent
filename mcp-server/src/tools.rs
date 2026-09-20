@@ -559,6 +559,26 @@ pub struct ListBoardParams {
     pub completed: Option<String>,
 }
 
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct ListGoalsParams {
+    /// The project ID. In daemon mode (inside a ticket run) omit it to list
+    /// the goals of the current ticket's project.
+    #[serde(rename = "projectId")]
+    pub project_id: Option<i32>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct SetTaskGoalParams {
+    /// The task ID.
+    #[serde(rename = "taskId")]
+    pub task_id: i32,
+    /// The business goal to link the task to (id from list_goals), or
+    /// null/absent to unlink the task from its current goal. The goal must
+    /// belong to the task's project.
+    #[serde(rename = "goalId")]
+    pub goal_id: Option<i32>,
+}
+
 // ── Attachment helpers (pure, unit-tested) ────────────────────────────────────
 
 /// Exactly one owner (spec §3.5): feature → `owner_kind` 1, task → 2,
@@ -832,6 +852,31 @@ impl RemoterMcp {
         json_result(&cards)
     }
 
+    #[tool(
+        name = "list_goals",
+        description = "List the business goals of a project (archived goals are excluded). In daemon mode omit projectId to list the goals of the current ticket's project. Use this to discover goal IDs for set_task_goal; a task's current goal shows up as goalId in get_task/list_my_tasks."
+    )]
+    async fn list_goals(&self, Parameters(p): Parameters<ListGoalsParams>) -> Result<CallToolResult, McpErrorData> {
+        let project_id = match p.project_id {
+            Some(id) => id,
+            None => {
+                let Some(ticket_id) = self.agent_task_id else {
+                    return Err(McpErrorData::invalid_params(
+                        "projectId is required in standalone mode",
+                        None,
+                    ));
+                };
+                self.client
+                    .get_task(ticket_id)
+                    .await
+                    .map_err(McpErrorData::from)?
+                    .project_id
+            }
+        };
+        let goals = self.client.list_goals(project_id).await.map_err(McpErrorData::from)?;
+        json_result(&goals)
+    }
+
     // ── Workflow mutation ────────────────────────────────────────────────
 
     #[tool(
@@ -1033,6 +1078,33 @@ impl RemoterMcp {
         let task = self
             .client
             .update_task(p.task_id, &serde_json::Value::Object(body))
+            .await
+            .map_err(McpErrorData::from)?;
+        json_result(&task)
+    }
+
+    #[tool(
+        name = "set_task_goal",
+        description = "Link a task to a business goal (goalId from list_goals) or unlink it (goalId null/absent). The goal must belong to the task's project; an unknown goal is rejected by the backend with a 404. In daemon mode only the current ticket or its subtasks may be re-linked."
+    )]
+    async fn set_task_goal(
+        &self,
+        Parameters(p): Parameters<SetTaskGoalParams>,
+    ) -> Result<CallToolResult, McpErrorData> {
+        if let Some(ticket_id) = self.agent_task_id
+            && p.task_id != ticket_id
+        {
+            let target = self.client.get_task(p.task_id).await.map_err(McpErrorData::from)?;
+            if !is_child_of_ticket(target.links.as_deref(), ticket_id) {
+                return Err(McpErrorData::invalid_params(
+                    "task is not the current ticket or its subtask",
+                    None,
+                ));
+            }
+        }
+        let task = self
+            .client
+            .set_task_goal(p.task_id, p.goal_id)
             .await
             .map_err(McpErrorData::from)?;
         json_result(&task)
@@ -1610,7 +1682,7 @@ mod tests {
     fn discovery_tools_are_registered_and_ungated() {
         let router = RemoterMcp::tool_router();
         let tools = router.list_all();
-        for name in ["list_projects", "search_tasks", "list_board"] {
+        for name in ["list_projects", "search_tasks", "list_board", "list_goals"] {
             assert!(tools.iter().any(|t| t.name == name), "missing tool `{name}`");
             for role in [
                 Role::Full,
@@ -1750,10 +1822,16 @@ mod tests {
     fn role_full_lists_all_tools() {
         let mcp = dummy_mcp(Role::Full);
         let names = tool_names(&mcp);
-        // 33 tools total; set_task_review is supervise-only and
-        // add/delete_task_question are dev-agent tools, so the Full count is 30.
-        assert_eq!(names.len(), 30, "unexpected tools: {names:?}");
-        for gated in ["set_task_review", "add_task_question", "delete_task_question"] {
+        // 35 tools total; set_task_review is supervise-only,
+        // add/delete_task_question are dev-agent tools, and set_task_goal is
+        // implement/plan-only, so the Full count is 31.
+        assert_eq!(names.len(), 31, "unexpected tools: {names:?}");
+        for gated in [
+            "set_task_review",
+            "add_task_question",
+            "delete_task_question",
+            "set_task_goal",
+        ] {
             assert!(
                 !names.contains(&gated.to_string()),
                 "{gated} should be gated in full role"
@@ -1769,10 +1847,11 @@ mod tests {
     fn role_implement_hides_four_board_tools() {
         let mcp = dummy_mcp(Role::DevAgentImplement);
         let names = tool_names(&mcp);
-        // 33 tools - 4 board tools - set_task_review (supervise-only) -
-        // add_task_question (plan-only) = 27; create_task/update_task/
-        // list_features/delete_task_question stay available.
-        assert_eq!(names.len(), 27, "unexpected tools: {names:?}");
+        // 35 tools - 4 board tools - set_task_review (supervise-only) -
+        // add_task_question (plan-only) = 29; create_task/update_task/
+        // list_features/delete_task_question/list_goals/set_task_goal stay
+        // available.
+        assert_eq!(names.len(), 29, "unexpected tools: {names:?}");
         for gated in [
             "start_task",
             "advance_task",
@@ -1792,6 +1871,8 @@ mod tests {
             "list_features",
             "list_task_questions",
             "delete_task_question",
+            "list_goals",
+            "set_task_goal",
         ] {
             assert!(
                 names.contains(&available.to_string()),
@@ -1804,8 +1885,8 @@ mod tests {
     fn role_plan_hides_eight_tools() {
         let mcp = dummy_mcp(Role::DevAgentPlan);
         let names = tool_names(&mcp);
-        // 33 tools - 9 gated (6 board/action + create_task/update_task + set_task_review) = 24.
-        assert_eq!(names.len(), 24, "unexpected tools: {names:?}");
+        // 35 tools - 9 gated (6 board/action + create_task/update_task + set_task_review) = 26.
+        assert_eq!(names.len(), 26, "unexpected tools: {names:?}");
         for gated in [
             "start_task",
             "advance_task",
@@ -1822,7 +1903,13 @@ mod tests {
                 "{gated} should be gated in plan role"
             );
         }
-        for available in ["add_task_question", "list_task_questions", "delete_task_question"] {
+        for available in [
+            "add_task_question",
+            "list_task_questions",
+            "delete_task_question",
+            "list_goals",
+            "set_task_goal",
+        ] {
             assert!(
                 names.contains(&available.to_string()),
                 "{available} should be available in plan role"
@@ -1834,17 +1921,19 @@ mod tests {
     fn role_supervise_keeps_supervision_tools() {
         let mcp = dummy_mcp(Role::DevAgentSupervise);
         let names = tool_names(&mcp);
-        // 33 tools - 3 daemon-owned board tools (start/complete/unassign_self)
-        // - add/delete_task_question (not the supervisor's job) = 28.
+        // 35 tools - 3 daemon-owned board tools (start/complete/unassign_self)
+        // - add/delete_task_question (not the supervisor's job)
+        // - set_task_goal (implement/plan-only) = 29.
         // advance_task and set_task_review stay: parent-scoped transitions and
         // child reviews are the supervisor's job.
-        assert_eq!(names.len(), 28, "unexpected tools: {names:?}");
+        assert_eq!(names.len(), 29, "unexpected tools: {names:?}");
         for gated in [
             "start_task",
             "complete_task",
             "unassign_self",
             "add_task_question",
             "delete_task_question",
+            "set_task_goal",
         ] {
             assert!(
                 !names.contains(&gated.to_string()),
@@ -1871,9 +1960,9 @@ mod tests {
     fn role_review_keeps_only_read_tools_and_set_task_review() {
         let mcp = dummy_mcp(Role::DevAgentReview);
         let names = tool_names(&mcp);
-        // 31 tools - 18 mutating tools = 13: read-only discovery plus
+        // 35 tools - 21 mutating tools = 14: read-only discovery plus
         // set_task_review for the review verdict.
-        assert_eq!(names.len(), 13, "unexpected tools: {names:?}");
+        assert_eq!(names.len(), 14, "unexpected tools: {names:?}");
         for available in [
             "list_my_tasks",
             "get_task",
@@ -1883,6 +1972,7 @@ mod tests {
             "list_projects",
             "search_tasks",
             "list_board",
+            "list_goals",
             "list_attachments",
             "read_attachment",
             "list_task_comments",
@@ -1915,6 +2005,7 @@ mod tests {
             "remove_link",
             "add_task_question",
             "delete_task_question",
+            "set_task_goal",
         ] {
             assert!(
                 !names.contains(&gated.to_string()),
@@ -2072,6 +2163,42 @@ mod tests {
 
         // snake_case task_id is not accepted — the MCP surface is camelCase.
         assert!(serde_json::from_value::<AssignTaskParams>(serde_json::json!({"task_id": 7})).is_err());
+    }
+
+    /// `set_task_goal` params: camelCase ids; `goalId` absent/null unlinks.
+    #[test]
+    fn set_task_goal_params_map_camel_case_and_nullable_goal() {
+        let p: SetTaskGoalParams = serde_json::from_value(serde_json::json!({
+            "taskId": 7,
+            "goalId": 3,
+        }))
+        .unwrap();
+        assert_eq!(p.task_id, 7);
+        assert_eq!(p.goal_id, Some(3));
+
+        for body in [
+            serde_json::json!({"taskId": 7}),
+            serde_json::json!({"taskId": 7, "goalId": null}),
+        ] {
+            let p: SetTaskGoalParams = serde_json::from_value(body).unwrap();
+            assert_eq!(p.task_id, 7);
+            assert_eq!(p.goal_id, None, "absent/null goalId must unlink");
+        }
+
+        // snake_case is not accepted — the MCP surface is camelCase.
+        assert!(serde_json::from_value::<SetTaskGoalParams>(serde_json::json!({"task_id": 7})).is_err());
+    }
+
+    /// `list_goals` params: optional camelCase `projectId`.
+    #[test]
+    fn list_goals_params_map_optional_project_id() {
+        let p: ListGoalsParams = serde_json::from_value(serde_json::json!({"projectId": 42})).unwrap();
+        assert_eq!(p.project_id, Some(42));
+        let p: ListGoalsParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(p.project_id, None);
+        // snake_case project_id is not mapped — the MCP surface is camelCase.
+        let p: ListGoalsParams = serde_json::from_value(serde_json::json!({"project_id": 42})).unwrap();
+        assert_eq!(p.project_id, None);
     }
 
     #[test]
