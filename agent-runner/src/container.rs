@@ -22,6 +22,13 @@ use crate::workspace::RefMount;
 pub const RUN_ID_LABEL: &str = "remoter.run_id";
 /// Docker label marking the project a container/image belongs to.
 pub const PROJECT_ID_LABEL: &str = "remoter.project_id";
+/// Docker label recording the ticket that created a container (staging
+/// environments, image-init containers) — provenance for operators.
+pub const TASK_ID_LABEL: &str = "remoter.task_id";
+/// Docker label marking an image-init container (`image.rs`) so the startup
+/// [`sweep`] can reap orphans a dropped build future or crashed daemon left
+/// behind.
+pub const IMAGE_INIT_LABEL: &str = "remoter.image_init";
 
 /// The worktree mount point inside the run container.
 pub const WORK_DIR: &str = "/work";
@@ -521,12 +528,20 @@ async fn provision_minio(cfg: &ExecutionConfig, run_name: &str) -> Result<(), Dr
 }
 
 /// Startup sweep (spec §5.7): `docker rm -f` every container labeled
-/// `remoter.run_id` — leftovers of a crashed daemon. Best-effort, never fails
-/// the caller.
+/// `remoter.run_id` — leftovers of a crashed daemon — and every image-init
+/// container (`remoter.image_init`, `image.rs`) orphaned by a dropped build
+/// future or daemon restart (such an orphan can still be *running*; its work
+/// is useless — nobody will commit its result). Best-effort, never fails the
+/// caller.
 pub async fn sweep(cfg: &ExecutionConfig) {
     let docker = &cfg.docker_binary;
+    sweep_labeled(docker, RUN_ID_LABEL, "run").await;
+    sweep_labeled(docker, IMAGE_INIT_LABEL, "image-init").await;
+}
+
+async fn sweep_labeled(docker: &str, label: &str, kind: &str) {
     let out = tokio::process::Command::new(docker)
-        .args(["ps", "-aq", "--filter", &format!("label={RUN_ID_LABEL}")])
+        .args(["ps", "-aq", "--filter", &format!("label={label}")])
         .output()
         .await;
     let ids = match out {
@@ -544,7 +559,7 @@ pub async fn sweep(cfg: &ExecutionConfig) {
         }
     };
     for id in ids.lines().filter(|l| !l.trim().is_empty()) {
-        tracing::info!(container = %id, "startup sweep: removing orphaned run container");
+        tracing::info!(container = %id, "startup sweep: removing orphaned {kind} container");
         docker_fire_and_forget(docker, &["rm", "-f", id]).await;
     }
 }
@@ -677,6 +692,42 @@ mod tests {
     #[test]
     fn run_container_name_is_scoped_to_the_run() {
         assert_eq!(run_container_name(42), "remoter-run-42");
+    }
+
+    #[tokio::test]
+    async fn sweep_removes_run_and_image_init_leftovers() {
+        let dir = std::env::temp_dir().join(format!("remoter-sweep-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Stub docker: logs every argv line; `ps` answers with two ids.
+        let stub = dir.join("docker-stub.sh");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\nif [ \"$1\" = ps ]; then printf 'aaa\\nbbb\\n'; fi\nexit 0\n",
+                dir.join("docker.log").display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let cfg = ExecutionConfig {
+            docker_binary: stub.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        sweep(&cfg).await;
+        let log = std::fs::read_to_string(dir.join("docker.log")).unwrap();
+        assert!(log.contains(&format!("ps -aq --filter label={RUN_ID_LABEL}")), "{log}");
+        assert!(
+            log.contains(&format!("ps -aq --filter label={IMAGE_INIT_LABEL}")),
+            "{log}"
+        );
+        // Both ids from both passes are force-removed.
+        assert_eq!(log.matches("rm -f aaa").count(), 2, "{log}");
+        assert_eq!(log.matches("rm -f bbb").count(), 2, "{log}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

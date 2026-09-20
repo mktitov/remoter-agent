@@ -790,6 +790,7 @@ async fn attempt_run(
         &rc.config,
         &rc.image_locks,
         &rc.project,
+        task_id,
         run_id,
         &prepared.dir,
         prepared.devenv,
@@ -1123,6 +1124,7 @@ pub(crate) async fn start_container_runtime(
     config: &Config,
     image_locks: &ImageLocks,
     project: &ProjectRepoConfig,
+    task_id: i32,
     run_id: i32,
     worktree: &Path,
     devenv: bool,
@@ -1133,7 +1135,7 @@ pub(crate) async fn start_container_runtime(
         return Ok(None);
     }
     let repo = workspace::repo_dir(&config.workspace_root, project.project_id);
-    let image = image::ensure_project_image(&config.execution, image_locks, &repo, project)
+    let image = image::ensure_project_image(&config.execution, image_locks, &repo, project, task_id)
         .await
         .map_err(|e| RunFailure::new(e, None))?;
     let containers = container::start(container::ContainerSpec {
@@ -1999,20 +2001,31 @@ async fn ensure_pr_mergeable(
     let wt = workspace::worktree_dir(&rc.config.workspace_root, rc.project.project_id, rc.task.id);
     let env = run_env(rc);
     let devenv = workspace::uses_devenv(&wt);
-    let containers =
-        match start_container_runtime(&rc.config, &rc.image_locks, &rc.project, run_id, &wt, devenv, &env, &[]).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(task_id, error = %e, "rebase nudge: container runtime start failed");
-                note(
-                    &rc.client,
-                    task_id,
-                    format!("PR is not mergeable into `{base}`: auto-rebase setup failed ({e}) — human help needed"),
-                )
-                .await;
-                return;
-            }
-        };
+    let containers = match start_container_runtime(
+        &rc.config,
+        &rc.image_locks,
+        &rc.project,
+        task_id,
+        run_id,
+        &wt,
+        devenv,
+        &env,
+        &[],
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(task_id, error = %e, "rebase nudge: container runtime start failed");
+            note(
+                &rc.client,
+                task_id,
+                format!("PR is not mergeable into `{base}`: auto-rebase setup failed ({e}) — human help needed"),
+            )
+            .await;
+            return;
+        }
+    };
     if containers.is_none()
         && devenv
         && let Err(e) = workspace::services_up(&wt, &env).await

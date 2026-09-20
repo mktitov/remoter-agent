@@ -11,11 +11,11 @@ use tokio::sync::{Mutex, broadcast};
 
 use crate::client::ProjectRepoConfig;
 use crate::config::Config;
+use crate::container::TASK_ID_LABEL;
 use crate::image::{self, ImageLocks};
 use crate::{container, workspace};
 
 pub const STAGING_LABEL: &str = "remoter.staging";
-pub const TASK_ID_LABEL: &str = "remoter.task_id";
 pub const PROJECT_ID_LABEL: &str = "remoter.project_id";
 pub const MAX_STAGING_ENVIRONMENTS: usize = 3;
 pub const STAGING_PATH_PREFIX: &str = "/stage/task-";
@@ -313,7 +313,7 @@ impl StagingManager {
         if !stage.enabled {
             return Err("staging is disabled".to_string());
         }
-        let image = image::ensure_project_image(&self.config.execution, &self.image_locks, &repo, project)
+        let image = image::ensure_project_image(&self.config.execution, &self.image_locks, &repo, project, task_id)
             .await
             .map_err(|e| format!("ensure staging image: {e}"))?;
         let name = format!("remoter-stage-task-{task_id}");

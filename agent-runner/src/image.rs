@@ -51,7 +51,7 @@ use sha2::Digest;
 
 use crate::client::ProjectRepoConfig;
 use crate::config::ExecutionConfig;
-use crate::container::{PROJECT_ID_LABEL, docker};
+use crate::container::{IMAGE_INIT_LABEL, PROJECT_ID_LABEL, TASK_ID_LABEL, docker};
 use crate::driver::DriverError;
 
 /// Repo-relative path of the agent image Dockerfile.
@@ -99,12 +99,15 @@ impl ImageLocks {
 /// (`origin/<base_branch>`, or `origin/HEAD` when unset; the daemon otherwise
 /// only fetches, never updates the clone's working tree — worktrees branch
 /// off the remote-tracking refs). The sync runs under the per-project lock so
-/// two parallel runs cannot race git's `index.lock`.
+/// two parallel runs cannot race git's `index.lock`. `task_id` labels the
+/// init container with the ticket that triggered the build
+/// (`remoter.task_id` — provenance for operators).
 pub async fn ensure_project_image(
     cfg: &ExecutionConfig,
     locks: &ImageLocks,
     repo: &Path,
     project: &ProjectRepoConfig,
+    task_id: i32,
 ) -> Result<String, DriverError> {
     let lock = locks.for_project(project.project_id);
     let _guard = lock.lock().await;
@@ -145,7 +148,27 @@ pub async fn ensure_project_image(
     let build_tag = format!("{tag}-build");
     let init_container = format!("remoter-image-init-p{project_id}-{hash}");
 
-    let result = build_and_commit(cfg, repo, project_id, &hash, &tag, &build_tag, &init_container).await;
+    // Pin the remote-flake fetch to the exact revision the content hash was
+    // computed from (master could move between hashing and building).
+    let flake_rev = clone_head_rev(repo)?;
+    let ssh_args = ssh_access_args(
+        std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from).as_deref(),
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+    )?;
+
+    let result = build_and_commit(BuildSpec {
+        cfg,
+        repo,
+        project_id,
+        task_id,
+        hash: &hash,
+        tag: &tag,
+        build_tag: &build_tag,
+        init_container: &init_container,
+        flake_rev: &flake_rev,
+        ssh_args,
+    })
+    .await;
 
     // Best-effort cleanup of the intermediate artifacts — the tagged image is
     // the deliverable; the build-stage image only wastes disk.
@@ -154,17 +177,37 @@ pub async fn ensure_project_image(
     result
 }
 
+/// Everything [`build_and_commit`] needs — bundled so unit tests can inject
+/// `flake_rev`/`ssh_args` directly instead of mutating the process
+/// environment (`HOME`/`SSH_AUTH_SOCK`).
+struct BuildSpec<'a> {
+    cfg: &'a ExecutionConfig,
+    repo: &'a Path,
+    project_id: i32,
+    task_id: i32,
+    hash: &'a str,
+    tag: &'a str,
+    build_tag: &'a str,
+    init_container: &'a str,
+    flake_rev: &'a str,
+    ssh_args: Vec<String>,
+}
+
 /// `docker build` → init container (repo RO at `/repo`) → `docker commit`
 /// with the provenance labels.
-async fn build_and_commit(
-    cfg: &ExecutionConfig,
-    repo: &Path,
-    project_id: i32,
-    hash: &str,
-    tag: &str,
-    build_tag: &str,
-    init_container: &str,
-) -> Result<String, DriverError> {
+async fn build_and_commit(spec: BuildSpec<'_>) -> Result<String, DriverError> {
+    let BuildSpec {
+        cfg,
+        repo,
+        project_id,
+        task_id,
+        hash,
+        tag,
+        build_tag,
+        init_container,
+        flake_rev,
+        ssh_args,
+    } = spec;
     let docker_bin = &cfg.docker_binary;
     let context = repo.join(".remoter");
 
@@ -200,14 +243,27 @@ async fn build_and_commit(
     } else {
         "cd /repo && devenv shell --no-tui --no-eval-cache -- true".to_string()
     };
-    // Pin the remote-flake fetch to the exact revision the content hash was
-    // computed from (master could move between hashing and building).
-    let flake_rev = clone_head_rev(repo)?;
-    let ssh_args = ssh_access_args(
-        std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from).as_deref(),
-        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
-    )?;
-    let run_args = init_run_args(init_container, repo, build_tag, &init_cmd, &flake_rev, ssh_args);
+    // Best-effort pre-clean: the deterministic init-container name may still
+    // be held by an orphan from a dropped build future or a crashed daemon —
+    // possibly still *running* (ticket #204) — and `docker run --name` fails
+    // permanently on the conflict. The orphan's work is useless (nobody will
+    // commit its result) and the per-project lock rules out a live namesake
+    // in this daemon, so force-removing it is always safe.
+    let _ = docker(
+        docker_bin,
+        &["rm".to_string(), "-f".to_string(), init_container.to_string()],
+    )
+    .await;
+    let run_args = init_run_args(
+        init_container,
+        repo,
+        build_tag,
+        &init_cmd,
+        flake_rev,
+        project_id,
+        task_id,
+        ssh_args,
+    );
     docker(docker_bin, &run_args).await.map_err(image_build_error)?;
 
     docker(
@@ -381,19 +437,30 @@ fn agent_socket_live(sock: &Path) -> bool {
     std::os::unix::net::UnixStream::connect(sock).is_ok()
 }
 
-/// Assembles the `docker run` arguments for the init container.
+/// Assembles the `docker run` arguments for the init container. The
+/// `remoter.image_init` marker lets the startup sweep (`container::sweep`)
+/// reap orphans; `project_id`/`task_id` record provenance.
+#[allow(clippy::too_many_arguments)]
 fn init_run_args(
     init_container: &str,
     repo: &Path,
     build_tag: &str,
     init_cmd: &str,
     flake_rev: &str,
+    project_id: i32,
+    task_id: i32,
     ssh_args: Vec<String>,
 ) -> Vec<String> {
     let mut args = vec![
         "run".to_string(),
         "--name".to_string(),
         init_container.to_string(),
+        "--label".to_string(),
+        format!("{IMAGE_INIT_LABEL}=1"),
+        "--label".to_string(),
+        format!("{PROJECT_ID_LABEL}={project_id}"),
+        "--label".to_string(),
+        format!("{TASK_ID_LABEL}={task_id}"),
         "-v".to_string(),
         format!("{}:/repo:ro", repo.display()),
         "--mount".to_string(),
@@ -636,18 +703,106 @@ mod tests {
     }
 
     #[test]
-    fn init_run_args_carry_flake_rev_and_ssh() {
+    fn init_run_args_carry_flake_rev_ssh_and_labels() {
         let args = init_run_args(
             "init-ctr",
             Path::new("/srv/repos/p1/repo"),
             "img:build",
             "cd /repo && true",
             "deadbeef",
+            1,
+            204,
             vec!["-e".to_string(), "SSH_AUTH_SOCK=/x".to_string()],
         );
         assert!(args.contains(&"REMOTER_IMAGE_FLAKE_REV=deadbeef".to_string()));
         assert!(args.contains(&"SSH_AUTH_SOCK=/x".to_string()));
+        assert!(args.contains(&format!("{IMAGE_INIT_LABEL}=1")));
+        assert!(args.contains(&format!("{PROJECT_ID_LABEL}=1")));
+        assert!(args.contains(&format!("{TASK_ID_LABEL}=204")));
         assert_eq!(args.last().unwrap(), "cd /repo && true");
+    }
+
+    /// Installs a stub `docker` that logs every invocation's argv (one line
+    /// per call) to `<dir>/docker.log` and exits 0 — except `rm`, which exits
+    /// `rm_exit`. Returns the execution config pointing at the stub.
+    fn stub_docker(dir: &Path, rm_exit: i32) -> ExecutionConfig {
+        let stub = dir.join("docker-stub.sh");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\nif [ \"$1\" = rm ]; then exit {rm_exit}; fi\nexit 0\n",
+                dir.join("docker.log").display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        ExecutionConfig {
+            docker_binary: stub.to_string_lossy().into_owned(),
+            ..Default::default()
+        }
+    }
+
+    fn docker_log(dir: &Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("docker.log"))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn test_build_spec<'a>(cfg: &'a ExecutionConfig, repo: &'a Path) -> BuildSpec<'a> {
+        BuildSpec {
+            cfg,
+            repo,
+            project_id: 1,
+            task_id: 204,
+            hash: "abc123",
+            tag: "img:p1-abc123",
+            build_tag: "img:p1-abc123-build",
+            init_container: "remoter-image-init-p1-abc123",
+            flake_rev: "deadbeef",
+            ssh_args: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn build_and_commit_removes_stale_init_container_before_run() {
+        let repo = setup_repo("build-preclean");
+        let cfg = stub_docker(&repo, 0);
+        let tag = build_and_commit(test_build_spec(&cfg, &repo)).await.unwrap();
+        assert_eq!(tag, "img:p1-abc123");
+        let log = docker_log(&repo);
+        let rm_idx = log
+            .iter()
+            .position(|l| l == "rm -f remoter-image-init-p1-abc123")
+            .expect("pre-clean rm -f missing");
+        let run_idx = log
+            .iter()
+            .position(|l| l.starts_with("run --name remoter-image-init-p1-abc123"))
+            .expect("docker run missing");
+        assert!(rm_idx < run_idx, "rm -f must precede docker run: {log:?}");
+        let run = &log[run_idx];
+        assert!(run.contains(&format!("--label {IMAGE_INIT_LABEL}=1")), "{run}");
+        assert!(run.contains(&format!("--label {PROJECT_ID_LABEL}=1")), "{run}");
+        assert!(run.contains(&format!("--label {TASK_ID_LABEL}=204")), "{run}");
+        assert!(log.last().unwrap().starts_with("commit "), "{log:?}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[tokio::test]
+    async fn build_and_commit_tolerates_a_failing_preclean() {
+        let repo = setup_repo("build-preclean-fail");
+        let cfg = stub_docker(&repo, 1);
+        let tag = build_and_commit(test_build_spec(&cfg, &repo)).await.unwrap();
+        assert_eq!(tag, "img:p1-abc123");
+        let log = docker_log(&repo);
+        assert!(log.iter().any(|l| l.starts_with("run --name")), "{log:?}");
+        assert!(log.last().unwrap().starts_with("commit "), "{log:?}");
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     /// A nonexistent docker binary: `image_label` cannot inspect anything and
