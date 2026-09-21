@@ -60,3 +60,8 @@ run:
   substituted from the daemon's environment at container start.
 - `.remoter/check-image.sh` keeps the documented exit-code contract
   (0 fresh / 42 stale / other = failed check, cache kept).
+- `.remoter/seed-nix-cache.sh` is the optional host-side seeding hook for the
+  daemon's shared nix binary cache (`[execution] nix_binary_cache_dir`): it
+  exports the agent-profile closure at `REMOTER_IMAGE_FLAKE_REV` plus the
+  devshell closure into `REMOTER_NIX_CACHE_DIR`. Fail-open like
+  check-image.sh — a failing hook just means a slower bake.

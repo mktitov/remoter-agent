@@ -89,6 +89,11 @@ tickets in container mode:
   image build;
 - `check-image.sh` — per-turn freshness hook: marks the image stale when
   `main` moved since the image was baked;
+- `seed-nix-cache.sh` — optional host-side seeding hook for the daemon's
+  shared nix binary cache (`[execution] nix_binary_cache_dir`): before a
+  bake, it exports the agent-profile closure at the pinned rev and the
+  devshell closure from the host's warm store into the cache, so the init
+  container substitutes instead of rebuilding;
 - `kimi-config.toml` — kimi provider/model template rendered into the
   container's agent home at every start (`${KIMI_API_KEY}` is substituted
   from the daemon's environment — never commit a real key).

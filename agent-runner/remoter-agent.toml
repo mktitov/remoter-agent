@@ -40,6 +40,19 @@ stall_grace_secs    = 30
 #                                      # mounted as the container user's $HOME
 #                                      # (/root): agent config/credentials and
 #                                      # ~/.kimi-code/sessions survive runs here
+# nix_binary_cache_dir = "~/.local/share/remoter-agent/nix-cache"
+#                                      # shared nix binary cache (file:// substituter)
+#                                      # on this host; image-init containers of
+#                                      # nix-based projects (nix FROM image or
+#                                      # devenv.nix/devenv.yaml in the repo) mount
+#                                      # it rw at /nix-cache, export their store
+#                                      # closures into it after the bake, and run
+#                                      # containers mount it read-only — repeat
+#                                      # bakes substitute instead of rebuilding.
+#                                      # Unset = disabled. With nix on the host the
+#                                      # daemon also generates a signing key next
+#                                      # to the dir and seeds the cache via the
+#                                      # project's .remoter/seed-nix-cache.sh hook.
 # Container mode: kimi auth comes from the project's .remoter/kimi-config.toml,
 # rendered into <agent_home>/.kimi-code/config.toml at every container start —
 # ${KIMI_API_KEY} is substituted from the daemon's own environment, so export
