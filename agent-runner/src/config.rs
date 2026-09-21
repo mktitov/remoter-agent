@@ -73,6 +73,16 @@ pub struct ExecutionConfig {
     /// Default: `<workspace_root>/agent-home`.
     #[serde(default)]
     pub agent_home: Option<PathBuf>,
+    /// Shared nix binary cache directory on the daemon host (a `file://`
+    /// substituter). When set and the project is nix-based (its
+    /// `.remoter/agent.Dockerfile` builds `FROM` a nix image, or the repo has
+    /// `devenv.nix`/`devenv.yaml`), image-init containers get it bind-mounted
+    /// rw at `/nix-cache` as an extra substituter, export their gcroot
+    /// closures into it after the bake, and run containers get it read-only —
+    /// repeat bakes and in-container nix commands substitute instead of
+    /// rebuilding. Default: unset (disabled).
+    #[serde(default)]
+    pub nix_binary_cache_dir: Option<PathBuf>,
 }
 
 impl Default for ExecutionConfig {
@@ -85,6 +95,7 @@ impl Default for ExecutionConfig {
             minio_image: default_minio_image(),
             mc_image: default_mc_image(),
             agent_home: None,
+            nix_binary_cache_dir: None,
         }
     }
 }
@@ -443,6 +454,7 @@ impl Config {
         let workspace_root = expand_tilde(&file.workspace_root);
         let execution = ExecutionConfig {
             agent_home: file.execution.agent_home.as_deref().map(expand_tilde_path),
+            nix_binary_cache_dir: file.execution.nix_binary_cache_dir.as_deref().map(expand_tilde_path),
             ..file.execution
         };
         let agent_home = execution.agent_home(&workspace_root);
@@ -720,6 +732,36 @@ mode = "container""#,
         unsafe { std::env::remove_var(API_URL_ENV) };
         let toml = TOML.replace("[driver]", "[execution]\nmode = \"sidecar\"\n\n[driver]");
         assert!(Config::from_toml_str(&toml, Some("tok".to_string())).is_err());
+    }
+
+    #[test]
+    fn nix_binary_cache_dir_is_optional_and_tilde_expanded() {
+        // SAFETY: single-threaded test process env tweak; removed immediately.
+        unsafe { std::env::remove_var(API_URL_ENV) };
+        let cfg = Config::from_toml_str(TOML, Some("tok".to_string())).unwrap();
+        assert_eq!(cfg.execution.nix_binary_cache_dir, None);
+
+        let toml = TOML.replace(
+            "[driver]",
+            "[execution]\nnix_binary_cache_dir = \"/var/cache/remoter-nix\"\n\n[driver]",
+        );
+        let cfg = Config::from_toml_str(&toml, Some("tok".to_string())).unwrap();
+        assert_eq!(
+            cfg.execution.nix_binary_cache_dir.as_deref(),
+            Some(std::path::Path::new("/var/cache/remoter-nix"))
+        );
+
+        let toml = TOML.replace(
+            "[driver]",
+            "[execution]\nnix_binary_cache_dir = \"~/nix-cache\"\n\n[driver]",
+        );
+        let cfg = Config::from_toml_str(&toml, Some("tok".to_string())).unwrap();
+        if let Some(home) = std::env::var_os("HOME") {
+            assert_eq!(
+                cfg.execution.nix_binary_cache_dir.as_deref(),
+                Some(std::path::Path::new(&home).join("nix-cache").as_path())
+            );
+        }
     }
 
     #[test]

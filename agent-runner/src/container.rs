@@ -337,6 +337,9 @@ async fn start_inner(
         "--add-host".to_string(),
         "host.docker.internal:host-gateway".to_string(),
     ]);
+    // Shared nix binary cache (image.rs module docs): read-only here — the
+    // agent's nix/devenv commands substitute from what the bakes exported.
+    args.extend(crate::image::nix_cache_run_args(cfg, spec.repo));
     for (k, v) in spec.env {
         args.extend(["-e".to_string(), format!("{k}={v}")]);
     }

@@ -42,6 +42,35 @@
 //! Fail closed: a project without `.remoter/agent.Dockerfile` is a permanent
 //! error — never a silent fallback to host mode, which would strip the
 //! isolation the operator asked for.
+//!
+//! ## Shared nix binary cache (`[execution] nix_binary_cache_dir`)
+//!
+//! Baking a nix-based image from scratch takes tens of minutes (the devenv
+//! warm plus the crane build of `remoter-mcp` inside the init container).
+//! When the operator points `nix_binary_cache_dir` at a host directory, the
+//! daemon treats it as a shared `file://` binary cache — but only for
+//! nix-based projects ([`nix_cache_applicable`]): the Dockerfile builds `FROM`
+//! a nix image, or the repo carries `devenv.nix`/`devenv.yaml`. The init
+//! container then mounts the dir rw at [`NIX_CACHE_CONTAINER_DIR`] with
+//! `NIX_CONFIG` adding it as an extra substituter, exports its gcroot
+//! closures back into it after the bake (best-effort — a failed export never
+//! fails the build), and run containers mount it read-only
+//! ([`nix_cache_run_args`]). When the host has nix and the image matches the
+//! host's OS/arch, the optional `.remoter/seed-nix-cache.sh` hook runs on the
+//! host before the build to seed the cache from the host's warm store
+//! (fail-open, like the freshness hook). The store itself is never mounted:
+//! `docker commit` must produce a self-contained image, and the substituter
+//! model guarantees that — substituted paths materialize into the container's
+//! own store and are committed.
+//!
+//! Signing: with nix on the host the daemon generates a binary-cache keypair
+//! once, next to the cache dir (`remoter-nix-cache-key.{secret,pub}` — never
+//! inside it, so the read-only run-container mount cannot leak the secret).
+//! Containers trust the public key; the secret is bind-mounted read-only into
+//! the init container only (bind mounts never reach `docker commit`) and used
+//! to sign the export. Without host nix there is no key and containers get
+//! `require-sigs = false` — acceptable because the cache dir is private to
+//! this docker host.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -73,6 +102,20 @@ const CHECK_EXIT_STALE: i32 = 42;
 const IMAGE_FLAKE_REV_LABEL: &str = "remoter.image_flake_rev";
 /// How long the freshness hook may run before it is killed (fail open).
 const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+/// Repo-relative path of the optional host-side cache seeding hook — run
+/// before the bake when the host has nix and the image matches the host's
+/// OS/arch. See the module docs for the env contract.
+const SEED_SCRIPT_REL: &str = ".remoter/seed-nix-cache.sh";
+/// How long the seeding hook may run before it is killed (fail open).
+const SEED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+/// Mount point of the shared nix binary cache inside init and run containers.
+const NIX_CACHE_CONTAINER_DIR: &str = "/nix-cache";
+/// Where the signing key (secret) is mounted inside the init container —
+/// read-only, only for the bake, so it never reaches the committed image.
+const NIX_CACHE_KEY_CONTAINER: &str = "/remoter-nix-cache-key.secret";
+/// Basename of the cache signing keypair, kept NEXT TO the cache dir (never
+/// inside it — run containers mount the cache dir itself).
+const NIX_CACHE_KEY_NAME: &str = "remoter-nix-cache-key";
 
 /// Serializes image builds per project — two parallel runs of one project
 /// must not race the same `docker build`/`docker commit`.
@@ -235,14 +278,30 @@ async fn build_and_commit(spec: BuildSpec<'_>) -> Result<String, DriverError> {
         .await
         .map_err(|e| DriverError::Transient(format!("mkdir {}/.devenv: {e}", repo.display())))?;
 
+    // The shared nix binary cache (module docs § "Shared nix binary cache"):
+    // prepared after `docker build` — seeding needs the built image's
+    // OS/arch — and entirely fail-open (every failure degrades to no cache).
+    let nix_cache = prepare_nix_cache(cfg, repo, docker_bin, build_tag, flake_rev).await;
+
     // The init step warms the project's devenv shell into the image (the run
     // container's first `devenv shell --` must not pay a full nix download)
     // and runs the project's optional init script inside that shell.
-    let init_cmd = if repo.join(INIT_SCRIPT_REL).is_file() {
+    let mut init_cmd = if repo.join(INIT_SCRIPT_REL).is_file() {
         format!("cd /repo && devenv shell --no-tui --no-eval-cache -- sh {INIT_SCRIPT_CONTAINER}")
     } else {
         "cd /repo && devenv shell --no-tui --no-eval-cache -- true".to_string()
     };
+    if nix_cache.is_some() {
+        // Pay the warm forward: export the closures of every gcroot (system
+        // profile, devenv shell roots on the /repo/.devenv tmpfs) into the
+        // shared cache so the next bake — and same-arch run containers —
+        // substitute instead of rebuilding. Best-effort: the export must
+        // never fail the bake.
+        init_cmd = format!(
+            "{init_cmd}; ( {} ) || echo 'remoter: nix cache export failed; continuing' >&2",
+            cache_populate_cmd()
+        );
+    }
     // Best-effort pre-clean: the deterministic init-container name may still
     // be held by an orphan from a dropped build future or a crashed daemon —
     // possibly still *running* (ticket #204) — and `docker run --name` fails
@@ -263,6 +322,7 @@ async fn build_and_commit(spec: BuildSpec<'_>) -> Result<String, DriverError> {
         project_id,
         task_id,
         ssh_args,
+        nix_cache.as_ref(),
     );
     docker(docker_bin, &run_args).await.map_err(image_build_error)?;
 
@@ -439,7 +499,10 @@ fn agent_socket_live(sock: &Path) -> bool {
 
 /// Assembles the `docker run` arguments for the init container. The
 /// `remoter.image_init` marker lets the startup sweep (`container::sweep`)
-/// reap orphans; `project_id`/`task_id` record provenance.
+/// reap orphans; `project_id`/`task_id` record provenance. With a prepared
+/// nix cache the container additionally gets the cache dir mounted rw with
+/// `NIX_CONFIG` pointing at it (and, when signing is active, the secret key
+/// read-only — bind mounts never reach `docker commit`).
 #[allow(clippy::too_many_arguments)]
 fn init_run_args(
     init_container: &str,
@@ -450,6 +513,7 @@ fn init_run_args(
     project_id: i32,
     task_id: i32,
     ssh_args: Vec<String>,
+    nix_cache: Option<&NixCachePlan>,
 ) -> Vec<String> {
     let mut args = vec![
         "run".to_string(),
@@ -468,6 +532,22 @@ fn init_run_args(
         "-e".to_string(),
         format!("REMOTER_IMAGE_FLAKE_REV={flake_rev}"),
     ];
+    if let Some(cache) = nix_cache {
+        args.extend([
+            "-v".to_string(),
+            format!("{}:{NIX_CACHE_CONTAINER_DIR}:rw", cache.dir.display()),
+            // NIX_CONFIG replaces the image's ENV wholesale, so the compose
+            // includes the base image's own experimental-features line.
+            "-e".to_string(),
+            format!("NIX_CONFIG={}", nix_config_with_cache(cache.public_key.as_deref())),
+        ]);
+        if let Some(secret) = &cache.secret_file {
+            args.extend([
+                "-v".to_string(),
+                format!("{}:{NIX_CACHE_KEY_CONTAINER}:ro", secret.display()),
+            ]);
+        }
+    }
     args.extend(ssh_args);
     args.extend([
         build_tag.to_string(),
@@ -485,6 +565,277 @@ async fn image_exists(docker_bin: &str, tag: &str) -> bool {
     )
     .await
     .is_ok()
+}
+
+/// A prepared shared nix binary cache for one image build (module docs §
+/// "Shared nix binary cache").
+struct NixCachePlan {
+    /// Host directory bind-mounted at [`NIX_CACHE_CONTAINER_DIR`].
+    dir: PathBuf,
+    /// Public key the containers trust; `None` => `require-sigs = false`.
+    public_key: Option<String>,
+    /// Host secret key file, mounted read-only into the init container only.
+    secret_file: Option<PathBuf>,
+}
+
+/// Prepares the shared nix binary cache for one bake: applicability gate,
+/// directory creation, signing key, host seeding. Every failure degrades to
+/// "no cache" (logged) — the cache is an accelerator and must never fail or
+/// delay a build beyond its hook timeouts.
+async fn prepare_nix_cache(
+    cfg: &ExecutionConfig,
+    repo: &Path,
+    docker_bin: &str,
+    build_tag: &str,
+    flake_rev: &str,
+) -> Option<NixCachePlan> {
+    let dir = cfg.nix_binary_cache_dir.as_deref()?;
+    if !nix_cache_applicable(repo) {
+        tracing::debug!(
+            "nix_binary_cache_dir is set but the project is not nix-based \
+             (no nix FROM image, no devenv.nix/devenv.yaml); building without the cache"
+        );
+        return None;
+    }
+    if let Err(e) = tokio::fs::create_dir_all(dir).await {
+        tracing::warn!(dir = %dir.display(), error = %e, "cannot create the nix binary cache dir; building without the cache");
+        return None;
+    }
+    let host_nix = host_nix_available();
+    let (secret_file, public_key) = match signing_key(dir, host_nix) {
+        Some((secret, public)) => (Some(secret), Some(public)),
+        None => (None, None),
+    };
+    // Host seeding helps only when the container can actually substitute
+    // host-built paths: same OS and architecture as the image. The hook is
+    // optional — without it the cache still pays forward across bakes.
+    let image_os_arch = docker(
+        docker_bin,
+        &[
+            "image".to_string(),
+            "inspect".to_string(),
+            "--format".to_string(),
+            "{{.Os}}/{{.Architecture}}".to_string(),
+            build_tag.to_string(),
+        ],
+    )
+    .await;
+    match image_os_arch {
+        Ok(os_arch) if should_seed_from_host(host_nix, repo, &os_arch) => {
+            run_seed_hook(repo, dir, flake_rev, SEED_TIMEOUT).await;
+        }
+        Ok(os_arch) => {
+            tracing::debug!(image = %os_arch, "nix cache host seeding skipped (no hook, no host nix, or OS/arch mismatch)")
+        }
+        Err(e) => tracing::warn!(error = %e, "cannot inspect the built image for nix cache seeding; skipping the hook"),
+    }
+    Some(NixCachePlan {
+        dir: dir.to_path_buf(),
+        public_key,
+        secret_file,
+    })
+}
+
+/// Seeding runs only with host nix (to export from the host store), a hook to
+/// run, and an image whose OS/arch matches the host — foreign-arch host paths
+/// would never substitute inside the container.
+fn should_seed_from_host(host_nix: bool, repo: &Path, image_os_arch: &str) -> bool {
+    host_nix
+        && repo.join(SEED_SCRIPT_REL).is_file()
+        && image_os_arch_matches_host(std::env::consts::OS, std::env::consts::ARCH, image_os_arch)
+}
+
+/// Docker renders OS/arch as `linux/amd64`; Rust's `std::env::consts` as
+/// `linux`/`x86_64` — map the arch names before comparing.
+fn image_os_arch_matches_host(host_os: &str, host_arch: &str, image_os_arch: &str) -> bool {
+    let docker_arch = match host_arch {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    image_os_arch == format!("{host_os}/{docker_arch}")
+}
+
+/// Is nix usable on the daemon host? Drives both key generation and seeding.
+fn host_nix_available() -> bool {
+    std::process::Command::new("nix-store")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Applicability gate (ticket #215): the shared cache only helps nix-based
+/// projects — the image Dockerfile builds `FROM` a nix image (e.g.
+/// `nixos/nix`), or the repo carries `devenv.nix`/`devenv.yaml`.
+fn nix_cache_applicable(repo: &Path) -> bool {
+    if repo.join("devenv.nix").is_file() || repo.join("devenv.yaml").is_file() {
+        return true;
+    }
+    match std::fs::read_to_string(repo.join(DOCKERFILE_REL)) {
+        Ok(dockerfile) => dockerfile_from_is_nix(&dockerfile),
+        Err(_) => false,
+    }
+}
+
+/// Any `FROM` line whose image reference mentions nix (`nixos/nix`,
+/// `nixpkgs/...`, a custom `…/nix-base`). Flags (`--platform=…`) are skipped;
+/// comments never reach here as their first token is `#`.
+fn dockerfile_from_is_nix(dockerfile: &str) -> bool {
+    dockerfile.lines().any(|line| {
+        let mut tokens = line.split_whitespace();
+        match tokens.next() {
+            Some(kw) if kw.eq_ignore_ascii_case("from") => tokens
+                .find(|t| !t.starts_with("--"))
+                .map(|image| image.to_ascii_lowercase().contains("nix"))
+                .unwrap_or(false),
+            _ => false,
+        }
+    })
+}
+
+/// The full `NIX_CONFIG` for a container using the cache: it replaces the
+/// base image's ENV wholesale, so it re-states `experimental-features` and
+/// then adds the cache as an extra substituter — trusted public key when the
+/// cache is signed, `require-sigs = false` otherwise.
+fn nix_config_with_cache(public_key: Option<&str>) -> String {
+    let mut cfg =
+        format!("experimental-features = nix-command flakes\nextra-substituters = file://{NIX_CACHE_CONTAINER_DIR}");
+    match public_key {
+        Some(key) => {
+            cfg.push_str("\nextra-trusted-public-keys = ");
+            cfg.push_str(key.trim());
+        }
+        None => cfg.push_str("\nrequire-sigs = false"),
+    }
+    cfg
+}
+
+/// The cache keypair lives NEXT TO the cache dir, never inside it: run
+/// containers mount the cache dir itself (read-only) and must not see the
+/// secret. `None` when the cache dir is a filesystem root.
+fn signing_key_paths(cache_dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let parent = cache_dir.parent()?;
+    Some((
+        parent.join(format!("{NIX_CACHE_KEY_NAME}.secret")),
+        parent.join(format!("{NIX_CACHE_KEY_NAME}.pub")),
+    ))
+}
+
+/// Returns the signing keypair (secret path + public key content), generating
+/// it once via `nix-store --generate-binary-cache-key` when the host has nix
+/// and the pair is missing. A pre-existing pair is used even without host
+/// nix — the signing itself happens inside the init container. Best-effort:
+/// any failure means an unsigned cache (`require-sigs = false`).
+fn signing_key(cache_dir: &Path, host_nix: bool) -> Option<(PathBuf, String)> {
+    let (secret, public) = signing_key_paths(cache_dir)?;
+    if !(secret.is_file() && public.is_file()) {
+        if !host_nix {
+            return None;
+        }
+        // Temp files + rename: two parallel bakes must not read a
+        // half-written key.
+        let tmp_secret = secret.with_extension("secret.tmp");
+        let tmp_public = public.with_extension("pub.tmp");
+        let out = std::process::Command::new("nix-store")
+            .arg("--generate-binary-cache-key")
+            .arg("remoter-nix-cache")
+            .arg(&tmp_secret)
+            .arg(&tmp_public)
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&tmp_secret, std::fs::Permissions::from_mode(0o600));
+                }
+                if std::fs::rename(&tmp_secret, &secret).is_err() || std::fs::rename(&tmp_public, &public).is_err() {
+                    tracing::warn!("cannot install the generated nix cache signing key; using an unsigned cache");
+                    let _ = std::fs::remove_file(&tmp_secret);
+                    let _ = std::fs::remove_file(&tmp_public);
+                    return None;
+                }
+            }
+            _ => {
+                tracing::warn!("nix-store --generate-binary-cache-key failed; using an unsigned nix cache");
+                let _ = std::fs::remove_file(&tmp_secret);
+                let _ = std::fs::remove_file(&tmp_public);
+                return None;
+            }
+        }
+    }
+    let public_key = std::fs::read_to_string(&public).ok()?.trim().to_string();
+    if public_key.is_empty() {
+        return None;
+    }
+    Some((secret, public_key))
+}
+
+/// The best-effort export appended to the init command after the devenv warm
+/// and the init script: every gcroot's closure (the system profile — devenv,
+/// the agent profile — and the devenv shell roots under the /repo/.devenv
+/// tmpfs) is signed when the key is mounted and copied into the shared cache.
+/// Runs outside the devenv shell; nix is on the base image's PATH. `$roots`
+/// word-splitting is intentional (one store path per line).
+fn cache_populate_cmd() -> String {
+    format!(
+        "roots=$(nix-store --gc --print-roots 2>/dev/null | grep -oE '/nix/store/[^ ]+' | sort -u); \
+         if [ -n \"$roots\" ]; then \
+         if [ -f {NIX_CACHE_KEY_CONTAINER} ]; then \
+         printf '%s\\n' $roots | xargs nix store sign --key-file {NIX_CACHE_KEY_CONTAINER}; \
+         fi; \
+         printf '%s\\n' $roots | xargs nix copy --to file://{NIX_CACHE_CONTAINER_DIR}; \
+         fi"
+    )
+}
+
+/// Runs the optional host-side seeding hook (`.remoter/seed-nix-cache.sh`)
+/// with cwd = the central clone and the documented env contract; the daemon's
+/// own environment (`SSH_AUTH_SOCK`, `HOME`, nix) is inherited. Fail-open
+/// exactly like the freshness hook: timeout, spawn failure and non-zero exit
+/// only log — an unseeded cache just means a slower bake.
+async fn run_seed_hook(repo: &Path, cache_dir: &Path, flake_rev: &str, timeout: std::time::Duration) {
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg(SEED_SCRIPT_REL)
+        .current_dir(repo)
+        .env("REMOTER_NIX_CACHE_DIR", cache_dir)
+        .env("REMOTER_IMAGE_FLAKE_REV", flake_rev)
+        // Dropping the future on timeout must kill the script, not orphan it.
+        .kill_on_drop(true);
+    match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(Ok(out)) if out.status.success() => tracing::info!("nix cache seeding hook finished"),
+        Ok(Ok(out)) => tracing::warn!(
+            status = %out.status,
+            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+            "nix cache seeding hook failed; continuing with an unseeded cache"
+        ),
+        Ok(Err(e)) => tracing::warn!(error = %e, "nix cache seeding hook failed to spawn; continuing"),
+        Err(_) => tracing::warn!("nix cache seeding hook timed out; continuing with an unseeded cache"),
+    }
+}
+
+/// Run-container wiring for the shared cache (read-only): the agent's own
+/// nix/devenv commands inside the run container substitute from the cache the
+/// bakes warmed. Empty when the cache is not configured, the project is not
+/// nix-based, or the dir does not exist (e.g. no bake has run yet).
+pub(crate) fn nix_cache_run_args(cfg: &ExecutionConfig, repo: &Path) -> Vec<String> {
+    let Some(dir) = cfg.nix_binary_cache_dir.as_deref() else {
+        return Vec::new();
+    };
+    if !nix_cache_applicable(repo) || !dir.is_dir() {
+        return Vec::new();
+    }
+    let public_key = signing_key_paths(dir)
+        .and_then(|(_, public)| std::fs::read_to_string(public).ok())
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty());
+    vec![
+        "-v".to_string(),
+        format!("{}:{NIX_CACHE_CONTAINER_DIR}:ro", dir.display()),
+        "-e".to_string(),
+        format!("NIX_CONFIG={}", nix_config_with_cache(public_key.as_deref())),
+    ]
 }
 
 /// Reads one label off a built image; `None` when the image or label is
@@ -713,6 +1064,7 @@ mod tests {
             1,
             204,
             vec!["-e".to_string(), "SSH_AUTH_SOCK=/x".to_string()],
+            None,
         );
         assert!(args.contains(&"REMOTER_IMAGE_FLAKE_REV=deadbeef".to_string()));
         assert!(args.contains(&"SSH_AUTH_SOCK=/x".to_string()));
@@ -873,5 +1225,281 @@ mod tests {
         let f = run_freshness_hook(NO_DOCKER, &dir, "img:tag", std::time::Duration::from_millis(200)).await;
         assert_eq!(f, Freshness::CheckFailed);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── shared nix binary cache ────────────────────────────────────────────
+
+    #[test]
+    fn nix_cache_gate_accepts_nix_dockerfile_or_devenv() {
+        let dir = setup_repo("gate");
+        // setup_repo writes `FROM scratch` — not nix-based.
+        assert!(!nix_cache_applicable(&dir));
+
+        std::fs::write(dir.join(DOCKERFILE_REL), "FROM nixos/nix:2.30.2\n").unwrap();
+        assert!(nix_cache_applicable(&dir));
+        std::fs::write(
+            dir.join(DOCKERFILE_REL),
+            "FROM --platform=linux/amd64 nixpkgs/nix:latest\n",
+        )
+        .unwrap();
+        assert!(nix_cache_applicable(&dir));
+        std::fs::write(dir.join(DOCKERFILE_REL), "# FROM nixos/nix\nFROM ubuntu:24.04\n").unwrap();
+        assert!(!nix_cache_applicable(&dir));
+
+        // A devenv project qualifies regardless of the base image.
+        std::fs::write(dir.join("devenv.nix"), "{ }\n").unwrap();
+        assert!(nix_cache_applicable(&dir));
+        std::fs::remove_file(dir.join("devenv.nix")).unwrap();
+        std::fs::write(dir.join("devenv.yaml"), "inputs: {}\n").unwrap();
+        assert!(nix_cache_applicable(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nix_config_with_cache_composes_full_config() {
+        let unsigned = nix_config_with_cache(None);
+        assert!(
+            unsigned.contains("experimental-features = nix-command flakes"),
+            "{unsigned}"
+        );
+        assert!(
+            unsigned.contains("extra-substituters = file:///nix-cache"),
+            "{unsigned}"
+        );
+        assert!(unsigned.contains("require-sigs = false"), "{unsigned}");
+        assert!(!unsigned.contains("trusted-public-keys"), "{unsigned}");
+
+        let signed = nix_config_with_cache(Some("remoter-nix-cache:BASE64==\n"));
+        assert!(
+            signed.contains("extra-trusted-public-keys = remoter-nix-cache:BASE64=="),
+            "{signed}"
+        );
+        assert!(!signed.contains("require-sigs"), "{signed}");
+    }
+
+    #[test]
+    fn signing_key_reads_preexisting_pair_without_host_nix() {
+        let dir = std::env::temp_dir().join(format!("remoter-signing-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = dir.join("nix-cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        // No pair, no host nix -> unsigned.
+        assert!(signing_key(&cache, false).is_none());
+        // A pre-existing pair is used even without host nix (the init
+        // container does the signing).
+        let (secret, public) = signing_key_paths(&cache).unwrap();
+        std::fs::write(&secret, "remoter-nix-cache:SECRET\n").unwrap();
+        std::fs::write(&public, "remoter-nix-cache:PUB==\n").unwrap();
+        let (s, p) = signing_key(&cache, false).unwrap();
+        assert_eq!(s, secret);
+        assert_eq!(p, "remoter-nix-cache:PUB==");
+        // The keypair lives next to the cache dir, never inside it.
+        assert_eq!(secret.parent().unwrap(), dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn image_os_arch_matches_host_maps_docker_arch_names() {
+        assert!(image_os_arch_matches_host("linux", "x86_64", "linux/amd64"));
+        assert!(image_os_arch_matches_host("linux", "aarch64", "linux/arm64"));
+        // Docker Desktop on macOS runs linux images — the host store (macOS
+        // binaries) is useless to them.
+        assert!(!image_os_arch_matches_host("macos", "aarch64", "linux/arm64"));
+        assert!(!image_os_arch_matches_host("linux", "aarch64", "linux/amd64"));
+        assert!(!image_os_arch_matches_host("linux", "x86_64", ""));
+    }
+
+    #[test]
+    fn init_run_args_wire_the_nix_cache() {
+        let signed = NixCachePlan {
+            dir: PathBuf::from("/srv/cache"),
+            public_key: Some("remoter-nix-cache:PUB==".to_string()),
+            secret_file: Some(PathBuf::from("/srv/remoter-nix-cache-key.secret")),
+        };
+        let args = init_run_args(
+            "c",
+            Path::new("/r"),
+            "img:build",
+            "true",
+            "rev",
+            1,
+            2,
+            vec![],
+            Some(&signed),
+        );
+        let joined = args.join(" ");
+        assert!(joined.contains("/srv/cache:/nix-cache:rw"), "{joined}");
+        assert!(joined.contains("extra-substituters = file:///nix-cache"), "{joined}");
+        assert!(
+            joined.contains("extra-trusted-public-keys = remoter-nix-cache:PUB=="),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("/srv/remoter-nix-cache-key.secret:/remoter-nix-cache-key.secret:ro"),
+            "{joined}"
+        );
+
+        let unsigned = NixCachePlan {
+            dir: PathBuf::from("/srv/cache"),
+            public_key: None,
+            secret_file: None,
+        };
+        let args = init_run_args(
+            "c",
+            Path::new("/r"),
+            "img:build",
+            "true",
+            "rev",
+            1,
+            2,
+            vec![],
+            Some(&unsigned),
+        );
+        let joined = args.join(" ");
+        assert!(joined.contains("require-sigs = false"), "{joined}");
+        assert!(!joined.contains("key.secret"), "{joined}");
+    }
+
+    #[test]
+    fn cache_populate_cmd_is_best_effort_and_exports_gcroot_closures() {
+        let cmd = cache_populate_cmd();
+        assert!(cmd.contains("nix-store --gc --print-roots"), "{cmd}");
+        assert!(cmd.contains("nix copy --to file:///nix-cache"), "{cmd}");
+        assert!(
+            cmd.contains("nix store sign --key-file /remoter-nix-cache-key.secret"),
+            "{cmd}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_and_commit_wires_cache_and_best_effort_export() {
+        let repo = setup_repo("build-cache");
+        std::fs::write(repo.join(DOCKERFILE_REL), "FROM nixos/nix:2.30.2\n").unwrap();
+        let cache_dir = repo.join("host-cache");
+        let mut cfg = stub_docker(&repo, 0);
+        cfg.nix_binary_cache_dir = Some(cache_dir.clone());
+        let tag = build_and_commit(test_build_spec(&cfg, &repo)).await.unwrap();
+        assert_eq!(tag, "img:p1-abc123");
+        assert!(cache_dir.is_dir(), "the cache dir is created");
+        let log = docker_log(&repo);
+        // NIX_CONFIG embeds newlines, so one docker invocation spans several
+        // log lines — assert against the full log, not a single line.
+        let full = log.join("\n");
+        let run_idx = log
+            .iter()
+            .position(|l| l.starts_with("run --name remoter-image-init-p1-abc123"))
+            .expect("docker run missing");
+        let run = &log[run_idx];
+        assert!(run.contains(&format!("{}:/nix-cache:rw", cache_dir.display())), "{run}");
+        assert!(full.contains("extra-substituters = file:///nix-cache"), "{full}");
+        assert!(full.contains("nix copy --to file:///nix-cache"), "{full}");
+        // The export is appended to the init command and must never fail the
+        // bake: the whole thing is wrapped in `( … ) || echo …`.
+        assert!(
+            full.contains("|| echo 'remoter: nix cache export failed; continuing'"),
+            "{full}"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[tokio::test]
+    async fn build_and_commit_skips_cache_for_non_nix_projects() {
+        let repo = setup_repo("build-nocache");
+        // setup_repo's `FROM scratch` Dockerfile is not nix-based.
+        let cache_dir = repo.join("host-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let mut cfg = stub_docker(&repo, 0);
+        cfg.nix_binary_cache_dir = Some(cache_dir);
+        build_and_commit(test_build_spec(&cfg, &repo)).await.unwrap();
+        let log = docker_log(&repo);
+        let run = log
+            .iter()
+            .find(|l| l.starts_with("run --name"))
+            .expect("docker run missing");
+        assert!(!run.contains("/nix-cache"), "{run}");
+        assert!(!run.contains("NIX_CONFIG"), "{run}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    fn write_seed_hook(dir: &Path, body: &str) {
+        std::fs::write(dir.join(SEED_SCRIPT_REL), body).unwrap();
+    }
+
+    #[tokio::test]
+    async fn seed_hook_receives_env_contract() {
+        let dir = setup_repo("seed-env");
+        write_seed_hook(
+            &dir,
+            "printf '%s|%s' \"$REMOTER_NIX_CACHE_DIR\" \"$REMOTER_IMAGE_FLAKE_REV\" > captured\n",
+        );
+        run_seed_hook(
+            &dir,
+            Path::new("/srv/cache"),
+            "deadbeef",
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(dir.join("captured")).unwrap(),
+            "/srv/cache|deadbeef"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn seed_hook_failure_and_timeout_fail_open() {
+        let dir = setup_repo("seed-fail");
+        write_seed_hook(&dir, "exit 1\n");
+        run_seed_hook(&dir, Path::new("/srv/cache"), "rev", std::time::Duration::from_secs(5)).await;
+        write_seed_hook(&dir, "sleep 30\n");
+        let start = std::time::Instant::now();
+        run_seed_hook(
+            &dir,
+            Path::new("/srv/cache"),
+            "rev",
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nix_cache_run_args_mount_read_only_for_nix_projects() {
+        let dir = setup_repo("run-args");
+        std::fs::write(dir.join("devenv.nix"), "{ }\n").unwrap();
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let cfg = ExecutionConfig {
+            nix_binary_cache_dir: Some(cache.clone()),
+            ..Default::default()
+        };
+        let args = nix_cache_run_args(&cfg, &dir);
+        let joined = args.join(" ");
+        assert!(
+            joined.contains(&format!("{}:/nix-cache:ro", cache.display())),
+            "{joined}"
+        );
+        assert!(joined.contains("extra-substituters = file:///nix-cache"), "{joined}");
+        // No keypair next to the cache dir -> unsigned mode.
+        assert!(joined.contains("require-sigs = false"), "{joined}");
+
+        // With a public key the containers trust it instead.
+        let (_, public) = signing_key_paths(&cache).unwrap();
+        std::fs::write(&public, "remoter-nix-cache:PUB==\n").unwrap();
+        let joined = nix_cache_run_args(&cfg, &dir).join(" ");
+        assert!(
+            joined.contains("extra-trusted-public-keys = remoter-nix-cache:PUB=="),
+            "{joined}"
+        );
+
+        // Not configured / not nix-based / dir missing -> no wiring.
+        assert!(nix_cache_run_args(&ExecutionConfig::default(), &dir).is_empty());
+        let non_nix = setup_repo("run-args-nonix");
+        assert!(nix_cache_run_args(&cfg, &non_nix).is_empty());
+        std::fs::remove_dir_all(&cache).unwrap();
+        assert!(nix_cache_run_args(&cfg, &dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&non_nix);
     }
 }
