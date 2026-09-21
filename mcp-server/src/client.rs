@@ -428,6 +428,21 @@ impl RemoterClient {
         Self::decode(resp).await
     }
 
+    /// `POST /tasks/{id}/wait` — move the task to `waiting` with the reason a
+    /// human must act (docs/specs/remoter-agent.md §4.3). The backend gates
+    /// this to the task's agent assignee while the task is in `plan` or
+    /// `in_progress`; a backend older than the waiting rollout answers 404,
+    /// which surfaces to the caller as a plain HTTP error.
+    pub async fn wait_task(&self, task_id: i32, reason: &str) -> Result<serde_json::Value, McpError> {
+        let resp = self
+            .http
+            .post(format!("{}/api/v1/tasks/{task_id}/wait", self.base_url))
+            .json(&serde_json::json!({ "reason": reason }))
+            .send()
+            .await?;
+        Self::decode(resp).await
+    }
+
     /// `PUT /tasks/{id}/report` — set (`Some`) or clear (`None` → empty body)
     /// the task's markdown implementation report. Returns the `TaskOutcome`
     /// row (`kind: "report"`).

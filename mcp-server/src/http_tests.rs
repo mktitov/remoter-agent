@@ -1019,6 +1019,111 @@ fn advertised_tool_schemas_document_markdown_and_plain_text_fields() {
     }
 }
 
+/// Gating contract (remoter#162, spec remoter-agent.md §4.3):
+/// `request_human_action` is the working agent's pause button — gated in
+/// Full (humans move tickets in the UI), Supervise (not the supervisor's
+/// ticket), and Review (read-only); open in Plan and Implement.
+#[test]
+fn request_human_action_is_role_gated() {
+    for role in [Role::Full, Role::DevAgentSupervise, Role::DevAgentReview] {
+        assert!(
+            role.is_gated("request_human_action"),
+            "request_human_action must be gated in {role}"
+        );
+    }
+    for role in [Role::DevAgentPlan, Role::DevAgentImplement] {
+        assert!(
+            !role.is_gated("request_human_action"),
+            "request_human_action must be open in {role}"
+        );
+    }
+    // A gated call is rejected before any HTTP happens.
+    let mcp = test_mcp("http://localhost:9999".into(), Role::DevAgentSupervise, Some(70));
+    let err = mcp.gate_tool("request_human_action").unwrap_err();
+    assert!(err.message.contains("not available"), "{err:?}");
+}
+
+#[tokio::test]
+async fn request_human_action_posts_wait_with_reason() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks/7/wait"))
+        .and(body_json(serde_json::json!({"reason": "Create the public repository"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 7, "taskStatus": "waiting",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp(server.uri(), Role::DevAgentImplement, Some(70));
+    let p: crate::tools::RequestHumanActionParams =
+        serde_json::from_value(serde_json::json!({"taskId": 7, "description": "Create the public repository"}))
+            .unwrap();
+    let result = mcp.request_human_action(Parameters(p)).await.unwrap();
+    assert!(result_text(result).contains("\"waiting\""));
+}
+
+/// Daemon mode: an omitted taskId defaults to the current ticket.
+#[tokio::test]
+async fn request_human_action_daemon_mode_defaults_to_current_ticket() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks/70/wait"))
+        .and(body_json(serde_json::json!({"reason": "Rotate the deploy key"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 70, "taskStatus": "waiting",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp(server.uri(), Role::DevAgentPlan, Some(70));
+    let p: crate::tools::RequestHumanActionParams =
+        serde_json::from_value(serde_json::json!({"description": "Rotate the deploy key"})).unwrap();
+    let result = mcp.request_human_action(Parameters(p)).await.unwrap();
+    assert!(result_text(result).contains("\"id\": 70"));
+}
+
+/// Standalone mode without taskId is a tool error before any HTTP happens.
+#[tokio::test]
+async fn request_human_action_standalone_requires_task_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp(server.uri(), Role::DevAgentImplement, None);
+    let p: crate::tools::RequestHumanActionParams =
+        serde_json::from_value(serde_json::json!({"description": "d"})).unwrap();
+    let err = mcp.request_human_action(Parameters(p)).await.unwrap_err();
+    assert!(err.message.contains("taskId is required"), "{err:?}");
+}
+
+/// Backward compatibility (remoter#162): a backend older than the waiting
+/// rollout answers 404 — the tool surfaces the HTTP error to the agent
+/// instead of hanging or panicking.
+#[tokio::test]
+async fn request_human_action_surfaces_404_from_old_backend() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks/7/wait"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+            "error": "not found",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp(server.uri(), Role::DevAgentImplement, Some(7));
+    let p: crate::tools::RequestHumanActionParams =
+        serde_json::from_value(serde_json::json!({"description": "d"})).unwrap();
+    let err = mcp.request_human_action(Parameters(p)).await.unwrap_err();
+    assert!(err.message.to_lowercase().contains("not found"), "{err:?}");
+}
+
 fn whoami_json() -> serde_json::Value {
     serde_json::json!({
         "id": 3,

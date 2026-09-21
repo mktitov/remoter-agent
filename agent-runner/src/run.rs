@@ -438,6 +438,14 @@ pub async fn execute(rc: RunContext) {
                 if cancel_after_attempt(&rc, task_id, run.id).await {
                     return;
                 }
+                // Waiting (spec remoter-agent.md §4.3, remoter#162): the agent
+                // may have paused the ticket mid-turn via `request_human_action`
+                // — the next step is human-only. The run then ends as a clean
+                // pause: no commit guard (a waiting ticket may legitimately
+                // carry no commits), no push/PR, no empty-report nudge (there is
+                // no reviewer yet). Fail-open: a fetch hiccup degrades to the
+                // normal success path.
+                let waiting = matches!(rc.client.task_detail(task_id).await, Ok(d) if d.task_status == "waiting");
                 // Commit guard (spec §5.4 step 5): an implement run the agent
                 // left uncommitted is no success — pushing the empty branch
                 // makes the forge 422 the PR create ("No commits between base
@@ -447,6 +455,7 @@ pub async fn execute(rc: RunContext) {
                 let mut created_child_tickets = false;
                 if rc.kind == RunKind::Implement
                     && supervised.is_none()
+                    && !waiting
                     && let Err(e) = ensure_committed(&rc, &branch).await
                 {
                     // Ticket-creation run (spec §5.4): an implement run may
@@ -501,19 +510,25 @@ pub async fn execute(rc: RunContext) {
                         // children skip push/PR only while their branch has no
                         // remote copy — a branch pushed by an earlier run (a
                         // gate was down) keeps being updated, or its open PR
-                        // would silently go stale (review #106).
-                        let skip_push_pr = match &supervised {
-                            // Cross-project child: always push and open the PR
-                            // against the parent's integration branch (never the
-                            // base) — create-or-reuse keeps it idempotent.
-                            Some((p, _)) if p.cross_project => false,
-                            Some(_) => {
-                                let wt =
-                                    workspace::worktree_dir(&rc.config.workspace_root, rc.project.project_id, task_id);
-                                !workspace::remote_branch_exists(&wt, &branch).await
-                            }
-                            None => false,
-                        };
+                        // would silently go stale (review #106). A waiting
+                        // ticket skips push/PR entirely: the work is paused for
+                        // a human, not ready for review (remoter#162).
+                        let skip_push_pr = waiting
+                            || match &supervised {
+                                // Cross-project child: always push and open the PR
+                                // against the parent's integration branch (never the
+                                // base) — create-or-reuse keeps it idempotent.
+                                Some((p, _)) if p.cross_project => false,
+                                Some(_) => {
+                                    let wt = workspace::worktree_dir(
+                                        &rc.config.workspace_root,
+                                        rc.project.project_id,
+                                        task_id,
+                                    );
+                                    !workspace::remote_branch_exists(&wt, &branch).await
+                                }
+                                None => false,
+                            };
                         if !created_child_tickets && !skip_push_pr {
                             let pr_base = supervised
                                 .as_ref()
@@ -568,7 +583,10 @@ pub async fn execute(rc: RunContext) {
 
                 // Final read-only action check: if actions are still not final,
                 // move to review anyway but note the remaining items on the thread.
+                // Skipped for a waiting ticket — the agent paused mid-plan on
+                // purpose (remoter#162), and the pause note below says it all.
                 if rc.kind == RunKind::Implement
+                    && !waiting
                     && let Ok(detail) = rc.client.task_detail(task_id).await
                 {
                     let pending: Vec<_> = detail.actions.iter().filter(|a| !is_action_final(&a.status)).collect();
@@ -593,58 +611,7 @@ pub async fn execute(rc: RunContext) {
                 }
 
                 finish_reporting(&rc.client, run.id, &body).await;
-                match rc.client.set_task_status(task_id, rc.kind.success_status()).await {
-                    Ok(()) => {
-                        note(
-                            &rc.client,
-                            task_id,
-                            format!(
-                                "{} run #{} finished → {}",
-                                rc.kind.as_str(),
-                                run.id,
-                                rc.kind.success_status()
-                            ),
-                        )
-                        .await;
-                    }
-                    // The dev-agent may have advanced the ticket itself via the
-                    // remoter MCP tools (spec §5.6) — then this write is a no-op
-                    // or conflicts; a forbidden means a human took the ticket
-                    // somewhere the agent set doesn't cover. Either way the
-                    // ticket is already where a human decided it should be, so
-                    // no "finished →" note (it would claim a transition that
-                    // didn't happen).
-                    Err(e) if e.is_conflict() || e.is_forbidden() => {
-                        tracing::info!(
-                            task_id,
-                            "ticket already advanced (agent MCP write or human move); status write skipped"
-                        )
-                    }
-                    Err(e) => tracing::error!(task_id, error = %e, "run succeeded but status transition failed"),
-                }
-                // Report reminder (ticket decision: the agent writes the
-                // report text itself — no auto-copy of the summary — but an
-                // implement run that finished leaving the report empty gives
-                // the reviewer nothing, so the daemon nudges on the thread).
-                if rc.kind == RunKind::Implement {
-                    match rc.client.task_detail(task_id).await {
-                        Ok(d) if d.report.as_deref().is_none_or(|r| r.trim().is_empty()) => {
-                            note(
-                                &rc.client,
-                                task_id,
-                                format!(
-                                    "implement run #{} finished without writing the task report \
-                                     (set_task_report) — the reviewer has no summary",
-                                    run.id
-                                ),
-                            )
-                            .await;
-                        }
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!(task_id, error = %e, "post-finish report check failed"),
-                    }
-                }
-                tracing::info!(task_id, run_id = run.id, "run succeeded → {}", rc.kind.success_status());
+                finalize_success(&rc, run.id, waiting).await;
                 return;
             }
             Ok(Err(RunFailure {
@@ -1236,6 +1203,78 @@ async fn rollback(rc: &RunContext) {
 /// successful run's targets) with an explanatory thread note, and a human
 /// bounces it back (`review → implement`) once the cause is fixed. A conflict
 /// or forbidden means a human already moved the ticket — leave it there.
+/// The tail of a successful claim-loop run: write the success status, then
+/// either note the pause when the agent moved the ticket to `waiting` mid-run
+/// (`request_human_action`, spec remoter-agent.md §4.3 — the status write
+/// soft-skips, and the empty-report nudge is skipped: there is no reviewer
+/// while the ticket waits) or, for implement runs, nudge about a missing
+/// report.
+async fn finalize_success(rc: &RunContext, run_id: i32, waiting: bool) {
+    let task_id = rc.task.id;
+    match rc.client.set_task_status(task_id, rc.kind.success_status()).await {
+        Ok(()) => {
+            note(
+                &rc.client,
+                task_id,
+                format!(
+                    "{} run #{} finished → {}",
+                    rc.kind.as_str(),
+                    run_id,
+                    rc.kind.success_status()
+                ),
+            )
+            .await;
+        }
+        // The dev-agent may have advanced the ticket itself via the
+        // remoter MCP tools (spec §5.6) — then this write is a no-op
+        // or conflicts; a forbidden means a human took the ticket
+        // somewhere the agent set doesn't cover (e.g. `waiting`,
+        // remoter#162). Either way the ticket is already where a human
+        // decided it should be, so no "finished →" note (it would claim a
+        // transition that didn't happen).
+        Err(e) if e.is_conflict() || e.is_forbidden() => {
+            tracing::info!(
+                task_id,
+                "ticket already advanced (agent MCP write or human move); status write skipped"
+            )
+        }
+        Err(e) => tracing::error!(task_id, error = %e, "run succeeded but status transition failed"),
+    }
+    if waiting {
+        note(
+            &rc.client,
+            task_id,
+            format!("run #{run_id} paused: waiting for human action"),
+        )
+        .await;
+        tracing::info!(task_id, run_id, "run succeeded; ticket waits for a human action");
+        return;
+    }
+    // Report reminder (ticket decision: the agent writes the
+    // report text itself — no auto-copy of the summary — but an
+    // implement run that finished leaving the report empty gives
+    // the reviewer nothing, so the daemon nudges on the thread).
+    if rc.kind == RunKind::Implement {
+        match rc.client.task_detail(task_id).await {
+            Ok(d) if d.report.as_deref().is_none_or(|r| r.trim().is_empty()) => {
+                note(
+                    &rc.client,
+                    task_id,
+                    format!(
+                        "implement run #{} finished without writing the task report \
+                         (set_task_report) — the reviewer has no summary",
+                        run_id
+                    ),
+                )
+                .await;
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(task_id, error = %e, "post-finish report check failed"),
+        }
+    }
+    tracing::info!(task_id, run_id, "run succeeded → {}", rc.kind.success_status());
+}
+
 async fn escalate(rc: &RunContext, run_id: i32, reason: &str, attempt: u32) {
     let task_id = rc.task.id;
     let reason = truncate_with_marker(reason, MAX_ERROR_BYTES);
@@ -1313,7 +1352,12 @@ const PLAN_INSTRUCTIONS: &str = "## Instructions\nYou are in PLAN-ONLY mode: exp
      MCP tool, so humans and agents can see which child ticket is ready for implementation and which \
      are blocked. Never wire a `blocks`/`blocked_by` link between a child ticket and its parent — or \
      any ancestor/descendant in the subtask tree: the backend rejects such links, so dependencies only \
-     ever run between sibling tickets.\n";
+     ever run between sibling tickets.\n\n\
+     If the ticket cannot proceed without a step only a human can perform (external permissions, \
+     credentials, manual changes outside the worktree), call the `request_human_action` MCP tool with \
+     a precise, actionable description of that step and end your turn — the ticket waits in the \
+     `waiting` status until the human confirms, then the daemon resumes the work. Never pretend the \
+     human-only step is done.\n";
 
 /// Cap for error text stored on the run row and posted to the thread — the
 /// full output stays in the daemon logs (spec §5.6).
@@ -1701,6 +1745,11 @@ fn render_prompt(
                  turn's end is final: the daemon shuts the agent down and pending tasks are killed, their \
                  completion never arrives. Run long checks in the foreground or wait for them to finish \
                  before your final message. End with a summary of changes.\n\n\
+                 If the next step is one only a human can perform (external permissions, credentials, a \
+                 manual environment change), call the `request_human_action` MCP tool with a precise, \
+                 actionable description of the required action and end your turn: the ticket moves to the \
+                 `waiting` status and the daemon resumes the work once the human confirms. Do NOT simulate \
+                 or skip the human-only step, and do NOT finish the run as if the work were complete.\n\n\
                  Action choreography: use `start_action` when you begin work on an action, \
                  `complete_action` when it is done, and `reject_action` with a reason for any step that \
                  is no longer needed or incorrect. Only one action per task may be active at a time. By the \
@@ -2340,6 +2389,29 @@ mod tests {
             assert!(p.contains("the backend rejects such links"), "{kind:?}: {p}");
             assert!(p.contains("sibling tickets"), "{kind:?}: {p}");
         }
+    }
+
+    /// remoter#162: both prompts instruct the agent to hand a human-only step
+    /// to a human via `request_human_action` (the ticket waits in `waiting`)
+    /// instead of simulating the step or finishing as if the work were done.
+    #[test]
+    fn prompts_instruct_request_human_action_for_human_only_steps() {
+        for kind in [RunKind::Plan, RunKind::Implement] {
+            let p = render_prompt(kind, &detail(vec![], vec![]), None, 999, "http://api", &[], "");
+            assert!(p.contains("`request_human_action`"), "{kind:?}: {p}");
+            assert!(p.contains("only a human"), "{kind:?}: {p}");
+            assert!(p.contains("`waiting`"), "{kind:?}: {p}");
+        }
+        let p = render_prompt(
+            RunKind::Implement,
+            &detail(vec![], vec![]),
+            None,
+            999,
+            "http://api",
+            &[],
+            "",
+        );
+        assert!(p.contains("Do NOT simulate or skip the human-only step"), "{p}");
     }
 
     /// The `.refs/` block (docs/specs/cross-repo-projects.md): with reference
@@ -3194,5 +3266,110 @@ kind = "stub"
             3,
             "whoami + child detail + parent detail — the gate trips before any further work"
         );
+    }
+
+    /// Minimal recording mock backend (same connection-per-response shape as
+    /// `spawn_counting_backend`, but captures each request's line and body so
+    /// a test can assert what the daemon posted).
+    async fn spawn_recording_backend(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (String, Arc<tokio::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        tokio::spawn(async move {
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let mut header_end = None;
+                while header_end.is_none() {
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            request.extend_from_slice(&chunk[..n]);
+                            header_end = request.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4);
+                        }
+                    }
+                }
+                if let Some(body_start) = header_end {
+                    let headers = String::from_utf8_lossy(&request[..body_start]).into_owned();
+                    let content_length: usize = headers
+                        .lines()
+                        .find_map(|l| {
+                            l.split_once(':')
+                                .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                                .and_then(|(_, v)| v.trim().parse().ok())
+                        })
+                        .unwrap_or(0);
+                    while request.len() < body_start + content_length {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => request.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let request_line = headers.lines().next().unwrap_or("").to_string();
+                    let body_text = String::from_utf8_lossy(&request[body_start..]).into_owned();
+                    recorded.lock().await.push(format!("{request_line}\n{body_text}"));
+                }
+                let response = format!(
+                    "HTTP/1.1 {status} Reason\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (format!("http://{addr}"), requests)
+    }
+
+    /// remoter#162: a run whose agent paused the ticket via
+    /// `request_human_action` finishes as a clean pause — the success status
+    /// write soft-skips (`waiting` is not agent-writable, so the PATCH 403s),
+    /// the thread gets the pause note, and the empty-report nudge is NOT
+    /// posted (there is no reviewer while the ticket waits).
+    #[tokio::test]
+    async fn finalize_success_notes_pause_and_skips_report_nudge_when_waiting() {
+        let (url, requests) = spawn_recording_backend(vec![
+            (403, r#"{"error":"forbidden"}"#), // PATCH /tasks/42/status
+            (200, r#"{"id":1}"#),              // POST /tasks/42/comments
+        ])
+        .await;
+        let rc = test_run_context(&url);
+
+        finalize_success(&rc, 99, true).await;
+
+        let reqs = requests.lock().await;
+        assert_eq!(reqs.len(), 2, "{reqs:?}");
+        assert!(reqs[0].starts_with("PATCH /api/v1/tasks/42/status"), "{reqs:?}");
+        assert!(reqs[1].starts_with("POST /api/v1/tasks/42/comments"), "{reqs:?}");
+        assert!(reqs[1].contains("run #99 paused: waiting for human action"), "{reqs:?}");
+    }
+
+    /// Regression guard for the non-waiting path: an implement run with an
+    /// empty report still gets the "finished → review" note and the
+    /// empty-report nudge.
+    #[tokio::test]
+    async fn finalize_success_nudges_about_empty_report_when_not_waiting() {
+        let (url, requests) = spawn_recording_backend(vec![
+            (200, r#"{"id":42}"#), // PATCH /tasks/42/status
+            (200, r#"{"id":1}"#),   // POST "finished →" note
+            (
+                200,
+                r#"{"id":42,"projectId":1,"projectName":"proj","featureId":1,"featureDescription":"feat","title":"t","description":"d","taskStatus":"review","assigneeId":null,"assigneeName":null,"report":null}"#,
+            ), // GET /tasks/42 detail
+            (200, r#"{"id":2}"#), // POST nudge note
+        ])
+        .await;
+        let rc = test_run_context(&url);
+
+        finalize_success(&rc, 99, false).await;
+
+        let reqs = requests.lock().await;
+        assert_eq!(reqs.len(), 4, "{reqs:?}");
+        assert!(reqs[1].contains("implement run #99 finished → review"), "{reqs:?}");
+        assert!(reqs[3].starts_with("POST /api/v1/tasks/42/comments"), "{reqs:?}");
+        assert!(reqs[3].contains("finished without writing the task report"), "{reqs:?}");
     }
 }
