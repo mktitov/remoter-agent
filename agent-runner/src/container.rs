@@ -703,19 +703,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // Stub docker: logs every argv line; `ps` answers with two ids.
         let stub = dir.join("docker-stub.sh");
-        std::fs::write(
+        crate::testutil::write_executable_script(
             &stub,
-            format!(
+            &format!(
                 "#!/bin/sh\necho \"$*\" >> '{}'\nif [ \"$1\" = ps ]; then printf 'aaa\\nbbb\\n'; fi\nexit 0\n",
                 dir.join("docker.log").display()
             ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        );
         let cfg = ExecutionConfig {
             docker_binary: stub.to_string_lossy().into_owned(),
             ..Default::default()

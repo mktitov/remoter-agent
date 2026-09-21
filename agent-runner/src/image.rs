@@ -1079,19 +1079,13 @@ mod tests {
     /// `rm_exit`. Returns the execution config pointing at the stub.
     fn stub_docker(dir: &Path, rm_exit: i32) -> ExecutionConfig {
         let stub = dir.join("docker-stub.sh");
-        std::fs::write(
+        crate::testutil::write_executable_script(
             &stub,
-            format!(
+            &format!(
                 "#!/bin/sh\necho \"$*\" >> '{}'\nif [ \"$1\" = rm ]; then exit {rm_exit}; fi\nexit 0\n",
                 dir.join("docker.log").display()
             ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        );
         ExecutionConfig {
             docker_binary: stub.to_string_lossy().into_owned(),
             ..Default::default()

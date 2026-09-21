@@ -2545,16 +2545,10 @@ mod tests {
             let bin = base.join("bin");
             std::fs::create_dir_all(&bin).unwrap();
             let log = base.join("devenv.log");
-            std::fs::write(
-                bin.join("devenv"),
+            crate::testutil::write_executable_script(
+                &bin.join("devenv"),
                 "#!/bin/sh\necho \"$* @ $(pwd)\" >> \"$DEVENV_STUB_LOG\"\nif [ -n \"$DEVENV_STUB_FAIL\" ]; then\n  case \"$*\" in\n    *\"$DEVENV_STUB_FAIL\"*) exit 1;;\n  esac\nfi\nexit 0\n",
-            )
-            .unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(bin.join("devenv"), std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
+            );
             let orig_path = std::env::var_os("PATH");
             // SAFETY: serialized on ENV_LOCK; no other thread in this binary
             // touches PATH while these tests hold it.
