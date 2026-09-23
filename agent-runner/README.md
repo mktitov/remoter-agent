@@ -159,11 +159,14 @@ docker container instead of on the host:
   images (pulled on first use).
 - **Disk / pruning:** budget ~8–16 GB per project image (PoC-1 measured a
   2.7 GB base → ~16.8 GB baked; the devshell profile dominates). Images are
-  labeled `remoter.project_id` / `remoter.image_hash`; when pruning, keep the
-  **current + previous** tag per project and drop older ones — that bounds
-  agent images at ~16–32 GB per project while keeping a rollback. Run
-  containers and sidecars are removed automatically after every run (a
-  startup sweep reaps leftovers from a crashed daemon).
+  labeled `remoter.project_id` / `remoter.image_hash`, and the daemon prunes
+  automatically: after every successful image build it removes the project's
+  superseded tags, keeping the **current + previous** tag per project — that
+  bounds agent images at ~16–32 GB per project while keeping a rollback. The
+  prune is best-effort: an image still used by a running container is skipped
+  with a warning in the daemon log. Run containers and sidecars are removed
+  automatically after every run (a startup sweep reaps leftovers from a
+  crashed daemon).
 
 ## Tests
 

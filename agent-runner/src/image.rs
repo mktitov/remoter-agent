@@ -116,6 +116,10 @@ const NIX_CACHE_KEY_CONTAINER: &str = "/remoter-nix-cache-key.secret";
 /// Basename of the cache signing keypair, kept NEXT TO the cache dir (never
 /// inside it — run containers mount the cache dir itself).
 const NIX_CACHE_KEY_NAME: &str = "remoter-nix-cache-key";
+/// Prune policy (spec §9): how many of a project's newest image tags survive
+/// the post-build prune — the just-built image plus one rollback. Fixed by
+/// the spec; deliberately not configurable.
+const IMAGE_TAGS_TO_KEEP: usize = 2;
 
 /// Serializes image builds per project — two parallel runs of one project
 /// must not race the same `docker build`/`docker commit`.
@@ -217,6 +221,12 @@ pub async fn ensure_project_image(
     // the deliverable; the build-stage image only wastes disk.
     let _ = docker(docker_bin, &["rmi".to_string(), "-f".to_string(), build_tag]).await;
     let _ = docker(docker_bin, &["rm".to_string(), "-f".to_string(), init_container]).await;
+    if result.is_ok() {
+        // Spec §9 prune policy: after a successful build, drop the project's
+        // superseded tags (keep current + previous). Best-effort — it never
+        // affects the returned tag.
+        prune_superseded_images(docker_bin, &cfg.image_tag_prefix, project_id, &tag).await;
+    }
     result
 }
 
@@ -565,6 +575,70 @@ async fn image_exists(docker_bin: &str, tag: &str) -> bool {
     )
     .await
     .is_ok()
+}
+
+/// Post-build prune (spec §9): removes the project's superseded image tags,
+/// keeping the [`IMAGE_TAGS_TO_KEEP`] newest — the just-built image plus one
+/// rollback for a bad Dockerfile. Entirely best-effort: a failed listing or
+/// `rmi` (e.g. the image is still used by a running container) only logs a
+/// warning; the build result is never affected. Runs under the per-project
+/// image lock, so no concurrent build of the same project can race it.
+async fn prune_superseded_images(docker_bin: &str, image_tag_prefix: &str, project_id: i32, current_tag: &str) {
+    let listing = docker(
+        docker_bin,
+        &[
+            "images".to_string(),
+            "--format".to_string(),
+            "{{.Repository}}:{{.Tag}} {{.CreatedAt}}".to_string(),
+            "--filter".to_string(),
+            format!("label={PROJECT_ID_LABEL}={project_id}"),
+            "--filter".to_string(),
+            format!("reference={image_tag_prefix}:p{project_id}-*"),
+        ],
+    )
+    .await;
+    let listing = match listing {
+        Ok(listing) => listing,
+        Err(e) => {
+            tracing::warn!(project_id, error = %e, "agent image prune: cannot list images; keeping everything");
+            return;
+        }
+    };
+    let images: Vec<(String, String)> = listing
+        .lines()
+        .filter_map(|line| {
+            let (tag, created_at) = line.split_once(' ')?;
+            Some((tag.to_string(), created_at.to_string()))
+        })
+        .collect();
+    for tag in superseded_tags(images, current_tag) {
+        match docker(docker_bin, &["rmi".to_string(), tag.clone()]).await {
+            Ok(_) => tracing::info!(tag, project_id, "agent image prune: removed superseded image"),
+            Err(e) => {
+                tracing::warn!(tag, project_id, error = %e, "agent image prune: cannot remove superseded image; skipping")
+            }
+        }
+    }
+}
+
+/// From `(tag, created_at)` pairs (the `docker images --format
+/// '{{.Repository}}:{{.Tag}} {{.CreatedAt}}'` rendering — the timestamp is
+/// lexicographically sortable), pick the tags to delete under the
+/// keep-current+previous policy (spec §9): everything but the
+/// [`IMAGE_TAGS_TO_KEEP`] newest. `-build` staging tags are excluded (the
+/// build's own cleanup handles them), and `current_tag` is never returned,
+/// even if its timestamp would sort it out of the kept window.
+fn superseded_tags(mut images: Vec<(String, String)>, current_tag: &str) -> Vec<String> {
+    images.retain(|(tag, _)| !tag.ends_with("-build"));
+    // Newest first; the tag breaks timestamp ties to keep the choice
+    // deterministic.
+    images.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    images
+        .into_iter()
+        .skip(IMAGE_TAGS_TO_KEEP)
+        .map(|(tag, _)| tag)
+        .filter(|tag| tag != current_tag)
+        .collect()
 }
 
 /// A prepared shared nix binary cache for one image build (module docs §
@@ -1495,5 +1569,153 @@ mod tests {
         assert!(nix_cache_run_args(&cfg, &dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&non_nix);
+    }
+
+    // ── image prune (spec §9) ────────────────────────────────────────────
+
+    fn img(tag: &str, created_at: &str) -> (String, String) {
+        (tag.to_string(), created_at.to_string())
+    }
+
+    #[test]
+    fn superseded_tags_keeps_two_newest() {
+        // 0 / 1 / 2 images: nothing is ever pruned.
+        assert!(superseded_tags(vec![], "img:p1-a").is_empty());
+        assert!(superseded_tags(vec![img("img:p1-a", "2026-09-20 10:00:00 +0000 UTC")], "img:p1-a").is_empty());
+        assert!(
+            superseded_tags(
+                vec![
+                    img("img:p1-a", "2026-09-20 10:00:00 +0000 UTC"),
+                    img("img:p1-b", "2026-09-21 10:00:00 +0000 UTC"),
+                ],
+                "img:p1-b",
+            )
+            .is_empty()
+        );
+        // N images in arbitrary input order: the two newest by CreatedAt
+        // survive; the rest come out newest-first.
+        let pruned = superseded_tags(
+            vec![
+                img("img:p1-c", "2026-09-22 10:00:00 +0000 UTC"),
+                img("img:p1-a", "2026-09-20 10:00:00 +0000 UTC"),
+                img("img:p1-d", "2026-09-23 10:00:00 +0000 UTC"),
+                img("img:p1-b", "2026-09-21 10:00:00 +0000 UTC"),
+            ],
+            "img:p1-d",
+        );
+        assert_eq!(pruned, vec!["img:p1-b".to_string(), "img:p1-a".to_string()]);
+    }
+
+    #[test]
+    fn superseded_tags_excludes_build_tags_and_current() {
+        // A leftover -build tag is never pruned here (the build's own cleanup
+        // handles it), even when it is the oldest entry.
+        let pruned = superseded_tags(
+            vec![
+                img("img:p1-d", "2026-09-23 10:00:00 +0000 UTC"),
+                img("img:p1-c", "2026-09-22 10:00:00 +0000 UTC"),
+                img("img:p1-x-build", "2026-09-19 10:00:00 +0000 UTC"),
+                img("img:p1-b", "2026-09-21 10:00:00 +0000 UTC"),
+            ],
+            "img:p1-d",
+        );
+        assert_eq!(pruned, vec!["img:p1-b".to_string()]);
+        // The just-built tag is never pruned, even with a bogus old timestamp
+        // that would sort it out of the kept window.
+        let pruned = superseded_tags(
+            vec![
+                img("img:p1-c", "2026-09-23 10:00:00 +0000 UTC"),
+                img("img:p1-b", "2026-09-22 10:00:00 +0000 UTC"),
+                img("img:p1-a", "2026-09-21 10:00:00 +0000 UTC"),
+                img("img:p1-current", "2020-01-01 00:00:00 +0000 UTC"),
+            ],
+            "img:p1-current",
+        );
+        assert_eq!(pruned, vec!["img:p1-a".to_string()]);
+    }
+
+    #[test]
+    fn superseded_tags_breaks_timestamp_ties_deterministically() {
+        let images = || {
+            vec![
+                img("img:p1-b", "2026-09-22 10:00:00 +0000 UTC"),
+                img("img:p1-c", "2026-09-22 10:00:00 +0000 UTC"),
+                img("img:p1-a", "2026-09-22 10:00:00 +0000 UTC"),
+            ]
+        };
+        // Equal timestamps: the tag name breaks the tie, so the choice is
+        // stable across runs (a, b kept; c pruned).
+        let pruned = superseded_tags(images(), "img:p1-d");
+        assert_eq!(pruned, vec!["img:p1-c".to_string()]);
+        assert_eq!(pruned, superseded_tags(images(), "img:p1-d"));
+    }
+
+    #[tokio::test]
+    async fn prune_superseded_images_keeps_two_newest_and_is_best_effort() {
+        let dir = std::env::temp_dir().join(format!("remoter-prune-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Stub docker: logs argv; `images` answers five tags (including a
+        // -build leftover); `rmi img:p1-busy` fails as if a container used it.
+        let stub = dir.join("docker-stub.sh");
+        crate::testutil::write_executable_script(
+            &stub,
+            &format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\n\
+                 if [ \"$1\" = images ]; then\n  \
+                 printf '%s\\n' \\\n\
+                 'img:p1-newest 2026-09-23 10:00:00 +0000 UTC' \\\n\
+                 'img:p1-prev 2026-09-22 10:00:00 +0000 UTC' \\\n\
+                 'img:p1-old 2026-09-21 10:00:00 +0000 UTC' \\\n\
+                 'img:p1-busy 2026-09-20 10:00:00 +0000 UTC' \\\n\
+                 'img:p1-stale-build 2026-09-19 10:00:00 +0000 UTC'\n  \
+                 exit 0\nfi\n\
+                 if [ \"$1\" = rmi ] && [ \"$2\" = img:p1-busy ]; then\n  \
+                 echo 'image is being used by a running container' >&2\n  \
+                 exit 1\nfi\n\
+                 exit 0\n",
+                dir.join("docker.log").display()
+            ),
+        );
+        let docker_bin = stub.to_string_lossy().into_owned();
+        prune_superseded_images(&docker_bin, "img", 1, "img:p1-newest").await;
+        let log = std::fs::read_to_string(dir.join("docker.log")).unwrap();
+        // The listing is scoped to the project's label and tag prefix.
+        assert!(
+            log.contains(&format!(
+                "images --format {{{{.Repository}}}}:{{{{.Tag}}}} {{{{.CreatedAt}}}} \
+                 --filter label={PROJECT_ID_LABEL}=1 --filter reference=img:p1-*"
+            )),
+            "{log}"
+        );
+        // Both superseded tags are attempted — the failing rmi does not stop
+        // the other — while the kept tags and the -build tag are untouched.
+        assert!(log.contains("rmi img:p1-old\n"), "{log}");
+        assert!(log.contains("rmi img:p1-busy\n"), "{log}");
+        assert!(!log.contains("rmi img:p1-newest"), "{log}");
+        assert!(!log.contains("rmi img:p1-prev"), "{log}");
+        assert!(!log.contains("rmi img:p1-stale-build"), "{log}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn prune_superseded_images_tolerates_a_failing_listing() {
+        let dir = std::env::temp_dir().join(format!("remoter-prune-fail-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join("docker-stub.sh");
+        crate::testutil::write_executable_script(
+            &stub,
+            &format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\nexit 1\n",
+                dir.join("docker.log").display()
+            ),
+        );
+        let docker_bin = stub.to_string_lossy().into_owned();
+        // Must not panic or escalate: a failed `docker images` only logs.
+        prune_superseded_images(&docker_bin, "img", 1, "img:p1-newest").await;
+        let log = std::fs::read_to_string(dir.join("docker.log")).unwrap();
+        assert!(!log.contains("rmi"), "{log}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
