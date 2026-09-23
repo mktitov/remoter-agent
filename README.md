@@ -48,6 +48,18 @@ cd remoter-agent
 cargo build --release   # binaries in target/release/
 ```
 
+## User documentation
+
+Full user guides (in Russian) are published at
+[aiborda.ru/docs/](https://aiborda.ru/docs/):
+
+- setting up a project for `remoter-agent` in host and container modes;
+- installing and configuring the `remoter-agent` daemon;
+- using `remoter-mcp` standalone with human-driven MCP clients.
+
+The guides are maintained in the Remoter monorepo (`docs/user/`) and
+published to aiborda.ru; this README stays an English quick-reference.
+
 ## Development
 
 The repo ships a [devenv](https://devenv.sh) shell with the stable Rust
