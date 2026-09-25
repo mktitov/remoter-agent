@@ -31,8 +31,10 @@ stall_grace_secs    = 30
 # docker_binary = "docker"
 # image_tag_prefix = "remoter-agent"   # tags: <prefix>:p<project_id>-<sha256-16>
 #                                      # over the project's .remoter/agent.Dockerfile
-#                                      # (+ agent-init.sh); keep current+previous
-#                                      # image per project when pruning (spec §9)
+#                                      # (+ agent-init.sh); the daemon prunes
+#                                      # superseded tags automatically after each
+#                                      # successful build, keeping current+previous
+#                                      # per project (spec §9)
 # postgres_image = "postgres:17.6-alpine3.22"
 # minio_image    = "minio/minio:RELEASE.2025-09-07T16-13-09Z"
 # mc_image       = "minio/mc:RELEASE.2025-08-13T08-35-41Z"
