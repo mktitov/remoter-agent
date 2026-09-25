@@ -296,9 +296,11 @@ async fn build_and_commit(spec: BuildSpec<'_>) -> Result<String, DriverError> {
         // profile, devenv shell roots on the /repo/.devenv tmpfs) into the
         // shared cache so the next bake — and same-arch run containers —
         // substitute instead of rebuilding. Best-effort: the export must
-        // never fail the bake.
+        // never fail the bake. The init script's exit code is captured
+        // first and restored after, so a failing agent-init.sh still fails
+        // the build — without this the `|| echo` below would swallow it.
         init_cmd = format!(
-            "{init_cmd}; ( {} ) || echo 'remoter: nix cache export failed; continuing' >&2",
+            "{init_cmd}\nrc=$?\n( {} ) || echo 'remoter: nix cache export failed; continuing' >&2\nexit $rc",
             cache_populate_cmd()
         );
     }
@@ -1393,7 +1395,37 @@ mod tests {
             full.contains("|| echo 'remoter: nix cache export failed; continuing'"),
             "{full}"
         );
+        // The init script's exit code is captured before the export and
+        // restored after, so a failing agent-init.sh still fails the build.
+        assert!(full.contains("rc=$?"), "{full}");
+        assert!(full.contains("exit $rc"), "{full}");
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// The init command must propagate agent-init.sh's exit code through the
+    /// cache-export suffix: a failing init script must fail the bake, not
+    /// produce a broken image. Regression test for the `; ( … ) || echo`
+    /// pattern that swallowed the exit code.
+    #[test]
+    fn init_cmd_preserves_exit_code_through_cache_export() {
+        // Test the shell pattern directly: `cmd; rc=$?; ( … ) || echo …; exit $rc`
+        // must propagate cmd's exit code regardless of the export's outcome.
+        let check = |init_exit: i32, export_exit: i32| {
+            let script =
+                format!("exit {init_exit}\nrc=$?\n( exit {export_exit} ) || echo 'export failed' >&2\nexit $rc");
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .output()
+                .unwrap()
+                .status
+                .code()
+                .unwrap()
+        };
+        assert_eq!(check(0, 0), 0, "success + success = success");
+        assert_eq!(check(1, 0), 1, "init failure propagates");
+        assert_eq!(check(0, 1), 0, "export failure is swallowed");
+        assert_eq!(check(1, 1), 1, "init failure wins over export failure");
     }
 
     #[tokio::test]
