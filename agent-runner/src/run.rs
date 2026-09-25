@@ -1902,13 +1902,20 @@ async fn push_and_create_pr(
 
     // Create-or-reuse: an earlier run of this ticket (a review → implement
     // bounce) may already have opened the PR — record the same URL instead of
-    // opening a second one.
+    // opening a second one. Only reuse a URL that points at THIS project's
+    // repo: a cross-project supervise run records the child repo's integration
+    // PR on this ticket's run history (#207), and reusing that URL here would
+    // leave the parent's own PR never created (#220).
     let runs = rc
         .client
         .list_runs(rc.task.id)
         .await
         .map_err(|e| format!("run history fetch: {e}"))?;
-    if let Some(url) = runs.iter().find_map(|r| r.pr_url.clone()) {
+    if let Some(url) = runs
+        .iter()
+        .find_map(|r| r.pr_url.clone())
+        .filter(|url| forge::pr_url_matches_repo(url, &rc.project.repo_url))
+    {
         return Ok(Some(url));
     }
 

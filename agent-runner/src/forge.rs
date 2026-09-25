@@ -365,6 +365,28 @@ pub fn pr_number_from_url(pr_url: &str) -> Result<u64, ForgeError> {
     Err(ForgeError::Parse(format!("cannot extract PR/MR number from {pr_url}")))
 }
 
+/// Whether a PR/MR web URL belongs to the given repo — the create-or-reuse
+/// guard in `push_and_create_pr` uses it to ignore a PR URL recorded by a
+/// cross-project supervise run (that URL points at the CHILD repo's
+/// integration PR, not at a PR in this project's repo). Compares host and
+/// path segments: GitHub `https://host/owner/repo/pull/N` and GitLab
+/// `https://host/group/proj/-/merge_requests/N` both embed the repo path
+/// before the PR marker. Returns `false` on any parse failure — a URL we
+/// can't attribute is never safe to reuse.
+pub fn pr_url_matches_repo(pr_url: &str, repo_url: &str) -> bool {
+    let (Ok((pr_host, pr_path)), Ok((repo_host, repo_path))) = (host_and_path(pr_url), host_and_path(repo_url)) else {
+        return false;
+    };
+    if pr_host != repo_host {
+        return false;
+    }
+    let pr_segs = path_segments(&pr_path);
+    let repo_segs = path_segments(&repo_path);
+    // The PR URL's path is `<repo path>/pull/<n>` or
+    // `<repo path>/-/merge_requests/<n>` — the repo path is a strict prefix.
+    pr_segs.len() > repo_segs.len() && pr_segs[..repo_segs.len()] == repo_segs[..]
+}
+
 // ── PR mergeability (PROD-9) ────────────────────────────────────────────────
 
 /// Whether the forge considers the PR/MR mergeable into its target branch.
@@ -863,6 +885,49 @@ mod tests {
         assert!(pr_number_from_url("https://gitlab.com/o/r/-/issues/5").is_err());
         assert!(pr_number_from_url("not a url").is_err());
         assert!(pr_number_from_url("").is_err());
+    }
+
+    #[test]
+    fn pr_url_matches_repo_same_repo() {
+        // GitHub.
+        assert!(pr_url_matches_repo(
+            "https://github.com/o/r/pull/18",
+            "git@github.com:o/r.git"
+        ));
+        // GitLab with subgroups.
+        assert!(pr_url_matches_repo(
+            "https://gitlab.com/grp/sub/proj/-/merge_requests/3",
+            "https://gitlab.com/grp/sub/proj.git"
+        ));
+        // GHE / self-hosted host match.
+        assert!(pr_url_matches_repo(
+            "https://ghe.acme.io/o/r/pull/7",
+            "ssh://git@ghe.acme.io/o/r.git"
+        ));
+    }
+
+    #[test]
+    fn pr_url_matches_repo_rejects_other_repo() {
+        // The #220 bug: a cross-project supervise run records the CHILD repo's
+        // integration PR on the parent's run history; the parent's own
+        // implement run must not reuse it.
+        assert!(!pr_url_matches_repo(
+            "https://github.com/mktitov/remoter-agent/pull/18",
+            "git@github.com:mktitov/remoter.git"
+        ));
+        // Different host.
+        assert!(!pr_url_matches_repo(
+            "https://gitlab.com/o/r/-/merge_requests/1",
+            "git@github.com:o/r.git"
+        ));
+        // Repo path is a prefix of a different repo's path (r vs r-extra).
+        assert!(!pr_url_matches_repo(
+            "https://github.com/o/r-extra/pull/1",
+            "git@github.com:o/r.git"
+        ));
+        // Unparseable URL is never reused.
+        assert!(!pr_url_matches_repo("not a url", "git@github.com:o/r.git"));
+        assert!(!pr_url_matches_repo("https://github.com/o/r/pull/1", "not a url"));
     }
 
     /// GitHub issue (conversation) comment fixture.
