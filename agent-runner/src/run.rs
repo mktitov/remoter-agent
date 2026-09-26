@@ -1328,7 +1328,11 @@ const PLAN_INSTRUCTIONS: &str = "## Instructions\nYou are in PLAN-ONLY mode: exp
      implementation plan and make it your ENTIRE final message (Markdown — do not ask questions \
      interactively). The plan must contain a \
      \"Plan\" section that describes what the implementation run will do and the expected outcome of \
-     the implementation step: code changes on this ticket's branch or a set of child tickets. \
+     the implementation step: code changes on this ticket's branch or a set of child tickets. These two \
+     outcomes never mix on one ticket: if any part of the work must become a child ticket (for example \
+     a change in another repository), then every code-change step is planned as a child ticket — work \
+     in this ticket's own repository becomes a same-project child — and this ticket's branch carries \
+     no direct code changes; its implement run only creates the children. \
      Register every open question or assumption the human must clarify as a structured question via \
      the `add_task_question` MCP tool (one call per question) — never write an \"Open questions\" \
      section into the plan text. Propose concrete answer `options` whenever possible; set `multiple` \
@@ -1350,7 +1354,9 @@ const PLAN_INSTRUCTIONS: &str = "## Instructions\nYou are in PLAN-ONLY mode: exp
      in plan mode and activating an action would not move the ticket for agents anyway. If the right \
      outcome for this ticket is a set of new tickets rather than code changes, structure the plan as one \
      action per future ticket; ticket-creation tools are unavailable in plan mode, and the implement run \
-     creates the child tickets after the plan is approved. Each future ticket must be holistic: \
+     creates the child tickets after the plan is approved. A plan that mixes code changes on this \
+     ticket's branch with child-ticket creation is invalid — move every code-change step into the \
+     child tickets. Each future ticket must be holistic: \
      implementing it on its own must leave the project building, all tests passing, and the result \
      safe to deploy to production — never slice the work so that a single ticket breaks the build \
      or ships a half-finished feature. Order the future tickets by dependency and state which ticket \
@@ -1544,7 +1550,8 @@ fn refs_section(kind: RunKind, refs: &[String]) -> String {
             "Cross-repo splitting convention: a task that spans several repositories is planned as a chain of \
              per-repo tickets linked with `blocks`: (1) the contract/API in the provider repo, (2) the \
              implementation in the consumer repo, (3) the pin-bump plus integration tests in the first repo. \
-             Every such ticket must be holistic (builds, tests green, deployable) and self-contained (the \
+             The spanning ticket itself then carries no code changes — all code work lives in the per-repo \
+             child tickets. Every such ticket must be holistic (builds, tests green, deployable) and self-contained (the \
              contract is quoted in its description). Never create cross-project tickets yourself — propose \
              their text in the plan or a comment for the human.\n\n",
         );
@@ -1766,7 +1773,11 @@ fn render_prompt(
                  Use `update_action` to correct a step's description or priority, and `delete_action` only \
                  for steps that are pure planning noise and never saw work.\n\n\
                  If the approved plan is a set of tickets, create each one via `create_task` as a child of \
-                 this ticket in `backlog`. Keep every created ticket holistic, exactly as planned: \
+                 this ticket in `backlog`. Ticket creation never mixes with code changes on this ticket's \
+                 branch: when the plan creates any child ticket, every code-change step belongs to a child — \
+                 if the plan still assigns code steps to this ticket itself, turn them into an additional \
+                 same-project child ticket (holistic, like the others) and wire its blocker links. Keep \
+                 every created ticket holistic, exactly as planned: \
                  implementing it on its own must leave the project building, all tests passing, and the \
                  result safe to deploy to production. Wire the dependency order between the created \
                  tickets with the `add_link` MCP tool: whenever ticket A must land before ticket B, call \
@@ -2406,6 +2417,38 @@ mod tests {
         }
     }
 
+    /// Code changes on the ticket's own branch and child-ticket creation never
+    /// mix on one ticket (#228): once any part of the work becomes a child
+    /// ticket (e.g. a change in another repository), every code-change step is
+    /// planned as a child — work in the ticket's own repository becomes a
+    /// same-project child — and the parent's branch carries no direct code
+    /// changes. The plan prompt states the rule up front (twice: the outcome
+    /// sentence and the action-structuring rule); the implement prompt defines
+    /// the recovery for an approved plan that still mixes both — fold the
+    /// ticket's own code steps into an additional same-project child ticket.
+    #[test]
+    fn prompts_forbid_mixing_code_changes_and_child_tickets() {
+        let p = render_prompt(RunKind::Plan, &detail(vec![], vec![]), None, 999, "http://api", &[], "");
+        assert!(p.contains("never mix on one ticket"), "{p}");
+        assert!(p.contains("becomes a same-project child"), "{p}");
+        assert!(p.contains("child-ticket creation is invalid"), "{p}");
+
+        let p = render_prompt(
+            RunKind::Implement,
+            &detail(vec![], vec![]),
+            None,
+            999,
+            "http://api",
+            &[],
+            "",
+        );
+        assert!(
+            p.contains("Ticket creation never mixes with code changes on this ticket's branch"),
+            "{p}"
+        );
+        assert!(p.contains("additional same-project child ticket"), "{p}");
+    }
+
     /// remoter#162: both prompts instruct the agent to hand a human-only step
     /// to a human via `request_human_action` (the ticket waits in `waiting`)
     /// instead of simulating the step or finishing as if the work were done.
@@ -2455,8 +2498,9 @@ mod tests {
 
     /// The cross-repo splitting convention rides the plan prompt only: a
     /// multi-repo task is a chain of per-repo tickets linked with `blocks`
-    /// (contract → consumer → pin-bump), each holistic and self-contained,
-    /// and the agent never creates cross-project tickets itself.
+    /// (contract → consumer → pin-bump), each holistic and self-contained, the
+    /// spanning ticket itself carries no code changes, and the agent never
+    /// creates cross-project tickets itself.
     #[test]
     fn refs_block_carries_cross_repo_splitting_convention_in_plan_only() {
         let refs = vec!["contracts".to_string()];
@@ -2474,6 +2518,7 @@ mod tests {
         assert!(p.contains("contract/API in the provider repo"), "{p}");
         assert!(p.contains("consumer repo"), "{p}");
         assert!(p.contains("pin-bump"), "{p}");
+        assert!(p.contains("carries no code changes"), "{p}");
         assert!(p.contains("self-contained"), "{p}");
         assert!(p.contains("Never create cross-project tickets yourself"), "{p}");
 
