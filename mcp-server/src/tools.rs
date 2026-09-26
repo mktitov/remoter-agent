@@ -791,7 +791,7 @@ impl RemoterMcp {
 
     #[tool(
         name = "get_task",
-        description = "Get full details of a single task, including its action list and its open/answered questions (with options and answers). Use this to understand what steps (actions) make up a task before starting work."
+        description = "Get full details of a single task, including its action list and its open/answered questions (with options and answers). Use this to understand what steps (actions) make up a task before starting work. PR/MR URLs come back as prUrl (the ticket's own/latest) plus prUrls (all PRs of the ticket and its cross-project descendants in merge order; omitted when empty)."
     )]
     async fn get_task(&self, Parameters(p): Parameters<TaskIdParams>) -> Result<CallToolResult, McpErrorData> {
         let detail = self.client.get_task(p.task_id).await.map_err(McpErrorData::from)?;
