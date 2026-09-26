@@ -179,6 +179,12 @@ pub struct TaskDetail {
     /// The ticket's PR/MR URL — a separate artifact written by the daemon
     /// (`agent_runs.pr_url`); absent until the first successful push/PR step.
     pub pr_url: Option<String>,
+    /// All PR/MR URLs of the ticket and its cross-project descendants, in
+    /// merge order (child-repo PRs first); `prUrl` stays the latest/main one.
+    /// Additive field (remoter#231) — absent on older backends; an empty list
+    /// is omitted from the tool output.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pr_urls: Vec<String>,
     /// Total number of comments in the ticket's thread.
     #[serde(default)]
     pub comments_count: i64,
