@@ -835,11 +835,14 @@ async fn parent_branch(rc: &SuperviseContext) -> Option<String> {
 
 /// The env every supervise turn (and its services/sidecars) gets — the same
 /// contract as claim runs (spec §5.8 + containers spec §3.4): host mode
-/// exports the port block, container mode exports `REMOTER_CONTAINER=1` and
+/// exports the port block, the isolated modes export their runtime marker and
 /// loopback DB URLs.
 fn supervise_env(rc: &SuperviseContext) -> Vec<(String, String)> {
     if rc.config.execution.is_container() {
         return crate::container::container_env(rc.parent.id);
+    }
+    if rc.config.execution.is_nspawn() {
+        return crate::nspawn::nspawn_env(rc.parent.id);
     }
     let mut env = vec![
         ("CI".to_string(), "1".to_string()),
@@ -862,11 +865,11 @@ async fn run_attempt(
     env: &AttemptEnv<'_>,
 ) -> Option<Result<RunOutcome, RunFailure>> {
     let env_vars = supervise_env(rc);
-    // Container mode: the supervise turn runs in a container like any other
-    // run — no silent fallback to host (a container-start failure is a normal
-    // transient error with retry). The guard's drop is the teardown on every
-    // exit path, including cancellation mid-turn. A parent whose project is
-    // not agent-managed has no repo to build an image from — it keeps the
+    // Isolated modes: the supervise turn runs in a container/machine like any
+    // other run — no silent fallback to host (a runtime-start failure is a
+    // normal transient error with retry). The guard's drop is the teardown on
+    // every exit path, including cancellation mid-turn. A parent whose project
+    // is not agent-managed has no repo to build an image from — it keeps the
     // host path (its review is report-only anyway). Cross-project children
     // are mounted read-only as `.refs/task-<childId>` (fail-open per child);
     // same-project children stay reachable via git objects of the shared
@@ -1116,7 +1119,7 @@ async fn build_prompt(rc: &SuperviseContext) -> Result<String, crate::client::Cl
         &parent_detail,
         &children,
         git.as_ref(),
-        rc.config.execution.is_container(),
+        rc.config.execution.is_isolated(),
     ))
 }
 
@@ -1352,7 +1355,7 @@ const SUPERVISE_INSTRUCTIONS: &str = "## Instructions\nYou are the supervisor fo
 /// supervisor reads their work through git objects of the shared clone;
 /// cross-project children ARE mounted read-only under `.refs/task-<childId>/`
 /// (their branch lives in another repo, unreachable by the shared clone).
-const CONTAINER_INSTRUCTIONS: &str = "- CONTAINER MODE: same-project child worktrees (`wt-<child>`) are NOT available on \
+const CONTAINER_INSTRUCTIONS: &str = "- ISOLATED RUNTIME (container/nspawn): same-project child worktrees (`wt-<child>`) are NOT available on \
      the filesystem here — read the child's work via git objects of the shared clone: \
      `git show <child-branch>:<path>` for file contents, `git diff <base>...<child-branch>` \
      for changes. Cross-project children (marked `cross-project` in their section) ARE mounted \

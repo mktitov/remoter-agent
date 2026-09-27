@@ -82,7 +82,9 @@ tools at run time (install them yourself, they are not bundled):
 - **`devenv`** — project services (Postgres, …) are brought up/down per run
   via `devenv up`;
 - **`docker`** — only for `[execution] mode = "container"`, where every run
-  executes inside a per-run container with postgres/minio sidecars.
+  executes inside a per-run container with postgres/minio sidecars;
+- **`systemd-nspawn`** — only for `[execution] mode = "nspawn"` on NixOS
+  hosts (see below); needs host systemd ≥ 256.
 
 `remoter-mcp` needs nothing but a reachable Remoter HTTP API and a token.
 
@@ -112,6 +114,45 @@ tickets in container mode:
 
 The image tag is content-keyed over every file in `.remoter/`, so any edit
 there rebuilds the image automatically on the next run.
+
+## systemd-nspawn execution mode (NixOS)
+
+`[execution] mode = "nspawn"` is a lighter alternative to container mode for
+NixOS daemon hosts: instead of baking a ~16 GB docker image, the daemon boots
+each run in a `systemd-nspawn` machine whose rootfs is a small shared NixOS
+system closure — `.remoter/nspawn-container.nix`, exposed as the
+`agentContainer` flake output — with the host `/nix/store` bind-mounted
+read-only inside. The host store *is* the binary cache: devenv shells in the
+machine resolve instantly against host store paths, and `.remoter/` edits no
+longer force any rebuild of agent tooling.
+
+Build the closure once (the daemon also builds it lazily on the first nspawn
+run; it is content-addressed, so repeat builds are no-ops):
+
+```sh
+nix build .#agentContainer --no-link --print-out-paths
+```
+
+Host prerequisites:
+
+- NixOS with **systemd ≥ 256** (agent exec uses `systemd-run -M --pipe`);
+- the root-owned helper `agent-runner/scripts/remoter-nspawnctl` and narrow
+  NOPASSWD sudoers rules for it plus `systemd-nspawn` / `systemd-run` /
+  `machinectl` — see the annotated `[execution]` block in
+  [`agent-runner/remoter-agent.toml`](agent-runner/remoter-agent.toml) for a
+  ready-to-paste NixOS snippet;
+- `nix` on the host for the closure build.
+
+Per run, the daemon allocates a /30 from the `nspawn_net_pool_base` pool
+(default `10.231`), configures the host veth end via `remoter-nspawnctl
+net-up`, boots the machine with the ticket worktree at `/work`, and waits for
+postgres (`remoter`, `remoter-test`, `remoter_e2e` databases, all on
+`127.0.0.1:5432` inside the machine) and minio (bucket `remoter-attachments`,
+`127.0.0.1:9000`) to become ready. Agent turns execute via `sudo systemd-run
+-M <machine> --pipe`, preserving the ACP stdio contract; teardown is
+`machinectl terminate` plus `net-down`, with a startup sweep for leftover
+`rr-*` machines (machine names are `rr-<run_id>` — a longer prefix would
+truncate away the run id in the 15-char `ve-` host interface name).
 
 ## Configuration
 

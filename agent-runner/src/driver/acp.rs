@@ -114,10 +114,12 @@ impl AgentDriver for AcpDriver {
         let mcp_servers = mcp::merged_mcp_servers(
             &spec.cwd,
             &self.remoter_mcp_command,
-            // Container mode: remoter-mcp runs inside the container, so the
-            // loopback API URL is rewritten to host.docker.internal.
+            // Isolated modes: remoter-mcp runs inside the runtime, so the
+            // loopback API URL is rewritten (container: host.docker.internal;
+            // nspawn: the run block's host-side veth address).
             match &spec.exec {
                 workspace::ExecEnv::Container(c) => &c.api_url,
+                workspace::ExecEnv::Nspawn(n) => &n.api_url,
                 workspace::ExecEnv::Host { .. } => &self.api_url,
             },
             &self.token,
@@ -129,20 +131,22 @@ impl AgentDriver for AcpDriver {
         let transport = ByteStreams::new(stdin, stdout);
 
         let updates = capture.clone();
-        // Container mode: the ACP session's cwd is the in-container mount
-        // point (`/work`); on the host it's the worktree itself.
+        // Isolated modes: the ACP session's cwd is the in-runtime mount point
+        // (`/work`); on the host it's the worktree itself.
         let cwd = match &spec.exec {
             workspace::ExecEnv::Container(c) => c.work_dir.clone(),
+            workspace::ExecEnv::Nspawn(n) => n.work_dir.clone(),
             workspace::ExecEnv::Host { .. } => spec.cwd.clone(),
         };
         let prompt = spec.prompt.clone();
         let resume = spec.resume_session.clone();
         let logger = spec.logger.clone();
         let config_options = spec.config_options.clone();
-        // Container mode: the wire files land in the host-side agent home
-        // (mounted at /root in the container), not the host user's home.
+        // Isolated modes: the wire files land in the host-side agent home
+        // (mounted at /root inside the runtime), not the host user's home.
         let sessions_dir = match &spec.exec {
             workspace::ExecEnv::Container(c) => Some(c.sessions_dir.clone()),
+            workspace::ExecEnv::Nspawn(n) => Some(n.sessions_dir.clone()),
             workspace::ExecEnv::Host { .. } => self.sessions_dir.clone(),
         };
         let kimi_usage_enabled = self.program == "kimi" || self.program.ends_with("/kimi");

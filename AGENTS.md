@@ -44,6 +44,22 @@ mode:
 - Git operations that touch origin (fetch/push) are done by the daemon on the
   host after your turn — never push yourself unless told to.
 
+### Running inside a remoter-agent nspawn machine
+
+Nspawn mode (`execution.mode = "nspawn"`, NixOS hosts only) gives the same
+contract with a few deltas:
+
+- `REMOTER_EXECUTION=nspawn` is set instead of `REMOTER_CONTAINER=1`; there
+  is likewise **no** `REMOTER_AGENT_PORT_BASE`.
+- Postgres/MinIO run as systemd units inside the machine on
+  `127.0.0.1:5432`/`127.0.0.1:9000` (same as container mode).
+- Your cwd is the ticket worktree mounted at `/work`.
+- The daemon's host is the run's gateway IP (the `.1` of the run's /30 from
+  the `10.231` pool); `REMOTER_API_URL` already points there.
+- `/nix/store` is the host store bind-mounted **read-only** — never nix-build
+  inside the machine; missing paths mean the daemon should pre-warm them on
+  the host.
+
 ## Agent container image (`.remoter/`)
 
 `.remoter/` is the build context of this project's own agent image — what
