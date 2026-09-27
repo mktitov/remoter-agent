@@ -891,6 +891,60 @@ async fn get_task_requests_and_returns_questions() {
     assert!(text.contains("\"status\": \"answered\""), "{text}");
 }
 
+#[tokio::test]
+async fn get_task_returns_pr_urls() {
+    let server = MockServer::start().await;
+    let mut detail = task_detail_json(7, serde_json::json!([]));
+    detail["prUrl"] = serde_json::json!("https://forge/parent/pull/3");
+    detail["prUrls"] = serde_json::json!([
+        "https://forge/child/pull/1",
+        "https://forge/child/pull/2",
+        "https://forge/parent/pull/3",
+    ]);
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(detail))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp(server.uri(), Role::Full, None);
+    let p: crate::tools::TaskIdParams = serde_json::from_value(serde_json::json!({"taskId": 7})).unwrap();
+    let result = mcp.get_task(Parameters(p)).await.unwrap();
+    let text = result_text(result);
+    assert!(text.contains("\"prUrls\""), "{text}");
+    assert!(text.contains("https://forge/child/pull/1"), "{text}");
+    assert!(text.contains("https://forge/parent/pull/3"), "{text}");
+}
+
+/// Old backends have no `prUrls` field (remoter#231 is additive): the tool
+/// must still parse the detail and must omit the empty list from its output.
+#[tokio::test]
+async fn get_task_omits_pr_urls_when_absent_or_empty() {
+    let server = MockServer::start().await;
+    // task_detail_json has no prUrls at all — the old-backend shape.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(task_detail_json(7, serde_json::json!([]))))
+        .mount(&server)
+        .await;
+    let mut detail = task_detail_json(8, serde_json::json!([]));
+    detail["prUrls"] = serde_json::json!([]);
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/8"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(detail))
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp(server.uri(), Role::Full, None);
+    for task_id in [7, 8] {
+        let p: crate::tools::TaskIdParams = serde_json::from_value(serde_json::json!({"taskId": task_id})).unwrap();
+        let result = mcp.get_task(Parameters(p)).await.unwrap();
+        let text = result_text(result);
+        assert!(!text.contains("prUrls"), "{text}");
+    }
+}
+
 /// Gating contract (spec mcp-server-for-agents): `add_task_question` is
 /// plan-only, `delete_task_question` is plan+implement, `list_task_questions`
 /// is available in every role.
