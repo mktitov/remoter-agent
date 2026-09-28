@@ -120,7 +120,7 @@ there rebuilds the image automatically on the next run.
 `[execution] mode = "nspawn"` is a lighter alternative to container mode for
 NixOS daemon hosts: instead of baking a ~16 GB docker image, the daemon boots
 each run in a `systemd-nspawn` machine whose rootfs is a small shared NixOS
-system closure — `.remoter/nspawn-container.nix`, exposed as the
+system closure — `agent-runner/nspawn/container.nix`, exposed as the
 `agentContainer` flake output — with the host `/nix/store` bind-mounted
 read-only inside. The host store *is* the binary cache: devenv shells in the
 machine resolve instantly against host store paths, and `.remoter/` edits no

@@ -135,7 +135,7 @@
           default = remoter-mcp;
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           # NixOS system closure for the daemon's `execution.mode = "nspawn"`
-          # (module: .remoter/nspawn-container.nix). The daemon builds it
+          # (module: agent-runner/nspawn/container.nix). The daemon builds it
           # lazily on the first nspawn run via
           # `nix build <ref>#agentContainer --no-link --print-out-paths` and
           # boots the toplevel with systemd-nspawn, sharing the host
@@ -148,7 +148,7 @@
           # NixOS straight from that source (same rev the packages use).
           agentContainer = (import "${nixpkgs.inputs.nixpkgs-src}/nixos/lib/eval-config.nix" {
             inherit system;
-            modules = [ ./.remoter/nspawn-container.nix ];
+            modules = [ ./agent-runner/nspawn/container.nix ];
           }).config.system.build.toplevel;
         };
 
