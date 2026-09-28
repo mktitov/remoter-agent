@@ -55,6 +55,40 @@ stall_grace_secs    = 30
 #                                      # daemon also generates a signing key next
 #                                      # to the dir and seeds the cache via the
 #                                      # project's .remoter/seed-nix-cache.sh hook.
+#
+# --- nspawn mode (NixOS hosts; ticket #237) ---
+# A third mode that boots each run in a systemd-nspawn machine instead of a
+# docker container: no image bake — the machine's rootfs is a small shared
+# NixOS closure built from this repo's flake (`agentContainer` output) and
+# the host /nix/store is bind-mounted read-only into it. Postgres + minio
+# run as systemd units inside the machine on 127.0.0.1:5432/9000.
+# mode = "nspawn"                  # "host" | "container" | "nspawn"
+# nspawn_closure_ref = "path:/etc/remoter-agent#agentContainer"
+#                                  # flake ref of the shared container closure; built
+#                                  # lazily on the first nspawn run via
+#                                  # `nix build <ref> --no-link --print-out-paths`
+#                                  # (content-addressed, no-op once in the host store)
+# nspawn_net_pool_base = "10.231"  # per-run /30 blocks from <base>.0.0/16: host side of
+#                                  # ve-rr-<id> gets the block's .1, the machine's
+#                                  # host0 gets .2 (the nspawn analogue of
+#                                  # host.docker.internal); must stay a two-octet prefix
+# sudo_binary = "sudo"             # prefixes systemd-nspawn / systemd-run / machinectl
+#                                  # and the remoter-nspawnctl helper
+#
+# Required NixOS host setup for nspawn mode:
+#   1. Install the helper root-owned, e.g.
+#        environment.systemPackages = [
+#          (pkgs.writeShellScriptBin "remoter-nspawnctl"
+#            (builtins.readFile ./remoter-nspawnctl))   # agent-runner/scripts/
+#        ];
+#   2. sudoers (security.sudo.extraRules) — NOPASSWD for the daemon user on
+#      the helper AND the three systemd tools, which the daemon invokes
+#      directly as `sudo -n <tool> ...`:
+#        remoter-nspawnctl * , systemd-nspawn * , systemd-run * , machinectl *
+#      The startup check `sudo -n remoter-nspawnctl check` fails closed if a
+#      rule is missing.
+#   3. Host systemd >= 256 (NixOS 24.11+) — agent exec uses
+#      `systemd-run -M <machine> --pipe --wait --collect`.
 # Container mode: kimi auth comes from the project's .remoter/kimi-config.toml,
 # rendered into <agent_home>/.kimi-code/config.toml at every container start —
 # ${KIMI_API_KEY} is substituted from the daemon's own environment, so export

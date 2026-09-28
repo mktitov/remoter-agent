@@ -133,6 +133,23 @@
           remoter-mcp = remoter-mcp;
           remoter-agent = remoter-agent;
           default = remoter-mcp;
+        } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          # NixOS system closure for the daemon's `execution.mode = "nspawn"`
+          # (module: agent-runner/nspawn/container.nix). The daemon builds it
+          # lazily on the first nspawn run via
+          # `nix build <ref>#agentContainer --no-link --print-out-paths` and
+          # boots the toplevel with systemd-nspawn, sharing the host
+          # /nix/store read-only — no image bake. Linux-only; intentionally
+          # not part of `checks` (a full toplevel is heavy and CI is
+          # cargo-only).
+          # NOTE: devenv-nixpkgs ships the real nixpkgs tree as its own
+          # flake:false input (`nixpkgs-src`); its flake root and `lib`
+          # output carry neither nixos/ nor nixosSystem, so evaluate
+          # NixOS straight from that source (same rev the packages use).
+          agentContainer = (import "${nixpkgs.inputs.nixpkgs-src}/nixos/lib/eval-config.nix" {
+            inherit system;
+            modules = [ ./agent-runner/nspawn/container.nix ];
+          }).config.system.build.toplevel;
         };
 
         apps = {

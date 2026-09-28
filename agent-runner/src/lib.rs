@@ -18,6 +18,7 @@ pub mod image;
 pub mod logs;
 pub mod logstore;
 pub mod logstream;
+pub mod nspawn;
 pub mod ports;
 pub mod review;
 pub mod run;
