@@ -123,7 +123,7 @@ fn parse_repo_mcp(text: &str, worktree: &Path) -> Result<Vec<McpServer>, String>
 fn parse_entry(name: &str, entry: &serde_json::Value, wt: &str) -> Result<McpServer, String> {
     let expand = |v: &serde_json::Value| v.as_str().map(|s| s.replace(WORKTREE_PLACEHOLDER, wt));
 
-    if let Some(url) = entry.get("url").and_then(&expand) {
+    if let Some(url) = entry.get("url").and_then(expand) {
         let headers = entry
             .get("headers")
             .and_then(|h| h.as_object())
@@ -140,7 +140,7 @@ fn parse_entry(name: &str, entry: &serde_json::Value, wt: &str) -> Result<McpSer
 
     let command = entry
         .get("command")
-        .and_then(&expand)
+        .and_then(expand)
         .ok_or_else(|| format!("entry {name:?} has neither \"command\" nor \"url\""))?;
     let args = entry
         .get("args")

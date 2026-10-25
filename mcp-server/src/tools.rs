@@ -5,7 +5,9 @@
 //! plus the attachments & comments group (spec §3.5). Each tool makes one HTTP
 //! call to the backend via [`RemoterClient`] — except `add_attachment`, which
 //! drives the whole presign flow (upload intent → PUT bytes → confirm) itself,
-//! and `create_task` with `assigneeId` (create → assign). The MCP layer
+//! `create_task` with `assigneeId` (create → assign), and
+//! `get_project_setup_guide`, which serves a static built-in guide without any
+//! HTTP call (spec mcp-server-for-agents.md §3.7). The MCP layer
 //! enforces no permissions — it forwards the caller's bearer token and relies
 //! on the backend's RBAC.
 
@@ -96,6 +98,11 @@ fn json_result<T: serde::Serialize>(val: &T) -> Result<CallToolResult, McpErrorD
     Ok(CallToolResult::success(vec![Content::text(text)]))
 }
 
+/// The project setup guide served by `get_project_setup_guide` (spec
+/// mcp-server-for-agents.md §3.7): static markdown embedded into the binary,
+/// so the tool works without any backend call.
+const PROJECT_SETUP_GUIDE: &str = include_str!("../project-setup-guide.md");
+
 /// Daemon-mode `update_task` scoping: the target task counts as a child of
 /// the current ticket when its links contain the ticket. From the child's
 /// perspective that link carries the `"subtask"` relation (the child is a
@@ -135,6 +142,11 @@ pub struct ListMyTasksParams {
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WhoAmIParams {}
+
+/// See [`WhoAmIParams`] — no-parameter tools need an empty struct.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GetProjectSetupGuideParams {}
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -921,6 +933,19 @@ impl RemoterMcp {
         };
         let goals = self.client.list_goals(project_id).await.map_err(McpErrorData::from)?;
         json_result(&goals)
+    }
+
+    // ── Guides (static, no backend call) ────────────────────────────────
+
+    #[tool(
+        name = "get_project_setup_guide",
+        description = "Return the built-in guide for preparing a project's repository for remoter: the human-only setup steps, the repository files to create (AGENTS.md, the devenv port contract, .mcp.json rules, the .remoter/ container-mode contract), and the final checklist. Call this first — before planning or making changes — when the ticket is about preparing or onboarding a repository for remoter. The guide is embedded in the binary; no backend call is made."
+    )]
+    async fn get_project_setup_guide(
+        &self,
+        Parameters(_): Parameters<GetProjectSetupGuideParams>,
+    ) -> Result<CallToolResult, McpErrorData> {
+        Ok(CallToolResult::success(vec![Content::text(PROJECT_SETUP_GUIDE)]))
     }
 
     // ── Workflow mutation ────────────────────────────────────────────────
@@ -1750,6 +1775,51 @@ mod tests {
         }
     }
 
+    /// `get_project_setup_guide` serves the embedded static guide (spec
+    /// mcp-server-for-agents.md §3.7): registered, ungated in every role,
+    /// and the guide carries all key sections.
+    #[test]
+    fn project_setup_guide_is_embedded_with_key_sections() {
+        let router = RemoterMcp::tool_router();
+        let tool = router
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "get_project_setup_guide")
+            .expect("get_project_setup_guide tool must be registered");
+        let desc = tool.description.as_deref().unwrap_or("");
+        assert!(desc.contains("onboarding"), "{desc}");
+        assert!(!PROJECT_SETUP_GUIDE.is_empty());
+        for section in [
+            "Human-only steps",
+            "request_human_action",
+            "AGENTS.md",
+            "REMOTER_AGENT_PORT_BASE",
+            ".mcp.json",
+            ".remoter/",
+            "agent.Dockerfile",
+            "check-image.sh",
+            "Final checklist",
+            "aiborda.ru/docs",
+        ] {
+            assert!(
+                PROJECT_SETUP_GUIDE.contains(section),
+                "guide is missing section/marker `{section}`"
+            );
+        }
+        for role in [
+            Role::Full,
+            Role::DevAgentPlan,
+            Role::DevAgentImplement,
+            Role::DevAgentSupervise,
+            Role::DevAgentReview,
+        ] {
+            assert!(
+                !role.is_gated("get_project_setup_guide"),
+                "get_project_setup_guide must be available in {role} mode"
+            );
+        }
+    }
+
     /// `add_link`'s description must warn that blocking tasks related in the
     /// subtask tree (parent/child, any depth) is rejected by the backend (#205).
     #[test]
@@ -1911,10 +1981,10 @@ mod tests {
     fn role_full_lists_all_tools() {
         let mcp = dummy_mcp(Role::Full);
         let names = tool_names(&mcp);
-        // 36 tools total; set_task_review is supervise-only,
+        // 37 tools total; set_task_review is supervise-only,
         // add/delete_task_question are dev-agent tools, set_task_goal and
-        // request_human_action are implement/plan-only, so the Full count is 31.
-        assert_eq!(names.len(), 31, "unexpected tools: {names:?}");
+        // request_human_action are implement/plan-only, so the Full count is 32.
+        assert_eq!(names.len(), 32, "unexpected tools: {names:?}");
         for gated in [
             "set_task_review",
             "add_task_question",
@@ -1937,11 +2007,11 @@ mod tests {
     fn role_implement_hides_four_board_tools() {
         let mcp = dummy_mcp(Role::DevAgentImplement);
         let names = tool_names(&mcp);
-        // 36 tools - 4 board tools - set_task_review (supervise-only) -
-        // add_task_question (plan-only) = 30; create_task/update_task/
+        // 37 tools - 4 board tools - set_task_review (supervise-only) -
+        // add_task_question (plan-only) = 31; create_task/update_task/
         // list_features/delete_task_question/list_goals/set_task_goal/
         // request_human_action stay available.
-        assert_eq!(names.len(), 30, "unexpected tools: {names:?}");
+        assert_eq!(names.len(), 31, "unexpected tools: {names:?}");
         for gated in [
             "start_task",
             "advance_task",
@@ -1976,8 +2046,8 @@ mod tests {
     fn role_plan_hides_eight_tools() {
         let mcp = dummy_mcp(Role::DevAgentPlan);
         let names = tool_names(&mcp);
-        // 36 tools - 9 gated (6 board/action + create_task/update_task + set_task_review) = 27.
-        assert_eq!(names.len(), 27, "unexpected tools: {names:?}");
+        // 37 tools - 9 gated (6 board/action + create_task/update_task + set_task_review) = 28.
+        assert_eq!(names.len(), 28, "unexpected tools: {names:?}");
         for gated in [
             "start_task",
             "advance_task",
@@ -2013,13 +2083,13 @@ mod tests {
     fn role_supervise_keeps_supervision_tools() {
         let mcp = dummy_mcp(Role::DevAgentSupervise);
         let names = tool_names(&mcp);
-        // 36 tools - 3 daemon-owned board tools (start/complete/unassign_self)
+        // 37 tools - 3 daemon-owned board tools (start/complete/unassign_self)
         // - add/delete_task_question (not the supervisor's job)
         // - set_task_goal (implement/plan-only)
-        // - request_human_action (the working agent's own pause, remoter#162) = 29.
+        // - request_human_action (the working agent's own pause, remoter#162) = 30.
         // advance_task and set_task_review stay: parent-scoped transitions and
         // child reviews are the supervisor's job.
-        assert_eq!(names.len(), 29, "unexpected tools: {names:?}");
+        assert_eq!(names.len(), 30, "unexpected tools: {names:?}");
         for gated in [
             "start_task",
             "complete_task",
@@ -2054,9 +2124,9 @@ mod tests {
     fn role_review_keeps_only_read_tools_and_set_task_review() {
         let mcp = dummy_mcp(Role::DevAgentReview);
         let names = tool_names(&mcp);
-        // 36 tools - 22 mutating tools = 14: read-only discovery plus
-        // set_task_review for the review verdict.
-        assert_eq!(names.len(), 14, "unexpected tools: {names:?}");
+        // 37 tools - 22 mutating tools = 15: read-only discovery, the static
+        // get_project_setup_guide, plus set_task_review for the review verdict.
+        assert_eq!(names.len(), 15, "unexpected tools: {names:?}");
         for available in [
             "list_my_tasks",
             "get_task",
@@ -2071,6 +2141,7 @@ mod tests {
             "read_attachment",
             "list_task_comments",
             "list_task_questions",
+            "get_project_setup_guide",
             "set_task_review",
         ] {
             assert!(
