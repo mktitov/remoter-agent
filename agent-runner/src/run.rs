@@ -1340,7 +1340,9 @@ const PLAN_INSTRUCTIONS: &str = "## Instructions\nYou are in PLAN-ONLY mode: exp
      the \"## Open questions\" prompt section and via `list_task_questions`/`get_task`. If the ticket or the \
      conversation changed since your previous plan, produce the UPDATED plan in full, not a status \
      report; human corrections in the Conversation section supersede the original ticket text. \
-     Honor AGENTS.md files in the repo. Never end your turn with background tasks still running — \
+     Honor AGENTS.md files in the repo. If the ticket is about preparing or onboarding a project's \
+     repository for remoter, call the `get_project_setup_guide` MCP tool first — its guide is the \
+     authoritative checklist for the ticket. Never end your turn with background tasks still running — \
      your turn's end is final: the daemon shuts the agent down and pending tasks are killed, their \
      completion never arrives. Run long commands in the foreground or wait for them to finish \
      before your final message. A dirty worktree after the turn fails the run: restore the worktree \
@@ -1754,7 +1756,9 @@ fn render_prompt(
                 "## Instructions\nImplement the approved plan. Run the project's checks (e.g. `just lint test` or \
                  the repo's equivalent), keep the ticket's actions up to date via the remoter MCP tools, and \
                  **commit your changes to the current branch** (`git add` + `git commit` with a clear message) \
-                 before finishing — the human reviews the branch. Leave the worktree clean — no uncommitted \
+                 before finishing — the human reviews the branch. If the ticket is about preparing or \
+                 onboarding a project's repository for remoter, call the `get_project_setup_guide` MCP tool \
+                 first and follow its guide. Leave the worktree clean — no uncommitted \
                  or untracked leftovers; the daemon checks `git status` after your turn and sends you back to \
                  finish if it is dirty. Never end your turn with background tasks still running — your \
                  turn's end is final: the daemon shuts the agent down and pending tasks are killed, their \
@@ -2374,6 +2378,20 @@ mod tests {
             assert!(p.contains("holistic"), "{kind:?}: {p}");
             assert!(p.contains("all tests passing"), "{kind:?}: {p}");
             assert!(p.contains("safe to deploy to production"), "{kind:?}: {p}");
+        }
+    }
+
+    /// Onboarding tickets must be pointed at the `get_project_setup_guide`
+    /// MCP tool before planning/changes (spec mcp-server-for-agents.md §3.7)
+    /// — in both the plan and the implement prompt.
+    #[test]
+    fn prompts_point_onboarding_tickets_at_project_setup_guide() {
+        for kind in [RunKind::Plan, RunKind::Implement] {
+            let p = render_prompt(kind, &detail(vec![], vec![]), None, 999, "http://api", &[], "");
+            assert!(
+                p.contains("`get_project_setup_guide`"),
+                "{kind:?} prompt must point at get_project_setup_guide: {p}"
+            );
         }
     }
 
