@@ -8,7 +8,10 @@ are all it needs — no database credentials, ever.
 Tool surface (role-dependent): discover projects/features/tasks, list and
 claim assigned tickets, advance board status, manage ticket actions
 (checklists), comment, attach/read files, ask/answer ticket questions, submit
-reviews, and file the implementation report.
+reviews, and file the implementation report. `get_project_setup_guide` serves
+the built-in guide for preparing a project's repository for remoter
+([`project-setup-guide.md`](project-setup-guide.md), embedded in the binary) —
+it is available in every role and makes no backend call.
 
 ## Installation
 

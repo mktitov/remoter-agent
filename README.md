@@ -11,7 +11,8 @@ binaries that connect a dev-agent to a Remoter backend:
 - **`remoter-mcp`** ([`mcp-server/`](mcp-server/)) — the MCP server (stdio)
   that exposes the Remoter board to agents and to human-driven MCP clients
   (Claude Code, Cursor, …): list/claim tickets, manage actions, comment,
-  attach files, report.
+  attach files, report — plus the built-in project-setup guide
+  (`get_project_setup_guide`).
 
 Both binaries are pure HTTP clients of the Remoter backend — they need a URL
 and a token, never database credentials.

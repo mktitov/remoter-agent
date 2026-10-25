@@ -14,8 +14,9 @@ use crate::{
     Role,
     client::{RemoterClient, WhoAmI, WorkspaceMembership},
     tools::{
-        AssignTaskParams, CreateTaskParams, ListBoardParams, ListGoalsParams, ListMyTasksParams, ListUsersParams,
-        RemoterMcp, ReviewVerdictParam, SearchTasksParams, SetTaskGoalParams, SetTaskReviewParams, UpdateTaskParams,
+        AssignTaskParams, CreateTaskParams, GetProjectSetupGuideParams, ListBoardParams, ListGoalsParams,
+        ListMyTasksParams, ListUsersParams, RemoterMcp, ReviewVerdictParam, SearchTasksParams, SetTaskGoalParams,
+        SetTaskReviewParams, UpdateTaskParams,
     },
 };
 
@@ -1095,6 +1096,43 @@ fn request_human_action_is_role_gated() {
     let mcp = test_mcp("http://localhost:9999".into(), Role::DevAgentSupervise, Some(70));
     let err = mcp.gate_tool("request_human_action").unwrap_err();
     assert!(err.message.contains("not available"), "{err:?}");
+}
+
+/// `get_project_setup_guide` (spec mcp-server-for-agents.md §3.7) is visible
+/// in `tools/list` in every role and answers without any backend call — the
+/// backend URL here is unreachable, so a stray HTTP request would fail the
+/// test.
+#[tokio::test]
+async fn get_project_setup_guide_works_in_all_roles_without_backend() {
+    for role in [
+        Role::Full,
+        Role::DevAgentPlan,
+        Role::DevAgentImplement,
+        Role::DevAgentSupervise,
+        Role::DevAgentReview,
+    ] {
+        let mcp = test_mcp("http://localhost:9999".into(), role, Some(7));
+        // list_tools gates by role: the tool must survive the filter.
+        let advertised: Vec<_> = mcp
+            .tool_router
+            .list_all()
+            .into_iter()
+            .filter(|tool| !role.is_gated(&tool.name))
+            .collect();
+        assert!(
+            advertised.iter().any(|tool| tool.name == "get_project_setup_guide"),
+            "get_project_setup_guide must be advertised in {role} mode"
+        );
+        let result = mcp
+            .get_project_setup_guide(Parameters(GetProjectSetupGuideParams {}))
+            .await
+            .unwrap();
+        let text = result_text(result);
+        assert!(!text.is_empty(), "{role}: empty guide");
+        for section in ["Human-only steps", "REMOTER_AGENT_PORT_BASE", "Final checklist"] {
+            assert!(text.contains(section), "{role}: guide is missing `{section}`");
+        }
+    }
 }
 
 #[tokio::test]
