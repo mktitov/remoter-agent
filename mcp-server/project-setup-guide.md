@@ -84,6 +84,12 @@ daemon merges it with the built-in remoter server):
   absolute paths;
 - entries pointing at fixed localhost ports must honor the port contract
   (§2.2) or they collide across parallel runs;
+- when `.mcp.json` defines its own `remoter-mcp` server (for human MCP
+  clients such as Claude Code or Cursor), bind the repository to its remoter
+  project via `"env": { "REMOTER_PROJECT_ID": "<project-id>" }`: at startup
+  remoter-mcp validates the id against the backend, `current_project`
+  reports the binding, and every tool with an optional `projectId` defaults
+  to it. A project id is not a secret;
 - **never commit tokens or other secrets** — `.mcp.json` is committed to the
   repository.
 

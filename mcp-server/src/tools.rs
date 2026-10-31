@@ -1,15 +1,15 @@
-//! The MCP tool surface: discovery tools (`list_projects`, `list_features`,
-//! `search_tasks`, `list_board`, `list_my_tasks`, `get_task`, `whoami`,
-//! `list_users`), workflow tools that advance tasks and actions (including
-//! supervision: `assign_task` plus the `dev-agent-supervise` role scoping),
-//! plus the attachments & comments group (spec §3.5). Each tool makes one HTTP
-//! call to the backend via [`RemoterClient`] — except `add_attachment`, which
-//! drives the whole presign flow (upload intent → PUT bytes → confirm) itself,
-//! `create_task` with `assigneeId` (create → assign), and
-//! `get_project_setup_guide`, which serves a static built-in guide without any
-//! HTTP call (spec mcp-server-for-agents.md §3.7). The MCP layer
-//! enforces no permissions — it forwards the caller's bearer token and relies
-//! on the backend's RBAC.
+//! The MCP tool surface: discovery tools (`list_projects`, `current_project`,
+//! `list_features`, `search_tasks`, `list_board`, `list_my_tasks`, `get_task`,
+//! `whoami`, `list_users`), workflow tools that advance tasks and actions
+//! (including supervision: `assign_task` plus the `dev-agent-supervise` role
+//! scoping), plus the attachments & comments group (spec §3.5). Each tool
+//! makes one HTTP call to the backend via [`RemoterClient`] — except
+//! `add_attachment`, which drives the whole presign flow (upload intent → PUT
+//! bytes → confirm) itself, `create_task` with `assigneeId` (create → assign),
+//! and `current_project`/`get_project_setup_guide`, which serve the cached
+//! startup state / a static built-in guide without any HTTP call (spec
+//! mcp-server-for-agents.md §3.7). The MCP layer enforces no permissions — it
+//! forwards the caller's bearer token and relies on the backend's RBAC.
 
 use base64ct::{Base64, Encoding};
 use rmcp::{
@@ -22,7 +22,7 @@ use rmcp::{
 
 use crate::{
     Role,
-    client::{MAX_ATTACHMENT_BYTES, RemoterClient, TaskLinkRef, WhoAmI},
+    client::{MAX_ATTACHMENT_BYTES, ProjectDto, RemoterClient, TaskLinkRef, WhoAmI},
     error::McpError,
 };
 
@@ -36,16 +36,28 @@ pub struct RemoterMcp {
     /// When running inside the ticket-execution daemon, this is the ticket
     /// being worked on. It scopes `create_task`/`update_task` to that ticket.
     pub agent_task_id: Option<i32>,
+    /// The project the local repository is bound to via `REMOTER_PROJECT_ID`
+    /// (validated at startup, spec mcp-server-for-agents.md §2.2). Served by
+    /// `current_project` and used as the default `projectId` in standalone
+    /// mode; daemon mode keeps resolving the current ticket's project.
+    pub bound_project: Option<ProjectDto>,
     pub tool_router: ToolRouter<Self>,
 }
 
 impl RemoterMcp {
-    pub fn new(client: RemoterClient, whoami: WhoAmI, role: Role, agent_task_id: Option<i32>) -> Self {
+    pub fn new(
+        client: RemoterClient,
+        whoami: WhoAmI,
+        role: Role,
+        agent_task_id: Option<i32>,
+        bound_project: Option<ProjectDto>,
+    ) -> Self {
         Self {
             client,
             whoami,
             role,
             agent_task_id,
+            bound_project,
             tool_router: Self::tool_router(),
         }
     }
@@ -61,6 +73,15 @@ impl RemoterMcp {
             ));
         }
         Ok(())
+    }
+
+    /// The effective project for tools with an optional `projectId`: the
+    /// explicit parameter wins; otherwise the `REMOTER_PROJECT_ID` binding is
+    /// the default. Daemon-mode tools that derive the project from the current
+    /// ticket (`list_goals`, `create_task`) resolve it before falling back
+    /// here — the ticket context outranks the binding.
+    fn effective_project_id(&self, explicit: Option<i32>) -> Option<i32> {
+        explicit.or_else(|| self.bound_project.as_ref().map(|p| p.id))
     }
 
     /// Daemon-mode discovery scoping for the supervise role (spec
@@ -129,7 +150,8 @@ pub struct ListMyTasksParams {
     /// Filter by board status: "backlog", "todo", "in_progress", "review", "completed".
     #[serde(rename = "status")]
     pub status: Option<String>,
-    /// Filter to one project.
+    /// Filter to one project. Defaults to the bound project
+    /// (`REMOTER_PROJECT_ID`) when omitted.
     #[serde(rename = "projectId")]
     pub project_id: Option<i32>,
     /// Max number of tasks (default 50, max 200).
@@ -147,6 +169,11 @@ pub struct WhoAmIParams {}
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GetProjectSetupGuideParams {}
+
+/// See [`WhoAmIParams`] — no-parameter tools need an empty struct.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentProjectParams {}
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -501,7 +528,9 @@ pub struct CreateTaskParams {
     /// ticket's project) for a same-project subtask. When it differs from the
     /// current ticket's project, featureId is required and must belong to
     /// that project; the subtask is created there with the current ticket as
-    /// its cross-project parent.
+    /// its cross-project parent. In standalone mode the project is derived
+    /// from featureId; when projectId is passed (or defaulted from the
+    /// `REMOTER_PROJECT_ID` binding) the feature must belong to it.
     #[serde(rename = "projectId")]
     pub project_id: Option<i32>,
     /// Assign the new task to this user immediately (id from list_users).
@@ -575,9 +604,10 @@ impl<'de> serde::Deserialize<'de> for UpdateTaskParams {
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListFeaturesParams {
-    /// The project ID.
+    /// The project ID. Defaults to the bound project (`REMOTER_PROJECT_ID`)
+    /// when omitted.
     #[serde(rename = "projectId")]
-    pub project_id: i32,
+    pub project_id: Option<i32>,
 }
 
 /// No-parameter tools still need an empty params struct (see `WhoAmIParams`).
@@ -597,7 +627,8 @@ pub struct SearchTasksParams {
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListBoardParams {
-    /// Scope the board to one project.
+    /// Scope the board to one project. Defaults to the bound project
+    /// (`REMOTER_PROJECT_ID`) when omitted.
     #[serde(rename = "projectId")]
     pub project_id: Option<i32>,
     /// Completed-column window: "today", "week", "month", or "all"
@@ -608,7 +639,8 @@ pub struct ListBoardParams {
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct ListGoalsParams {
     /// The project ID. In daemon mode (inside a ticket run) omit it to list
-    /// the goals of the current ticket's project.
+    /// the goals of the current ticket's project; in standalone mode it
+    /// defaults to the bound project (`REMOTER_PROJECT_ID`).
     #[serde(rename = "projectId")]
     pub project_id: Option<i32>,
 }
@@ -779,7 +811,7 @@ impl RemoterMcp {
 
     #[tool(
         name = "list_my_tasks",
-        description = "List tasks assigned to the calling agent, with denormalized project/feature names. This is the primary entry point: call this first to see what work you have."
+        description = "List tasks assigned to the calling agent, with denormalized project/feature names. This is the primary entry point: call this first to see what work you have. projectId defaults to the bound project (REMOTER_PROJECT_ID) when omitted."
     )]
     async fn list_my_tasks(
         &self,
@@ -787,7 +819,7 @@ impl RemoterMcp {
     ) -> Result<CallToolResult, McpErrorData> {
         let mut tasks = self
             .client
-            .list_my_tasks(p.status.as_deref(), p.project_id, p.limit)
+            .list_my_tasks(p.status.as_deref(), self.effective_project_id(p.project_id), p.limit)
             .await
             .map_err(McpErrorData::from)?;
         if let Some(scope) = self.supervise_scope_ids().await? {
@@ -834,15 +866,21 @@ impl RemoterMcp {
 
     #[tool(
         name = "list_features",
-        description = "List features in a project, with task totals and completion counts. Use this to discover feature IDs when creating tasks in standalone mode."
+        description = "List features in a project, with task totals and completion counts. Use this to discover feature IDs when creating tasks in standalone mode. projectId defaults to the bound project (REMOTER_PROJECT_ID) when omitted."
     )]
     async fn list_features(
         &self,
         Parameters(p): Parameters<ListFeaturesParams>,
     ) -> Result<CallToolResult, McpErrorData> {
+        let Some(project_id) = self.effective_project_id(p.project_id) else {
+            return Err(McpErrorData::invalid_params(
+                "projectId is required when no project is bound (REMOTER_PROJECT_ID is not set)",
+                None,
+            ));
+        };
         let features = self
             .client
-            .list_features(p.project_id)
+            .list_features(project_id)
             .await
             .map_err(McpErrorData::from)?;
         if features.is_empty() {
@@ -869,6 +907,23 @@ impl RemoterMcp {
     }
 
     #[tool(
+        name = "current_project",
+        description = "Return the project this repository is bound to via REMOTER_PROJECT_ID ({id, name, goal}, cached from the startup validation). Errors when no project is bound."
+    )]
+    async fn current_project(
+        &self,
+        Parameters(_): Parameters<CurrentProjectParams>,
+    ) -> Result<CallToolResult, McpErrorData> {
+        match &self.bound_project {
+            Some(project) => json_result(project),
+            None => Err(McpErrorData::invalid_params(
+                "project not bound (REMOTER_PROJECT_ID is not set)",
+                None,
+            )),
+        }
+    }
+
+    #[tool(
         name = "search_tasks",
         description = "Find tasks by exact #id/id or a case-insensitive title substring. Returns compact hits (id, title, status, project/feature IDs); call get_task with the id for full details."
     )]
@@ -891,12 +946,12 @@ impl RemoterMcp {
 
     #[tool(
         name = "list_board",
-        description = "List the kanban board: every task as a card with its column (taskStatus), assignee, and action counts. Optionally scope to one project (projectId) and set the Completed column window (completed: today, week, month, or all)."
+        description = "List the kanban board: every task as a card with its column (taskStatus), assignee, and action counts. Optionally scope to one project (projectId; defaults to the bound project REMOTER_PROJECT_ID when omitted) and set the Completed column window (completed: today, week, month, or all)."
     )]
     async fn list_board(&self, Parameters(p): Parameters<ListBoardParams>) -> Result<CallToolResult, McpErrorData> {
         let mut cards = self
             .client
-            .list_board(p.project_id, p.completed.as_deref())
+            .list_board(self.effective_project_id(p.project_id), p.completed.as_deref())
             .await
             .map_err(McpErrorData::from)?;
         if let Some(scope) = self.supervise_scope_ids().await? {
@@ -912,24 +967,31 @@ impl RemoterMcp {
 
     #[tool(
         name = "list_goals",
-        description = "List the business goals of a project (archived goals are excluded). In daemon mode omit projectId to list the goals of the current ticket's project. Use this to discover goal IDs for set_task_goal; a task's current goal shows up as goalId in get_task/list_my_tasks."
+        description = "List the business goals of a project (archived goals are excluded). In daemon mode omit projectId to list the goals of the current ticket's project; in standalone mode it defaults to the bound project (REMOTER_PROJECT_ID). Use this to discover goal IDs for set_task_goal; a task's current goal shows up as goalId in get_task/list_my_tasks."
     )]
     async fn list_goals(&self, Parameters(p): Parameters<ListGoalsParams>) -> Result<CallToolResult, McpErrorData> {
         let project_id = match p.project_id {
             Some(id) => id,
-            None => {
-                let Some(ticket_id) = self.agent_task_id else {
-                    return Err(McpErrorData::invalid_params(
-                        "projectId is required in standalone mode",
-                        None,
-                    ));
-                };
-                self.client
-                    .get_task(ticket_id)
-                    .await
-                    .map_err(McpErrorData::from)?
-                    .project_id
-            }
+            // The daemon-mode ticket context outranks the REMOTER_PROJECT_ID
+            // binding, which applies in standalone mode only.
+            None => match self.agent_task_id {
+                Some(ticket_id) => {
+                    self.client
+                        .get_task(ticket_id)
+                        .await
+                        .map_err(McpErrorData::from)?
+                        .project_id
+                }
+                None => match self.effective_project_id(None) {
+                    Some(id) => id,
+                    None => {
+                        return Err(McpErrorData::invalid_params(
+                            "projectId is required in standalone mode when no project is bound (REMOTER_PROJECT_ID is not set)",
+                            None,
+                        ));
+                    }
+                },
+            },
         };
         let goals = self.client.list_goals(project_id).await.map_err(McpErrorData::from)?;
         json_result(&goals)
@@ -1105,6 +1167,19 @@ impl RemoterMcp {
                 ));
             };
             let feature = self.client.get_feature(feature_id).await.map_err(McpErrorData::from)?;
+            // An explicit projectId — or the REMOTER_PROJECT_ID binding as its
+            // default — constrains which project the feature must belong to.
+            if let Some(project_id) = self.effective_project_id(p.project_id)
+                && feature.project_id != project_id
+            {
+                return Err(McpErrorData::invalid_params(
+                    format!(
+                        "featureId {feature_id} belongs to project {}, not to projectId {project_id}",
+                        feature.project_id
+                    ),
+                    None,
+                ));
+            }
             serde_json::json!({
                 "projectId": feature.project_id,
                 "featureId": feature_id,
@@ -1965,6 +2040,7 @@ mod tests {
             },
             role,
             None,
+            None,
         )
     }
 
@@ -1981,10 +2057,10 @@ mod tests {
     fn role_full_lists_all_tools() {
         let mcp = dummy_mcp(Role::Full);
         let names = tool_names(&mcp);
-        // 37 tools total; set_task_review is supervise-only,
+        // 38 tools total; set_task_review is supervise-only,
         // add/delete_task_question are dev-agent tools, set_task_goal and
-        // request_human_action are implement/plan-only, so the Full count is 32.
-        assert_eq!(names.len(), 32, "unexpected tools: {names:?}");
+        // request_human_action are implement/plan-only, so the Full count is 33.
+        assert_eq!(names.len(), 33, "unexpected tools: {names:?}");
         for gated in [
             "set_task_review",
             "add_task_question",
@@ -2007,11 +2083,11 @@ mod tests {
     fn role_implement_hides_four_board_tools() {
         let mcp = dummy_mcp(Role::DevAgentImplement);
         let names = tool_names(&mcp);
-        // 37 tools - 4 board tools - set_task_review (supervise-only) -
-        // add_task_question (plan-only) = 31; create_task/update_task/
+        // 38 tools - 4 board tools - set_task_review (supervise-only) -
+        // add_task_question (plan-only) = 32; create_task/update_task/
         // list_features/delete_task_question/list_goals/set_task_goal/
         // request_human_action stay available.
-        assert_eq!(names.len(), 31, "unexpected tools: {names:?}");
+        assert_eq!(names.len(), 32, "unexpected tools: {names:?}");
         for gated in [
             "start_task",
             "advance_task",
@@ -2046,8 +2122,8 @@ mod tests {
     fn role_plan_hides_eight_tools() {
         let mcp = dummy_mcp(Role::DevAgentPlan);
         let names = tool_names(&mcp);
-        // 37 tools - 9 gated (6 board/action + create_task/update_task + set_task_review) = 28.
-        assert_eq!(names.len(), 28, "unexpected tools: {names:?}");
+        // 38 tools - 9 gated (6 board/action + create_task/update_task + set_task_review) = 29.
+        assert_eq!(names.len(), 29, "unexpected tools: {names:?}");
         for gated in [
             "start_task",
             "advance_task",
@@ -2083,13 +2159,13 @@ mod tests {
     fn role_supervise_keeps_supervision_tools() {
         let mcp = dummy_mcp(Role::DevAgentSupervise);
         let names = tool_names(&mcp);
-        // 37 tools - 3 daemon-owned board tools (start/complete/unassign_self)
+        // 38 tools - 3 daemon-owned board tools (start/complete/unassign_self)
         // - add/delete_task_question (not the supervisor's job)
         // - set_task_goal (implement/plan-only)
-        // - request_human_action (the working agent's own pause, remoter#162) = 30.
+        // - request_human_action (the working agent's own pause, remoter#162) = 31.
         // advance_task and set_task_review stay: parent-scoped transitions and
         // child reviews are the supervisor's job.
-        assert_eq!(names.len(), 30, "unexpected tools: {names:?}");
+        assert_eq!(names.len(), 31, "unexpected tools: {names:?}");
         for gated in [
             "start_task",
             "complete_task",
@@ -2124,9 +2200,9 @@ mod tests {
     fn role_review_keeps_only_read_tools_and_set_task_review() {
         let mcp = dummy_mcp(Role::DevAgentReview);
         let names = tool_names(&mcp);
-        // 37 tools - 22 mutating tools = 15: read-only discovery, the static
+        // 38 tools - 22 mutating tools = 16: read-only discovery, the static
         // get_project_setup_guide, plus set_task_review for the review verdict.
-        assert_eq!(names.len(), 15, "unexpected tools: {names:?}");
+        assert_eq!(names.len(), 16, "unexpected tools: {names:?}");
         for available in [
             "list_my_tasks",
             "get_task",
@@ -2134,6 +2210,7 @@ mod tests {
             "list_users",
             "list_features",
             "list_projects",
+            "current_project",
             "search_tasks",
             "list_board",
             "list_goals",
@@ -2393,7 +2470,10 @@ mod tests {
     #[test]
     fn list_features_params_map_project_id() {
         let p: ListFeaturesParams = serde_json::from_value(serde_json::json!({"projectId": 42})).unwrap();
-        assert_eq!(p.project_id, 42);
+        assert_eq!(p.project_id, Some(42));
+        // projectId is optional: the REMOTER_PROJECT_ID binding is the default.
+        let p: ListFeaturesParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(p.project_id, None);
         // snake_case project_id is not accepted — the MCP surface is camelCase.
         assert!(serde_json::from_value::<ListFeaturesParams>(serde_json::json!({"project_id": 42})).is_err());
     }
