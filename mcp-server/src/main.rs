@@ -267,6 +267,48 @@ fn read_workspace_id() -> anyhow::Result<Option<i32>> {
     }
 }
 
+/// Parse an optional `REMOTER_PROJECT_ID` value (testable). An empty or unset
+/// value means "no project bound"; a malformed value fails at startup.
+pub(crate) fn parse_project_id(value: Option<String>) -> anyhow::Result<Option<i32>> {
+    match value {
+        Some(s) if s.trim().is_empty() => Ok(None),
+        Some(s) => s
+            .parse::<i32>()
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("REMOTER_PROJECT_ID must be an integer project id, got {s:?}")),
+        None => Ok(None),
+    }
+}
+
+/// Read the optional `REMOTER_PROJECT_ID` env var (spec mcp-server-for-agents.md
+/// §2.2): binds the local repository to one Remoter project.
+fn read_project_id() -> anyhow::Result<Option<i32>> {
+    parse_project_id(env::var("REMOTER_PROJECT_ID").ok())
+}
+
+/// Validate the configured `REMOTER_PROJECT_ID` against the backend (`GET
+/// /api/v1/projects/{id}`). A 404 — nonexistent id or a project outside the
+/// token's workspace — is a permanent configuration error and gets a clear
+/// message (keeping its status, so startup fails fast like a bad token).
+/// Every other error passes through unwrapped: `with_retry` classifies it
+/// (429/5xx/transport are retried, other 4xx fail immediately) and the
+/// backend's own message stays intact.
+pub(crate) async fn resolve_project(
+    client: &RemoterClient,
+    configured: Option<i32>,
+) -> Result<Option<client::ProjectDto>, error::McpError> {
+    match configured {
+        Some(id) => match client.get_project(id).await {
+            Ok(project) => Ok(Some(project)),
+            Err(e) if e.status() == Some(reqwest::StatusCode::NOT_FOUND) => Err(e.with_message(format!(
+                "REMOTER_PROJECT_ID={id} is not a project in this workspace — fix or unset the env var"
+            ))),
+            Err(e) => Err(e),
+        },
+        None => Ok(None),
+    }
+}
+
 /// Picks the effective workspace. Required when the caller belongs to more than
 /// one workspace; optional (single-membership fallback) otherwise.
 fn resolve_workspace(whoami: &mut client::WhoAmI, configured: Option<i32>) -> Result<(), String> {
@@ -321,22 +363,38 @@ async fn validate_with_retry(
     max_attempts: u32,
     base_delay: Duration,
 ) -> Result<client::WhoAmI, error::McpError> {
+    with_retry("token validation", max_attempts, base_delay, || client.validate()).await
+}
+
+/// Retry a startup call on transient failures (5xx, 429, network errors) with
+/// exponential backoff + jitter; 401/403 and other 4xx are permanent and fail
+/// on the first attempt. `label` names the call in the stderr log lines.
+pub(crate) async fn with_retry<T, F, Fut>(
+    label: &str,
+    max_attempts: u32,
+    base_delay: Duration,
+    mut call: F,
+) -> Result<T, error::McpError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, error::McpError>>,
+{
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        match client.validate().await {
-            Ok(whoami) => return Ok(whoami),
+        match call().await {
+            Ok(val) => return Ok(val),
             Err(e) if e.is_retryable() && attempt < max_attempts => {
                 let delay = retry_delay(base_delay, attempt);
                 eprintln!(
-                    "remoter-mcp: token validation attempt {attempt}/{max_attempts} failed ({e}), retrying in {} ms",
+                    "remoter-mcp: {label} attempt {attempt}/{max_attempts} failed ({e}), retrying in {} ms",
                     delay.as_millis()
                 );
                 tokio::time::sleep(delay).await;
             }
             Err(e) => {
                 if attempt > 1 {
-                    eprintln!("remoter-mcp: token validation failed after {attempt}/{max_attempts} attempts");
+                    eprintln!("remoter-mcp: {label} failed after {attempt}/{max_attempts} attempts");
                 }
                 return Err(e);
             }
@@ -386,6 +444,7 @@ async fn main() -> anyhow::Result<()> {
     let base_url = require_env("REMOTER_API_URL");
     let token = read_token();
     let workspace_id = read_workspace_id()?;
+    let project_id = read_project_id()?;
 
     let client = RemoterClient::new(base_url, token, workspace_id);
 
@@ -402,6 +461,23 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
+    // Validate the project binding even in daemon mode (where the ticket
+    // context wins over it): a stale REMOTER_PROJECT_ID must surface at
+    // startup, not on the first defaulted tool call.
+    let bound_project = match with_retry("project validation", MAX_VALIDATE_ATTEMPTS, VALIDATE_BASE_DELAY, || {
+        resolve_project(&client, project_id)
+    })
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Some(p) = &bound_project {
+        eprintln!("remoter-mcp: bound to project {} (id={})", p.name, p.id);
+    }
     eprintln!(
         "remoter-mcp: authenticated as {} (id={}, kind={}, workspace_id={}, workspace_name={}, role={}, mcp_role={})",
         whoami.name,
@@ -413,7 +489,7 @@ async fn main() -> anyhow::Result<()> {
         role
     );
 
-    let server = RemoterMcp::new(client, whoami, role, parse_agent_task_id());
+    let server = RemoterMcp::new(client, whoami, role, parse_agent_task_id(), bound_project);
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
@@ -465,6 +541,8 @@ impl ServerHandler for RemoterMcp {
             Role::Full => "Remoter task management over MCP, for AI agents and humans alike. \
                  Discover IDs first: list_projects, then list_features for a project; search_tasks finds tasks by #id or title, \
                  list_board shows the kanban, and list_my_tasks shows work assigned to you. \
+                 current_project returns the project bound via REMOTER_PROJECT_ID (id, name, goal); the binding is the \
+                 default projectId for list_features, list_board, list_goals, create_task, and list_my_tasks. \
                  get_task gives full details; start_task/advance_task/complete_task move a task along the board. \
                  Use add_action to create steps, update_action to edit them, delete_action to remove stale ones, \
                  and start_action/complete_action to track progress. reject_action with a reason when a step is no longer needed. \
@@ -629,5 +707,24 @@ mod tests {
             .map(|a| crate::retry_delay(crate::VALIDATE_BASE_DELAY, a))
             .sum();
         assert!(total < std::time::Duration::from_secs(30), "{total:?}");
+    }
+
+    #[test]
+    fn parse_project_id_maps_unset_and_empty_to_no_binding() {
+        assert_eq!(crate::parse_project_id(None).unwrap(), None);
+        assert_eq!(crate::parse_project_id(Some(String::new())).unwrap(), None);
+        assert_eq!(crate::parse_project_id(Some("   ".into())).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_project_id_accepts_an_integer() {
+        assert_eq!(crate::parse_project_id(Some("42".into())).unwrap(), Some(42));
+    }
+
+    #[test]
+    fn parse_project_id_rejects_garbage_with_a_clear_message() {
+        let err = crate::parse_project_id(Some("abc".into())).unwrap_err();
+        assert!(err.to_string().contains("REMOTER_PROJECT_ID"), "{err}");
+        assert!(err.to_string().contains("\"abc\""), "{err}");
     }
 }

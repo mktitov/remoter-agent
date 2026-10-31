@@ -68,6 +68,18 @@ impl McpError {
             Some(s) => s == reqwest::StatusCode::TOO_MANY_REQUESTS || s.is_server_error(),
         }
     }
+
+    /// The HTTP status from the backend, if the request got that far.
+    pub fn status(&self) -> Option<reqwest::StatusCode> {
+        self.status
+    }
+
+    /// Override the message while keeping the code and HTTP status, so
+    /// retry classification (`is_retryable`) is preserved.
+    pub fn with_message(mut self, msg: impl Into<String>) -> Self {
+        self.message = msg.into();
+        self
+    }
 }
 
 impl From<reqwest::Error> for McpError {
