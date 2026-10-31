@@ -12,15 +12,24 @@ use wiremock::{
 
 use crate::{
     Role,
-    client::{RemoterClient, WhoAmI, WorkspaceMembership},
+    client::{ProjectDto, RemoterClient, WhoAmI, WorkspaceMembership},
     tools::{
-        AssignTaskParams, CreateTaskParams, GetProjectSetupGuideParams, ListBoardParams, ListGoalsParams,
-        ListMyTasksParams, ListUsersParams, RemoterMcp, ReviewVerdictParam, SearchTasksParams, SetTaskGoalParams,
-        SetTaskReviewParams, UpdateTaskParams,
+        AssignTaskParams, CreateTaskParams, CurrentProjectParams, GetProjectSetupGuideParams, ListBoardParams,
+        ListFeaturesParams, ListGoalsParams, ListMyTasksParams, ListUsersParams, RemoterMcp, ReviewVerdictParam,
+        SearchTasksParams, SetTaskGoalParams, SetTaskReviewParams, UpdateTaskParams,
     },
 };
 
 fn test_mcp(base_url: String, role: Role, agent_task_id: Option<i32>) -> RemoterMcp {
+    test_mcp_with_project(base_url, role, agent_task_id, None)
+}
+
+fn test_mcp_with_project(
+    base_url: String,
+    role: Role,
+    agent_task_id: Option<i32>,
+    bound_project: Option<ProjectDto>,
+) -> RemoterMcp {
     RemoterMcp::new(
         RemoterClient::new(base_url, "dummy".into(), None),
         WhoAmI {
@@ -38,7 +47,18 @@ fn test_mcp(base_url: String, role: Role, agent_task_id: Option<i32>) -> Remoter
         },
         role,
         agent_task_id,
+        bound_project,
     )
+}
+
+/// A `ProjectDto` fixture as returned by `GET /projects/{id}` and cached as
+/// the `REMOTER_PROJECT_ID` binding.
+fn bound_project(id: i32) -> ProjectDto {
+    ProjectDto {
+        id,
+        name: format!("project {id}"),
+        goal: format!("goal of project {id}"),
+    }
 }
 
 /// Extract the JSON text block from a successful tool result.
@@ -1459,4 +1479,337 @@ async fn set_task_goal_daemon_mode_rejects_unrelated_task() {
     let p: SetTaskGoalParams = serde_json::from_value(serde_json::json!({"taskId": 71, "goalId": 3})).unwrap();
     let err = mcp.set_task_goal(Parameters(p)).await.unwrap_err();
     assert!(err.message.contains("not the current ticket or its subtask"), "{err:?}");
+}
+
+// ── Project binding via REMOTER_PROJECT_ID (remoter#245 / remoter-agent#246) ─
+
+/// Startup validation: a configured REMOTER_PROJECT_ID resolves through
+/// `GET /api/v1/projects/{id}`.
+#[tokio::test]
+async fn resolve_project_returns_the_bound_project() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 7, "name": "remoter-agent", "goal": "ship it",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RemoterClient::new(server.uri(), "dummy".into(), None);
+    let project = crate::resolve_project(&client, Some(7)).await.unwrap().unwrap();
+    assert_eq!(project.id, 7);
+    assert_eq!(project.name, "remoter-agent");
+    assert_eq!(project.goal, "ship it");
+}
+
+/// Startup validation: a nonexistent id or a project outside the token's
+/// workspace comes back as a 404 and fails startup with a clear message.
+#[tokio::test]
+async fn resolve_project_rejects_an_unknown_or_foreign_project() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+            "error": "Not found", "message": "Project not found",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RemoterClient::new(server.uri(), "dummy".into(), None);
+    let err = crate::resolve_project(&client, Some(7)).await.unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("REMOTER_PROJECT_ID=7"), "{msg}");
+    assert!(msg.contains("Project not found"), "{msg}");
+}
+
+/// Without REMOTER_PROJECT_ID there is no binding and no validation call.
+#[tokio::test]
+async fn resolve_project_without_config_binds_nothing() {
+    let server = MockServer::start().await;
+    // No mock mounted: any HTTP call would fail the test via wiremock's
+    // unmatched-request 404, but resolve_project must not call at all.
+    let client = RemoterClient::new(server.uri(), "dummy".into(), None);
+    assert!(crate::resolve_project(&client, None).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn current_project_returns_the_bound_project() {
+    // No mock mounted: current_project serves the startup cache, no HTTP call.
+    let mcp = test_mcp_with_project("http://localhost:9999".into(), Role::Full, None, Some(bound_project(7)));
+    let result = mcp.current_project(Parameters(CurrentProjectParams {})).await.unwrap();
+    let text = result_text(result);
+    assert!(text.contains("\"id\": 7"), "{text}");
+    assert!(text.contains("\"name\": \"project 7\""), "{text}");
+    assert!(text.contains("\"goal\": \"goal of project 7\""), "{text}");
+}
+
+#[tokio::test]
+async fn current_project_errors_when_no_project_is_bound() {
+    let mcp = test_mcp("http://localhost:9999".into(), Role::Full, None);
+    let err = mcp
+        .current_project(Parameters(CurrentProjectParams {}))
+        .await
+        .unwrap_err();
+    assert!(
+        err.message
+            .contains("project not bound (REMOTER_PROJECT_ID is not set)"),
+        "{err:?}"
+    );
+}
+
+/// current_project is a discovery tool: available in every role.
+#[test]
+fn current_project_is_available_in_all_roles() {
+    for role in [
+        Role::Full,
+        Role::DevAgentPlan,
+        Role::DevAgentImplement,
+        Role::DevAgentSupervise,
+        Role::DevAgentReview,
+    ] {
+        assert!(
+            !role.is_gated("current_project"),
+            "current_project must be open in {role}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn list_features_uses_the_bound_project_as_default() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/features"))
+        .and(query_param("project_id", "7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"id": 9, "projectId": 7, "description": "mcp api", "tasksTotal": 2, "tasksCompleted": 1},
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp_with_project(server.uri(), Role::Full, None, Some(bound_project(7)));
+    let p: ListFeaturesParams = serde_json::from_value(serde_json::json!({})).unwrap();
+    let result = mcp.list_features(Parameters(p)).await.unwrap();
+    assert!(result_text(result).contains("mcp api"));
+}
+
+#[tokio::test]
+async fn list_features_explicit_project_id_wins_over_the_binding() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/features"))
+        .and(query_param("project_id", "3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp_with_project(server.uri(), Role::Full, None, Some(bound_project(7)));
+    let p: ListFeaturesParams = serde_json::from_value(serde_json::json!({"projectId": 3})).unwrap();
+    let result = mcp.list_features(Parameters(p)).await.unwrap();
+    assert!(result_text(result).contains("No features"));
+}
+
+#[tokio::test]
+async fn list_features_unbound_requires_project_id() {
+    let server = MockServer::start().await;
+    // No features mock: the call must fail before any HTTP request.
+    let mcp = test_mcp(server.uri(), Role::Full, None);
+    let p: ListFeaturesParams = serde_json::from_value(serde_json::json!({})).unwrap();
+    let err = mcp.list_features(Parameters(p)).await.unwrap_err();
+    assert!(err.message.contains("projectId is required"), "{err:?}");
+}
+
+#[tokio::test]
+async fn list_board_uses_the_bound_project_as_default() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/boards"))
+        .and(query_param("scope", "project"))
+        .and(query_param("projectId", "7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp_with_project(server.uri(), Role::Full, None, Some(bound_project(7)));
+    let p: ListBoardParams = serde_json::from_value(serde_json::json!({})).unwrap();
+    let result = mcp.list_board(Parameters(p)).await.unwrap();
+    assert!(result_text(result).contains("No tasks on the board"));
+}
+
+#[tokio::test]
+async fn list_my_tasks_uses_the_bound_project_as_default() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks"))
+        .and(query_param("assignee", "me"))
+        .and(query_param("projectId", "7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp_with_project(server.uri(), Role::Full, None, Some(bound_project(7)));
+    let p: ListMyTasksParams = serde_json::from_value(serde_json::json!({})).unwrap();
+    let result = mcp.list_my_tasks(Parameters(p)).await.unwrap();
+    assert!(result_text(result).contains("No tasks assigned to you"));
+}
+
+#[tokio::test]
+async fn list_goals_standalone_uses_the_bound_project_as_default() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7/goals"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"id": 3, "projectId": 7, "title": "Grow revenue"},
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp_with_project(server.uri(), Role::Full, None, Some(bound_project(7)));
+    let p: ListGoalsParams = serde_json::from_value(serde_json::json!({})).unwrap();
+    let result = mcp.list_goals(Parameters(p)).await.unwrap();
+    assert!(result_text(result).contains("Grow revenue"));
+}
+
+/// Daemon mode: the current ticket's project outranks the REMOTER_PROJECT_ID
+/// binding — list_goals without projectId stays on the ticket's project.
+#[tokio::test]
+async fn list_goals_daemon_mode_prefers_the_ticket_project_over_the_binding() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/70"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(task_detail_json(70, serde_json::json!([]))))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/1/goals"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"id": 3, "projectId": 1, "title": "Grow revenue"},
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The binding's project must never be queried.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7/goals"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp_with_project(server.uri(), Role::DevAgentImplement, Some(70), Some(bound_project(7)));
+    let p: ListGoalsParams = serde_json::from_value(serde_json::json!({})).unwrap();
+    let result = mcp.list_goals(Parameters(p)).await.unwrap();
+    assert!(result_text(result).contains("Grow revenue"));
+}
+
+/// Daemon mode: the binding does not turn a plain subtask into a cross-project
+/// one — create_task keeps working from the ticket's project.
+#[tokio::test]
+async fn create_task_daemon_mode_ignores_the_binding() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/70"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(task_detail_json(70, serde_json::json!([]))))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks"))
+        .and(body_json(serde_json::json!({
+            "projectId": 1,
+            "featureId": 3,
+            "title": "sub",
+            "description": "d",
+            "parentTaskId": 70,
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 71})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp_with_project(server.uri(), Role::DevAgentImplement, Some(70), Some(bound_project(7)));
+    let p: CreateTaskParams = serde_json::from_value(serde_json::json!({
+        "title": "sub",
+        "description": "d",
+    }))
+    .unwrap();
+    let result = mcp.create_task(Parameters(p)).await.unwrap();
+    assert!(result_text(result).contains("\"id\": 71"));
+}
+
+/// Standalone mode: the binding constrains which project the feature must
+/// belong to (the explicit parameter would win over it).
+#[tokio::test]
+async fn create_task_standalone_rejects_a_feature_outside_the_bound_project() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/features/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 9, "projectId": 1, "description": "f", "tasksTotal": 0, "tasksCompleted": 0,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp_with_project(server.uri(), Role::Full, None, Some(bound_project(7)));
+    let p: CreateTaskParams = serde_json::from_value(serde_json::json!({
+        "title": "t",
+        "description": "d",
+        "featureId": 9,
+    }))
+    .unwrap();
+    let err = mcp.create_task(Parameters(p)).await.unwrap_err();
+    assert!(
+        err.message.contains("belongs to project 1, not to projectId 7"),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn create_task_standalone_with_a_matching_binding_creates_the_task() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/features/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 9, "projectId": 7, "description": "f", "tasksTotal": 0, "tasksCompleted": 0,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks"))
+        .and(body_json(serde_json::json!({
+            "projectId": 7,
+            "featureId": 9,
+            "title": "t",
+            "description": "d",
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 71})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp_with_project(server.uri(), Role::Full, None, Some(bound_project(7)));
+    let p: CreateTaskParams = serde_json::from_value(serde_json::json!({
+        "title": "t",
+        "description": "d",
+        "featureId": 9,
+    }))
+    .unwrap();
+    let result = mcp.create_task(Parameters(p)).await.unwrap();
+    assert!(result_text(result).contains("\"id\": 71"));
 }

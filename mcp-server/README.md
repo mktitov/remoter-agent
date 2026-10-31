@@ -64,13 +64,16 @@ child process by the MCP client) plus one optional flag:
 | `REMOTER_TOKEN` | Bearer token: a personal access token, a login JWT, or an agent's static token (required) | `abC123...` |
 | `REMOTER_AGENT_TOKEN` | Legacy alias for `REMOTER_TOKEN` (what the `remoter-agent` daemon sets); ignored when `REMOTER_TOKEN` is present | `abC123...` |
 | `REMOTER_WORKSPACE_ID` | Workspace id sent as `X-Workspace-Id`. Required when the caller has multiple workspace memberships; optional with a single one | `1` |
+| `REMOTER_PROJECT_ID` | Bind this repository to one project (optional). Validated at startup via `GET /api/v1/projects/{id}`; `current_project` reports the binding and tools with an optional `projectId` default to it. Daemon mode (`REMOTER_AGENT_TASK_ID`) outranks it | `7` |
 | `REMOTER_AGENT_TASK_ID` | Current ticket id when spawned by `remoter-agent` (daemon mode); scopes task creation and supervise-role discovery | `42` |
 | `REMOTER_MCP_NAME` | Server name reported in MCP `initialize` (optional) | `remoter` |
 | `--role <role>` | Runtime role: `full`, `dev-agent-plan`, `dev-agent-implement`, `dev-agent-supervise`, `dev-agent-review` | `--role dev-agent-implement` |
 
 On startup the server validates the token with one `GET /auth/me` call,
-resolves the effective workspace, and caches the identity for `whoami`. The
-protocol surface is MCP 2025-06-18 over stdio: `initialize`, `tools/list`,
+resolves the effective workspace, validates `REMOTER_PROJECT_ID` when set
+(unknown id or a project outside the token's workspace fails startup with a
+clear message), and caches the identity for `whoami`. The protocol surface is
+MCP 2025-06-18 over stdio: `initialize`, `tools/list`,
 `tools/call`, `ping` (no resources/prompts/notifications).
 
 ## Human usage (without `remoter-agent`)
@@ -98,6 +101,7 @@ token (PAT):
      --env REMOTER_API_URL=http://localhost:8181 \
      --env REMOTER_TOKEN=<pat-from-step-1> \
      --env REMOTER_WORKSPACE_ID=1 \
+     --env REMOTER_PROJECT_ID=7 \
      -- remoter-mcp
    ```
 
@@ -111,12 +115,18 @@ token (PAT):
          "env": {
            "REMOTER_API_URL": "http://localhost:8181",
            "REMOTER_TOKEN": "<pat-from-step-1>",
-           "REMOTER_WORKSPACE_ID": "1"
+           "REMOTER_WORKSPACE_ID": "1",
+           "REMOTER_PROJECT_ID": "7"
          }
        }
      }
    }
    ```
+
+   `REMOTER_PROJECT_ID` is optional: it binds the repository to one project,
+   so `current_project` reports it and `projectId` can be omitted from
+   `list_features`, `list_board`, `list_goals`, `create_task`, and
+   `list_my_tasks` (an explicit parameter always wins).
 
 Humans get the same discovery tools as agents (`list_projects`,
 `search_tasks`, `list_board`, …). Reading is workspace-wide for any
