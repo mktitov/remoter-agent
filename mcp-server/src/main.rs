@@ -287,19 +287,24 @@ fn read_project_id() -> anyhow::Result<Option<i32>> {
 }
 
 /// Validate the configured `REMOTER_PROJECT_ID` against the backend (`GET
-/// /api/v1/projects/{id}`). A nonexistent id or a project outside the token's
-/// workspace fails startup with a clear message; without the env var there is
-/// no binding and nothing to validate.
+/// /api/v1/projects/{id}`). A 404 — nonexistent id or a project outside the
+/// token's workspace — is a permanent configuration error and gets a clear
+/// message (keeping its status, so startup fails fast like a bad token).
+/// Every other error passes through unwrapped: `with_retry` classifies it
+/// (429/5xx/transport are retried, other 4xx fail immediately) and the
+/// backend's own message stays intact.
 pub(crate) async fn resolve_project(
     client: &RemoterClient,
     configured: Option<i32>,
 ) -> Result<Option<client::ProjectDto>, error::McpError> {
     match configured {
-        Some(id) => client.get_project(id).await.map(Some).map_err(|e| {
-            error::McpError::internal(format!(
-                "REMOTER_PROJECT_ID={id} is not a project in this workspace ({e}) — fix or unset the env var"
-            ))
-        }),
+        Some(id) => match client.get_project(id).await {
+            Ok(project) => Ok(Some(project)),
+            Err(e) if e.status() == Some(reqwest::StatusCode::NOT_FOUND) => Err(e.with_message(format!(
+                "REMOTER_PROJECT_ID={id} is not a project in this workspace — fix or unset the env var"
+            ))),
+            Err(e) => Err(e),
+        },
         None => Ok(None),
     }
 }
@@ -364,7 +369,7 @@ async fn validate_with_retry(
 /// Retry a startup call on transient failures (5xx, 429, network errors) with
 /// exponential backoff + jitter; 401/403 and other 4xx are permanent and fail
 /// on the first attempt. `label` names the call in the stderr log lines.
-async fn with_retry<T, F, Fut>(
+pub(crate) async fn with_retry<T, F, Fut>(
     label: &str,
     max_attempts: u32,
     base_delay: Duration,

@@ -1522,7 +1522,52 @@ async fn resolve_project_rejects_an_unknown_or_foreign_project() {
     let err = crate::resolve_project(&client, Some(7)).await.unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("REMOTER_PROJECT_ID=7"), "{msg}");
-    assert!(msg.contains("Project not found"), "{msg}");
+    assert!(msg.contains("not a project in this workspace"), "{msg}");
+    // The 404 status is preserved, so the error stays non-retryable.
+    assert!(!err.is_retryable(), "404 must fail fast, not be retried");
+}
+
+/// Fail-fast contract (same as a bad token): a 404 from project validation
+/// goes through `with_retry` and fails on the first attempt — no backoff
+/// loop for a permanent configuration error.
+#[tokio::test]
+async fn project_validation_404_fails_fast_without_retries() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RemoterClient::new(server.uri(), "dummy".into(), None);
+    let err = crate::with_retry("project validation", 5, std::time::Duration::from_millis(1), || {
+        crate::resolve_project(&client, Some(7))
+    })
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("REMOTER_PROJECT_ID=7"), "{err}");
+}
+
+/// Non-404 errors are not rewritten into the "not a project" message: a
+/// transient 500 keeps the backend's own message and stays retryable.
+#[tokio::test]
+async fn resolve_project_passes_through_transient_errors_unwrapped() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RemoterClient::new(server.uri(), "dummy".into(), None);
+    let err = crate::resolve_project(&client, Some(7)).await.unwrap_err();
+    assert!(err.is_retryable(), "500 must stay retryable");
+    assert!(
+        !err.to_string().contains("REMOTER_PROJECT_ID"),
+        "non-404 errors keep the backend's message: {err}"
+    );
 }
 
 /// Without REMOTER_PROJECT_ID there is no binding and no validation call.
