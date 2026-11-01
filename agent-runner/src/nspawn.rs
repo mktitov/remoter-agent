@@ -1,89 +1,30 @@
 //! Per-run systemd-nspawn machines (`execution.mode = "nspawn"`, NixOS hosts
-//! only): one booted machine per attempt from a shared NixOS system closure,
-//! with the host `/nix/store` bind-mounted read-only — no image bake. The
-//! machine is minimal and generic: the daemon provides no project services —
-//! postgres/minio/… come from the project's own devenv.nix, started via
-//! `devenv up` inside the machine (see `run.rs`). The private netns makes a
-//! project's default ports safe, so the §5.8 port-block contract does not
-//! apply.
-//!
-//! Privileges: the daemon stays an ordinary user. `systemd-nspawn`,
-//! `systemd-run -M`, `machinectl terminate` and the root-owned
-//! [`HELPER_BINARY`] script (host veth address + masquerade) are whitelisted
-//! in sudoers and always invoked via `sudo -n`.
-//!
-//! Networking: `--network-veth` gives the machine a private netns (host side
-//! `ve-<machine>`, container side `host0`). The daemon manages addresses
-//! itself (no host systemd-networkd dependency): a per-run /30 from the
-//! [`NetBlocks`] pool, host side configured by the helper's `net-up`, machine
-//! side by a generated networkd drop-in bind-mounted over
-//! `/etc/systemd/network`. The host is reachable from inside at the block's
-//! `.1` — the nspawn analogue of `host.docker.internal`.
-//!
-//! Machine names are `rr-<run_id>`, NOT `remoter-run-<run_id>`: the host-side
-//! veth name is `ve-` + machine name truncated to IFNAMSIZ-1 (15 chars), so a
-//! 12+ char prefix would truncate the run id away and make every parallel
-//! run's host interface collide (`ve-remoter-run-`). `rr-<id>` keeps the
-//! derived `ve-rr-<id>` unique for run ids up to 9 digits.
-//!
-//! Lifecycle mirrors `container.rs`: [`start`] boots and waits for readiness,
-//! returning a [`NspawnMachine`] guard whose teardown (terminate, net-down,
-//! `git worktree unlock`) runs on explicit [`NspawnMachine::teardown`] or on
-//! drop. A daemon crash can still leak machines; [`sweep`] reaps `rr-*`
-//! machines at startup.
+//! only). The root-owned `remoter-nspawnctl` helper owns privileged systemd and
+//! networking operations, host-wide machine/subnet leases, and orphan sweeping.
+//! The daemon retains worktree locking, closure realization, boot logs, and the
+//! ACP stdio lifecycle.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::config::ExecutionConfig;
 use crate::driver::DriverError;
 use crate::workspace::RefMount;
 
-/// The root-owned privileged helper (host veth address + masquerade rule),
-/// always invoked as `sudo -n remoter-nspawnctl <check|net-up|net-down>`.
 pub const HELPER_BINARY: &str = "remoter-nspawnctl";
-
-/// `systemd-run -M <machine> --pipe` (the per-turn exec path) requires
-/// systemd ≥ 256 on the host; startup validation fails closed below that.
 pub const MIN_SYSTEMD_VERSION: u32 = 256;
-
-/// Machine name prefix — see module docs for why this is short.
-const MACHINE_NAME_PREFIX: &str = "rr-";
-
-/// The worktree mount point inside the machine (same as container mode).
 pub const WORK_DIR: &str = crate::container::WORK_DIR;
 
-/// How long to wait for the machine to accept `systemd-run -M` exec.
 const MACHINE_READY_TIMEOUT: Duration = Duration::from_secs(60);
-/// The host veth appears only once nspawn has set up the pair.
 const NET_UP_TIMEOUT: Duration = Duration::from_secs(30);
-/// Grace for the boot process to exit after `machinectl terminate`.
 const TERMINATE_WAIT: Duration = Duration::from_secs(5);
 
-/// `/30` blocks per pool: third octet `4n` for n in 0..BLOCKS.
-const NET_POOL_BLOCKS: u32 = 64;
-const NET_PREFIX_LEN: u8 = 30;
-
-/// The run's machine name — the `machinectl`/`systemd-run -M` target.
-pub fn run_machine_name(run_id: i32) -> String {
-    format!("{MACHINE_NAME_PREFIX}{run_id}")
-}
-
-/// The host side of the machine's veth pair (`ve-` + machine name; fits
-/// IFNAMSIZ because of the short prefix, see module docs).
-fn veth_name(run_id: i32) -> String {
-    format!("ve-{MACHINE_NAME_PREFIX}{run_id}")
-}
-
-/// Startup-sweep predicate: our machines are `rr-<digits>` exactly.
-fn is_run_machine(name: &str) -> bool {
-    name.strip_prefix(MACHINE_NAME_PREFIX)
-        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
-}
-
-/// `systemd 257 (257.9)` → 257. The first line of `systemd-run --version`.
 pub(crate) fn parse_systemd_version(version_out: &str) -> Option<u32> {
     let line = version_out.lines().next()?;
     let ver = line.strip_prefix("systemd ")?.split_whitespace().next()?;
@@ -91,12 +32,6 @@ pub(crate) fn parse_systemd_version(version_out: &str) -> Option<u32> {
     if digits.is_empty() { None } else { digits.parse().ok() }
 }
 
-/// The nspawn-mode env contract: `CI=1`, `REMOTER_EXECUTION=nspawn`, the task
-/// id — nothing else. The daemon provides no project services in this mode
-/// (the project's own devenv.nix defines them, started via `devenv up`
-/// inside the machine), so there are no `*_DATABASE_URL` exports and no
-/// `REMOTER_AGENT_PORT_BASE` (the machine's netns is private to the run, so a
-/// project's default ports are safe).
 pub fn nspawn_env(task_id: i32) -> Vec<(String, String)> {
     vec![
         ("CI".to_string(), "1".to_string()),
@@ -105,9 +40,6 @@ pub fn nspawn_env(task_id: i32) -> Vec<(String, String)> {
     ]
 }
 
-/// The API URL as reachable from inside a run machine: loopback hosts go to
-/// the run block's host-side veth address (`<base>.<4n>.1`). Non-loopback
-/// URLs pass through unchanged. Mirrors `container::container_api_url`.
 pub fn nspawn_api_url(api_url: &str, host_ip: &str) -> String {
     for loopback in ["localhost", "127.0.0.1", "[::1]", "0.0.0.0"] {
         for scheme in ["http://", "https://", "ws://", "wss://"] {
@@ -122,10 +54,6 @@ pub fn nspawn_api_url(api_url: &str, host_ip: &str) -> String {
     api_url.to_string()
 }
 
-/// The API URL for one run's machine, resolving the host IP from the
-/// run-id → net-block registry that [`start`] populates. A missing entry can
-/// only mean the machine was never started (or is already torn down) — the
-/// URL then stays unrewritten rather than pointing at a guessed block.
 pub fn nspawn_api_url_for(api_url: &str, run_id: i32) -> String {
     match host_ip_for(run_id) {
         Some(ip) => nspawn_api_url(api_url, &ip),
@@ -139,9 +67,6 @@ pub fn nspawn_api_url_for(api_url: &str, run_id: i32) -> String {
     }
 }
 
-/// run id → host-side veth IP of the live machines, so `exec_env` can rewrite
-/// the API URL for a run it did not itself start (same derivation pattern as
-/// `run_container_name`).
 fn host_ips() -> &'static Mutex<HashMap<i32, String>> {
     static IPS: OnceLock<Mutex<HashMap<i32, String>>> = OnceLock::new();
     IPS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -159,249 +84,205 @@ pub fn host_ip_for(run_id: i32) -> Option<String> {
     host_ips().lock().unwrap().get(&run_id).cloned()
 }
 
-// ── per-run /30 net blocks (mirror of ports.rs) ─────────────────────────────
-
-/// An allocated /30: host `<base>.<4n>.1`, machine `<base>.<4n>.2`. Release
-/// happens automatically on drop (run end).
-#[derive(Debug)]
-pub struct NetBlock {
-    index: u32,
-    base: [u8; 2],
-    in_use: Arc<Mutex<HashSet<u32>>>,
+/// Persistent identity used by the helper to distinguish this daemon's leases
+/// from those of other daemons. The lock prevents two live processes from
+/// sharing one identity and sweeping each other's machines.
+pub struct NspawnIdentity {
+    id: String,
+    _lock: std::fs::File,
 }
 
-impl NetBlock {
-    /// The host's address on the run's veth pair — what the machine reaches
-    /// the daemon's API through, and what the helper configures on `ve-…`.
-    pub fn host_ip(&self) -> String {
-        format!("{}.{}.{}.1", self.base[0], self.base[1], self.index * 4)
-    }
-
-    /// The machine's own address (static, via the generated drop-in).
-    pub fn machine_ip(&self) -> String {
-        format!("{}.{}.{}.2", self.base[0], self.base[1], self.index * 4)
+impl NspawnIdentity {
+    pub fn id(&self) -> &str {
+        &self.id
     }
 }
 
-impl Drop for NetBlock {
-    fn drop(&mut self) {
-        self.in_use.lock().unwrap().remove(&self.index);
-    }
-}
-
-/// The daemon-wide pool of /30 blocks, one per concurrent nspawn run —
-/// `ports.rs` for veth subnets instead of TCP ports.
-#[derive(Clone)]
-pub struct NetBlocks {
-    base: [u8; 2],
-    in_use: Arc<Mutex<HashSet<u32>>>,
-}
-
-impl NetBlocks {
-    /// `pool_base` is the first two octets, e.g. `10.231`.
-    pub fn new(pool_base: &str) -> Result<Self, String> {
-        let mut octets = pool_base.split('.');
-        let (Some(a), Some(b), None) = (octets.next(), octets.next(), octets.next()) else {
-            return Err(format!(
-                "execution.nspawn_net_pool_base {pool_base:?} must be two octets like \"10.231\""
-            ));
-        };
-        let parse = |s: &str| s.parse::<u8>().ok();
-        let (Some(a), Some(b)) = (parse(a), parse(b)) else {
-            return Err(format!(
-                "execution.nspawn_net_pool_base {pool_base:?} must be two octets like \"10.231\""
-            ));
-        };
-        Ok(Self {
-            base: [a, b],
-            in_use: Arc::new(Mutex::new(HashSet::new())),
-        })
+pub fn lock_instance(workspace_root: &Path) -> anyhow::Result<NspawnIdentity> {
+    std::fs::create_dir_all(workspace_root)?;
+    let lock_path = workspace_root.join("nspawn-instance.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(&lock_path)?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        anyhow::bail!(
+            "another remoter-agent daemon holds {} (nspawn mode permits one daemon per workspace)",
+            lock_path.display()
+        );
     }
 
-    /// The smallest free block index, or `None` when the pool is exhausted
-    /// (64 concurrent nspawn runs — exhaustion means a leak).
-    pub fn allocate(&self) -> Option<NetBlock> {
-        let mut in_use = self.in_use.lock().unwrap();
-        (0..NET_POOL_BLOCKS).find(|i| in_use.insert(*i)).map(|index| NetBlock {
-            index,
-            base: self.base,
-            in_use: self.in_use.clone(),
-        })
-    }
-
-    #[cfg(test)]
-    fn allocated_count(&self) -> usize {
-        self.in_use.lock().unwrap().len()
-    }
-}
-
-/// The daemon-process-global pool, keyed off the configured pool base on
-/// first use (the config is fixed for the process lifetime).
-fn global_net_blocks(cfg: &ExecutionConfig) -> Result<&'static NetBlocks, DriverError> {
-    static POOL: OnceLock<NetBlocks> = OnceLock::new();
-    if let Some(pool) = POOL.get() {
-        return Ok(pool);
-    }
-    let pool = NetBlocks::new(&cfg.nspawn_net_pool_base).map_err(DriverError::Permanent)?;
-    Ok(POOL.get_or_init(|| pool))
-}
-
-// ── closure resolution ──────────────────────────────────────────────────────
-
-/// Resolves `execution.nspawn_closure_ref` to the NixOS toplevel directory
-/// the machine boots from. A plain path (optionally `path:`-prefixed, no
-/// `#attr`) must already exist; a flake ref with an attribute is built lazily
-/// with `nix build --no-link --print-out-paths` — content-addressed, so a
-/// no-op once the host store has the closure. Serialized process-wide: two
-/// parallel first runs must not race the same `nix build`.
-pub async fn resolve_closure(cfg: &ExecutionConfig) -> Result<PathBuf, DriverError> {
-    let r = cfg.nspawn_closure_ref.trim();
-    if r.is_empty() {
-        return Err(DriverError::Permanent(
-            "execution.nspawn_closure_ref is empty — point it at a flake ref (path:/etc/remoter-agent#agentContainer) \
-             or a pre-built NixOS toplevel"
-                .to_string(),
-        ));
-    }
-    let Some((_, attr)) = r.split_once('#') else {
-        let p = PathBuf::from(r.strip_prefix("path:").unwrap_or(r));
-        if p.is_dir() {
-            return Ok(p);
+    let id_path = workspace_root.join("nspawn-instance-id");
+    let id = match std::fs::read_to_string(&id_path) {
+        Ok(value) => {
+            let value = value.trim().to_string();
+            if !valid_instance_id(&value) {
+                anyhow::bail!("{} must contain exactly 32 lowercase hex characters", id_path.display());
+            }
+            value
         }
-        return Err(DriverError::Permanent(format!(
-            "execution.nspawn_closure_ref {r:?} is neither an existing directory nor a flake ref with an attribute"
-        )));
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut bytes = [0u8; 16];
+            std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+            let value = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+            let tmp = workspace_root.join(format!("nspawn-instance-id.tmp-{}", std::process::id()));
+            let mut file = OpenOptions::new().create_new(true).write(true).mode(0o600).open(&tmp)?;
+            file.write_all(value.as_bytes())?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, &id_path)?;
+            value
+        }
+        Err(e) => return Err(e.into()),
     };
-    if attr.is_empty() {
-        return Err(DriverError::Permanent(format!(
-            "execution.nspawn_closure_ref {r:?} has an empty attribute (expected e.g. path:/etc/remoter-agent#agentContainer)"
-        )));
-    }
-    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    let _guard = LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
-    let out = tokio::process::Command::new("nix")
-        .args([
-            "--extra-experimental-features",
-            "nix-command flakes",
-            "build",
-            r,
-            "--no-link",
-            "--print-out-paths",
-        ])
-        .output()
-        .await
-        .map_err(|e| DriverError::Transient(format!("nix build {r}: {e}")))?;
-    if !out.status.success() {
-        return Err(DriverError::Transient(format!(
-            "nix build {r} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if path.is_empty() {
-        return Err(DriverError::Transient(format!("nix build {r} printed no store path")));
-    }
-    Ok(PathBuf::from(path))
+    Ok(NspawnIdentity { id, _lock: lock })
 }
 
-// ── machine lifecycle ───────────────────────────────────────────────────────
+fn valid_instance_id(value: &str) -> bool {
+    value.len() == 32 && value.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
 
-/// The binaries nspawn operations go through. All privileged calls are
-/// `<sudo> -n <binary> …`; `machinectl list` runs unprivileged. Fields are
-/// injectable for tests (stub scripts on a temp PATH).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Bins {
     sudo: String,
-    nspawn: String,
-    systemd_run: String,
-    machinectl: String,
+    nix: String,
+    nix_store: String,
 }
 
 impl Bins {
     fn from_cfg(cfg: &ExecutionConfig) -> Self {
         Self {
             sudo: cfg.sudo_binary.clone(),
-            nspawn: "systemd-nspawn".to_string(),
-            systemd_run: "systemd-run".to_string(),
-            machinectl: "machinectl".to_string(),
+            nix: "nix".to_string(),
+            nix_store: "nix-store".to_string(),
         }
     }
 }
 
-/// Everything [`start`] needs to boot one run's machine.
+#[derive(Clone, Debug)]
+struct RunLease {
+    machine: String,
+    host_ip: String,
+}
+
+fn parse_lease(output: &str) -> Result<RunLease, DriverError> {
+    let fields: Vec<_> = output.split_whitespace().collect();
+    let [machine, _ifname, host_ip, _machine_ip] = fields.as_slice() else {
+        return Err(DriverError::Transient(format!(
+            "remoter-nspawnctl acquire returned invalid lease {output:?}"
+        )));
+    };
+    Ok(RunLease {
+        machine: (*machine).to_string(),
+        host_ip: (*host_ip).to_string(),
+    })
+}
+
 pub struct NspawnSpec<'a> {
     pub cfg: &'a ExecutionConfig,
-    /// Configured ACP driver kind; only Kimi needs config-file provisioning.
     pub driver_kind: &'a str,
-    /// The backend `agent_runs` row id — names the machine and its veth.
     pub run_id: i32,
-    /// The NixOS toplevel the machine boots (from [`resolve_closure`]).
-    pub closure: &'a Path,
-    /// Host directory mounted at `/work` (the ticket worktree, or the central
-    /// clone for a supervise run without a parent worktree).
     pub worktree: &'a Path,
-    /// The central clone (`p<id>/repo`); its `.git` is mounted at the same
-    /// absolute path inside the machine so worktree gitdir files resolve.
     pub repo: &'a Path,
-    /// Mounted at `/root` (agent config + session state survive runs here).
     pub agent_home: &'a Path,
-    /// Reference repos prepared for this run (docs/specs/cross-repo-projects.md)
-    /// — each is bind-mounted read-only at `/work/.refs/<mount_name>`.
     pub refs: &'a [RefMount],
 }
 
-/// The live machine of one run. Teardown is guaranteed: `teardown()` on the
-/// happy path, `Drop` (sync terminate + net-down) on cancellation/timeout.
+struct WorktreeLockGuard {
+    repo: PathBuf,
+    worktree: PathBuf,
+}
+
+impl WorktreeLockGuard {
+    fn new(repo: &Path, worktree: &Path) -> Self {
+        Self {
+            repo: repo.to_path_buf(),
+            worktree: worktree.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for WorktreeLockGuard {
+    fn drop(&mut self) {
+        if !self.repo.as_os_str().is_empty() {
+            let _ = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.repo)
+                .args(["worktree", "unlock"])
+                .arg(&self.worktree)
+                .output();
+        }
+    }
+}
+
 pub struct NspawnMachine {
     sudo: String,
-    machine: String,
-    ifname: String,
-    host_ip: String,
+    instance: String,
     run_id: i32,
-    /// Held for its Drop (pool release); the addresses live in the fields.
-    #[allow(dead_code)]
-    block: Option<NetBlock>,
+    machine: String,
+    host_ip: String,
+    lease_active: bool,
     worktree: PathBuf,
     repo: PathBuf,
-    /// Per-run temp dir: the networkd drop-in bind-mounted into the machine
-    /// plus the boot log. Must outlive the machine (the bind mount resolves
-    /// against it); removed on teardown.
     run_dir: PathBuf,
-    /// The `sudo systemd-nspawn` supervisor process. Kept so a dead boot is
-    /// detected during readiness waits and the child is reaped on teardown.
     child: Option<tokio::process::Child>,
 }
 
 impl NspawnMachine {
-    /// The machine name — the `systemd-run -M` target for agent commands.
     pub fn machine_name(&self) -> &str {
         &self.machine
     }
 
-    /// Terminate the machine, remove the host veth config, release the net
-    /// block, and unlock the worktree. Idempotent and best-effort per step —
-    /// a partial teardown still attempts the rest.
     pub async fn teardown(mut self) {
-        let machine = std::mem::take(&mut self.machine);
-        if !machine.is_empty() {
-            sudo_fire_and_forget(&self.sudo, &["machinectl", "terminate", &machine]).await;
-            if let Some(mut child) = self.child.take() {
-                // The supervisor exits once the machine is down; bound the
-                // wait so a wedged boot cannot hang run teardown.
-                let _ = tokio::time::timeout(TERMINATE_WAIT, child.wait()).await;
-                let _ = child.start_kill();
-            }
-            unregister_host_ip(self.run_id);
+        self.terminate_lease_async().await;
+        if let Some(mut child) = self.child.take() {
+            let _ = tokio::time::timeout(TERMINATE_WAIT, child.wait()).await;
+            kill_boot_process_group(&child);
+            let _ = child.wait().await;
         }
-        let ifname = std::mem::take(&mut self.ifname);
-        if !ifname.is_empty() {
-            sudo_fire_and_forget(&self.sudo, &[HELPER_BINARY, "net-down", &ifname, &self.host_ip]).await;
-        }
+        self.stop_lease_async().await;
+        unregister_host_ip(self.run_id);
         self.unlock_worktree().await;
-        let _ = std::fs::remove_dir_all(&self.run_dir);
+        self.remove_run_dir_if_released();
     }
 
-    /// Best-effort `git worktree unlock` — the lock is best-effort too.
+    async fn terminate_lease_async(&mut self) {
+        if !self.lease_active {
+            return;
+        }
+        let args = [
+            HELPER_BINARY.to_string(),
+            "terminate".to_string(),
+            self.instance.clone(),
+            self.run_id.to_string(),
+        ];
+        let _ = helper_output(&self.sudo, &args).await;
+    }
+
+    async fn stop_lease_async(&mut self) {
+        if !self.lease_active {
+            return;
+        }
+        let args = [
+            HELPER_BINARY.to_string(),
+            "stop".to_string(),
+            self.instance.clone(),
+            self.run_id.to_string(),
+        ];
+        if helper_output(&self.sudo, &args).await.is_ok() {
+            self.lease_active = false;
+        }
+    }
+
+    fn remove_run_dir_if_released(&self) {
+        if !self.lease_active {
+            let _ = std::fs::remove_dir_all(&self.run_dir);
+        }
+    }
+
     async fn unlock_worktree(&self) {
         if self.repo.as_os_str().is_empty() {
             return;
@@ -415,40 +296,28 @@ impl NspawnMachine {
             .await;
         match out {
             Ok(o) if o.status.success() => {}
-            Ok(o) => {
-                tracing::debug!(
-                    worktree = %self.worktree.display(),
-                    "git worktree unlock: {}",
-                    String::from_utf8_lossy(&o.stderr).trim()
-                );
-            }
+            Ok(o) => tracing::debug!(
+                worktree = %self.worktree.display(),
+                "git worktree unlock: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
             Err(e) => tracing::debug!(error = %e, "git worktree unlock failed to spawn"),
         }
     }
 }
 
 impl Drop for NspawnMachine {
-    /// Cancellation path: the run future is dropped (timeout, human cancel,
-    /// daemon shutdown within `cancel_grace_secs`). Sync terminate + net-down,
-    /// mirroring `RunContainers::drop`.
     fn drop(&mut self) {
-        if self.machine.is_empty() && self.ifname.is_empty() {
-            return;
+        if self.lease_active {
+            lease_command_sync(&self.sudo, "terminate", &self.instance, self.run_id);
         }
-        if !self.machine.is_empty() {
-            let _ = std::process::Command::new(&self.sudo)
-                .args(["-n", "machinectl", "terminate", &self.machine])
-                .output();
-            unregister_host_ip(self.run_id);
+        if let Some(child) = self.child.take() {
+            kill_boot_process_group(&child);
         }
-        if let Some(mut child) = self.child.take() {
-            let _ = child.start_kill();
+        if self.lease_active && lease_command_sync(&self.sudo, "stop", &self.instance, self.run_id) {
+            self.lease_active = false;
         }
-        if !self.ifname.is_empty() {
-            let _ = std::process::Command::new(&self.sudo)
-                .args(["-n", HELPER_BINARY, "net-down", &self.ifname, &self.host_ip])
-                .output();
-        }
+        unregister_host_ip(self.run_id);
         if !self.repo.as_os_str().is_empty() {
             let _ = std::process::Command::new("git")
                 .arg("-C")
@@ -457,31 +326,39 @@ impl Drop for NspawnMachine {
                 .arg(&self.worktree)
                 .output();
         }
-        let _ = std::fs::remove_dir_all(&self.run_dir);
+        self.remove_run_dir_if_released();
     }
 }
 
-/// Boots the run's machine, brings up its network, and waits until the
-/// machine accepts exec. Any failure tears down whatever came up and returns
-/// a transient error (machined hiccups, a stale closure are all retryable,
-/// spec §5.7); a broken config (bad closure ref, missing kimi key) is
-/// permanent.
+fn kill_boot_process_group(child: &tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+}
+
+fn lease_command_sync(sudo: &str, command: &str, instance: &str, run_id: i32) -> bool {
+    std::process::Command::new(sudo)
+        .arg("-n")
+        .args([HELPER_BINARY, command, instance, &run_id.to_string()])
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
 pub async fn start(spec: NspawnSpec<'_>) -> Result<NspawnMachine, DriverError> {
     let bins = Bins::from_cfg(spec.cfg);
-    // Lock the worktree against host-side cleanup (`git worktree remove`)
-    // while a machine has it mounted. Best-effort: locking the main checkout
-    // (supervise run in the central clone) fails harmlessly.
+    let lock_guard = WorktreeLockGuard::new(spec.repo, spec.worktree);
     let lock = tokio::process::Command::new("git")
         .arg("-C")
         .arg(spec.repo)
         .args(["worktree", "lock"])
         .arg(spec.worktree)
+        .kill_on_drop(true)
         .output()
         .await;
     match lock {
-        Ok(o) if o.status.success() => {
-            tracing::debug!(worktree = %spec.worktree.display(), "git worktree locked")
-        }
+        Ok(o) if o.status.success() => tracing::debug!(worktree = %spec.worktree.display(), "git worktree locked"),
         Ok(o) => tracing::debug!(
             worktree = %spec.worktree.display(),
             "git worktree lock: {}",
@@ -490,93 +367,83 @@ pub async fn start(spec: NspawnSpec<'_>) -> Result<NspawnMachine, DriverError> {
         Err(e) => tracing::debug!(error = %e, "git worktree lock failed to spawn"),
     }
 
-    if spec.driver_kind == "kimi-acp" {
-        crate::container::provision_kimi_config(spec.repo, spec.agent_home).map_err(DriverError::Permanent)?;
+    let result = async {
+        if spec.driver_kind == "kimi-acp" {
+            crate::container::provision_kimi_config(spec.repo, spec.agent_home).map_err(DriverError::Permanent)?;
+        }
+        start_inner(&spec, &bins).await
     }
-
-    let result = start_inner(&spec, &bins).await;
-    if result.is_err() {
-        // Roll back whatever came up; the guard was never handed out.
-        let _ = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(spec.repo)
-            .args(["worktree", "unlock"])
-            .arg(spec.worktree)
-            .output()
-            .await;
+    .await;
+    if result.is_ok() {
+        std::mem::forget(lock_guard);
     }
     result
 }
 
-async fn start_inner(spec: &NspawnSpec<'_>, bins: &Bins) -> Result<NspawnMachine, DriverError> {
-    let block = global_net_blocks(spec.cfg)?.allocate().ok_or_else(|| {
-        DriverError::Transient(format!("no free nspawn net block ({NET_POOL_BLOCKS} concurrent runs)"))
-    })?;
-    let machine = run_machine_name(spec.run_id);
-    let ifname = veth_name(spec.run_id);
-    let host_ip = block.host_ip();
+struct StartupGuard {
+    sudo: String,
+    instance: String,
+    run_id: i32,
+    run_dir: PathBuf,
+    lease_active: bool,
+}
 
+impl Drop for StartupGuard {
+    fn drop(&mut self) {
+        if self.lease_active {
+            self.lease_active = !lease_command_sync(&self.sudo, "stop", &self.instance, self.run_id);
+        }
+        if !self.lease_active {
+            let _ = std::fs::remove_dir_all(&self.run_dir);
+        }
+    }
+}
+
+async fn start_inner(spec: &NspawnSpec<'_>, bins: &Bins) -> Result<NspawnMachine, DriverError> {
+    let instance = instance_id(spec.cfg)?.to_string();
     let run_dir = std::env::temp_dir().join(format!("remoter-nspawn-{}-{}", std::process::id(), spec.run_id));
     let _ = std::fs::remove_dir_all(&run_dir);
-    let net_dir = write_network_dropin(&run_dir, &block)?;
+    std::fs::create_dir_all(&run_dir)
+        .map_err(|e| DriverError::Transient(format!("cannot create {}: {e}", run_dir.display())))?;
+    let mut startup = StartupGuard {
+        sudo: bins.sudo.clone(),
+        instance: instance.clone(),
+        run_id: spec.run_id,
+        run_dir: run_dir.clone(),
+        lease_active: false,
+    };
 
-    let git_dir = spec.repo.join(".git");
-    let mut args = vec![
-        bins.nspawn.clone(),
-        "--boot".to_string(),
-        format!("--machine={machine}"),
-        format!("--directory={}", spec.closure.display()),
-        "--register=yes".to_string(),
-        "--network-veth".to_string(),
-        // The host store *is* the package cache — read-only, shared live.
-        "--bind-ro=/nix/store".to_string(),
-        format!("--bind={}:{}", spec.worktree.display(), WORK_DIR),
-        // Same absolute host path inside the machine: the worktree's `.git`
-        // file points at `<repo>/.git/worktrees/<wt>`, and that path must
-        // resolve identically inside.
-        format!("--bind={}:{}", git_dir.display(), git_dir.display()),
-        format!("--bind={}:/root", spec.agent_home.display()),
-        // Per-run networkd config (static host0 address) — mounted over the
-        // closure's /etc/systemd/network before boot.
-        format!("--bind={}:/etc/systemd/network", net_dir.display()),
-    ];
-    // Reference repos (#169): read-only bind mounts at /work/.refs/<mount>,
-    // with the ref clone's `.git` at its absolute host path (like the main
-    // repo's above) — same contract as container.rs.
-    for r in spec.refs {
-        args.push(format!(
-            "--bind-ro={}:{WORK_DIR}/.refs/{}",
-            r.worktree.display(),
-            r.mount_name
-        ));
-        let ref_git = r.repo.join(".git");
-        args.push(format!("--bind-ro={}:{}", ref_git.display(), ref_git.display()));
-    }
+    let closure = resolve_closure_with_bins(spec.cfg, &run_dir.join("closure"), bins).await?;
+    startup.lease_active = true;
+    let lease = acquire_lease(bins, &instance, spec.run_id, &spec.cfg.nspawn_net_pool_base).await?;
+    let mut guard = NspawnMachine {
+        sudo: bins.sudo.clone(),
+        instance: instance.clone(),
+        run_id: spec.run_id,
+        machine: lease.machine,
+        host_ip: lease.host_ip,
+        lease_active: true,
+        worktree: spec.worktree.to_path_buf(),
+        repo: spec.repo.to_path_buf(),
+        run_dir: run_dir.clone(),
+        child: None,
+    };
+    std::mem::forget(startup);
 
     let boot_log_path = run_dir.join("boot.log");
     let boot_log = std::fs::File::create(&boot_log_path)
         .map_err(|e| DriverError::Transient(format!("nspawn boot log {}: {e}", boot_log_path.display())))?;
+    let args = boot_args(&instance, spec.run_id, &closure, spec);
     let child = tokio::process::Command::new(&bins.sudo)
         .arg("-n")
         .args(&args)
+        .process_group(0)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(boot_log))
         .spawn()
-        .map_err(|e| DriverError::Transient(format!("sudo -n {} …: {e}", bins.nspawn)))?;
-
-    let mut guard = NspawnMachine {
-        sudo: bins.sudo.clone(),
-        machine,
-        ifname,
-        host_ip,
-        run_id: spec.run_id,
-        block: Some(block),
-        worktree: spec.worktree.to_path_buf(),
-        repo: spec.repo.to_path_buf(),
-        run_dir,
-        child: Some(child),
-    };
+        .map_err(|e| DriverError::Transient(format!("sudo -n {HELPER_BINARY} boot: {e}")))?;
+    guard.child = Some(child);
 
     let ready = async {
         net_up(bins, &mut guard, &boot_log_path).await?;
@@ -591,17 +458,51 @@ async fn start_inner(spec: &NspawnSpec<'_>, bins: &Bins) -> Result<NspawnMachine
     Ok(guard)
 }
 
-/// `remoter-nspawnctl net-up <ifname> <host_ip> <prefix>` — idempotent (the
-/// helper tolerates an existing address), retried until nspawn has created
-/// the host side of the veth pair.
+fn instance_id(cfg: &ExecutionConfig) -> Result<&str, DriverError> {
+    cfg.nspawn_instance_id
+        .as_deref()
+        .filter(|id| valid_instance_id(id))
+        .ok_or_else(|| DriverError::Permanent("nspawn daemon instance identity is not initialized".to_string()))
+}
+
+async fn acquire_lease(bins: &Bins, instance: &str, run_id: i32, pool_base: &str) -> Result<RunLease, DriverError> {
+    let args = [
+        HELPER_BINARY.to_string(),
+        "acquire".to_string(),
+        instance.to_string(),
+        run_id.to_string(),
+        pool_base.to_string(),
+    ];
+    parse_lease(&helper(&bins.sudo, &args).await?)
+}
+
+fn boot_args(instance: &str, run_id: i32, closure: &Path, spec: &NspawnSpec<'_>) -> Vec<String> {
+    let mut args = vec![
+        HELPER_BINARY.to_string(),
+        "boot".to_string(),
+        instance.to_string(),
+        run_id.to_string(),
+        closure.to_string_lossy().into_owned(),
+        spec.worktree.to_string_lossy().into_owned(),
+        spec.repo.to_string_lossy().into_owned(),
+        spec.agent_home.to_string_lossy().into_owned(),
+    ];
+    for r in spec.refs {
+        args.push("--ref".to_string());
+        args.push(r.mount_name.clone());
+        args.push(r.worktree.to_string_lossy().into_owned());
+        args.push(r.repo.to_string_lossy().into_owned());
+    }
+    args
+}
+
 async fn net_up(bins: &Bins, guard: &mut NspawnMachine, boot_log: &Path) -> Result<(), DriverError> {
     let deadline = std::time::Instant::now() + NET_UP_TIMEOUT;
     let args = [
         HELPER_BINARY.to_string(),
         "net-up".to_string(),
-        guard.ifname.clone(),
-        guard.host_ip.clone(),
-        NET_PREFIX_LEN.to_string(),
+        guard.instance.clone(),
+        guard.run_id.to_string(),
     ];
     loop {
         if let Some(dead) = boot_died(guard, boot_log) {
@@ -609,30 +510,24 @@ async fn net_up(bins: &Bins, guard: &mut NspawnMachine, boot_log: &Path) -> Resu
                 "nspawn machine died during network setup: {dead}"
             )));
         }
-        match sudo(bins, &args).await {
+        match helper(&bins.sudo, &args).await {
             Ok(_) => return Ok(()),
-            Err(e) if std::time::Instant::now() >= deadline => {
-                return Err(e.context("nspawn net-up"));
-            }
+            Err(e) if std::time::Instant::now() >= deadline => return Err(e.context("nspawn net-up")),
             _ => tokio::time::sleep(Duration::from_millis(500)).await,
         }
     }
 }
 
-/// Machine-level readiness: retry a trivial exec until the machine accepts
-/// `systemd-run -M … --pipe` or the budget runs out. The daemon deliberately
-/// waits on nothing else — project services are the project's own devenv
-/// processes, brought up by `run.rs` after the boot.
 async fn wait_machine_ready(bins: &Bins, guard: &mut NspawnMachine, boot_log: &Path) -> Result<(), DriverError> {
     let deadline = std::time::Instant::now() + MACHINE_READY_TIMEOUT;
-    let args = exec_args(bins, &guard.machine, &["true"]);
+    let args = exec_args(&guard.instance, guard.run_id, &["true"]);
     loop {
         if let Some(dead) = boot_died(guard, boot_log) {
             return Err(DriverError::Transient(format!(
                 "nspawn machine died before it accepted exec: {dead}"
             )));
         }
-        match sudo(bins, &args).await {
+        match helper(&bins.sudo, &args).await {
             Ok(_) => return Ok(()),
             Err(e) if std::time::Instant::now() >= deadline => {
                 return Err(DriverError::Transient(format!(
@@ -646,25 +541,18 @@ async fn wait_machine_ready(bins: &Bins, guard: &mut NspawnMachine, boot_log: &P
     }
 }
 
-/// `systemd-run -M <machine> --pipe --quiet --wait --collect -- <cmd…>` — the
-/// same exec contract `workspace::wrap_command` uses per ACP turn.
-fn exec_args(bins: &Bins, machine: &str, cmd: &[&str]) -> Vec<String> {
+fn exec_args(instance: &str, run_id: i32, cmd: &[&str]) -> Vec<String> {
     let mut args = vec![
-        bins.systemd_run.clone(),
-        "-M".to_string(),
-        machine.to_string(),
-        "--pipe".to_string(),
-        "--quiet".to_string(),
-        "--wait".to_string(),
-        "--collect".to_string(),
+        HELPER_BINARY.to_string(),
+        "exec".to_string(),
+        instance.to_string(),
+        run_id.to_string(),
         "--".to_string(),
     ];
     args.extend(cmd.iter().map(|s| s.to_string()));
     args
 }
 
-/// A boot process that exited before readiness means the machine will never
-/// come up — fail fast with the boot log tail instead of riding the timeout.
 fn boot_died(guard: &mut NspawnMachine, boot_log: &Path) -> Option<String> {
     let child = guard.child.as_mut()?;
     let status = match child.try_wait() {
@@ -682,28 +570,16 @@ fn boot_died(guard: &mut NspawnMachine, boot_log: &Path) -> Option<String> {
     Some(format!("boot process exited with {status}: {}", tail.trim()))
 }
 
-/// The generated per-run networkd config: static host0 address from the
-/// run's /30, gateway (and DNS, via the helper's masquerade) at the host.
-/// Returns the directory to bind over `/etc/systemd/network`.
-fn write_network_dropin(run_dir: &Path, block: &NetBlock) -> Result<PathBuf, DriverError> {
-    let net_dir = run_dir.join("network");
-    std::fs::create_dir_all(&net_dir)
-        .map_err(|e| DriverError::Transient(format!("cannot create {}: {e}", net_dir.display())))?;
-    let conf = format!(
-        "[Match]\nName=host0\n\n[Network]\nAddress={}/{NET_PREFIX_LEN}\nGateway={}\nDNS=1.1.1.1\n",
-        block.machine_ip(),
-        block.host_ip()
-    );
-    std::fs::write(net_dir.join("10-host0.network"), conf)
-        .map_err(|e| DriverError::Transient(format!("cannot write network drop-in in {}: {e}", net_dir.display())))?;
-    Ok(net_dir)
+async fn helper(sudo: &str, args: &[String]) -> Result<String, DriverError> {
+    let out = helper_output(sudo, args).await?;
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// `<sudo> -n <args>` to success; stderr becomes a transient driver error.
-async fn sudo(bins: &Bins, args: &[String]) -> Result<String, DriverError> {
-    let out = tokio::process::Command::new(&bins.sudo)
+async fn helper_output(sudo: &str, args: &[String]) -> Result<std::process::Output, DriverError> {
+    let out = tokio::process::Command::new(sudo)
         .arg("-n")
         .args(args)
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| DriverError::Transient(format!("sudo -n {}: {e}", args.join(" "))))?;
@@ -714,73 +590,104 @@ async fn sudo(bins: &Bins, args: &[String]) -> Result<String, DriverError> {
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    Ok(out)
 }
 
-/// Teardown-style sudo call: logged at debug, never returned.
-async fn sudo_fire_and_forget(sudo_bin: &str, args: &[&str]) {
-    match tokio::process::Command::new(sudo_bin)
-        .arg("-n")
-        .args(args)
-        .output()
-        .await
-    {
-        Ok(o) if o.status.success() => {}
-        Ok(o) => tracing::debug!(
-            "sudo -n {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&o.stderr).trim()
-        ),
-        Err(e) => tracing::debug!(error = %e, "sudo -n {} failed to spawn", args.join(" ")),
+pub async fn resolve_closure(cfg: &ExecutionConfig, root_link: &Path) -> Result<PathBuf, DriverError> {
+    resolve_closure_with_bins(cfg, root_link, &Bins::from_cfg(cfg)).await
+}
+
+async fn resolve_closure_with_bins(
+    cfg: &ExecutionConfig,
+    root_link: &Path,
+    bins: &Bins,
+) -> Result<PathBuf, DriverError> {
+    let r = cfg.nspawn_closure_ref.trim();
+    if r.is_empty() {
+        return Err(DriverError::Permanent(
+            "execution.nspawn_closure_ref is empty".to_string(),
+        ));
     }
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    let _guard = LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+    let out = if let Some((_, attr)) = r.split_once('#') {
+        if attr.is_empty() {
+            return Err(DriverError::Permanent(format!(
+                "execution.nspawn_closure_ref {r:?} has an empty attribute"
+            )));
+        }
+        tokio::process::Command::new(&bins.nix)
+            .args([
+                "--extra-experimental-features",
+                "nix-command flakes",
+                "build",
+                r,
+                "--out-link",
+            ])
+            .arg(root_link)
+            .arg("--print-out-paths")
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|e| DriverError::Transient(format!("nix build {r}: {e}")))?
+    } else {
+        let requested = PathBuf::from(r.strip_prefix("path:").unwrap_or(r));
+        let path = std::fs::canonicalize(&requested).map_err(|e| {
+            DriverError::Permanent(format!("cannot resolve nspawn closure {}: {e}", requested.display()))
+        })?;
+        if !path.starts_with("/nix/store") || !path.is_dir() {
+            return Err(DriverError::Permanent(format!(
+                "nspawn closure {} must be a directory below /nix/store",
+                path.display()
+            )));
+        }
+        tokio::process::Command::new(&bins.nix_store)
+            .arg("--realise")
+            .arg(&path)
+            .arg("--add-root")
+            .arg(root_link)
+            .arg("--indirect")
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|e| DriverError::Transient(format!("nix-store --realise {}: {e}", path.display())))?
+    };
+    if !out.status.success() {
+        return Err(DriverError::Transient(format!(
+            "nspawn closure realization failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let path = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| PathBuf::from(line.trim()))
+        .ok_or_else(|| DriverError::Transient("nspawn closure realization printed no store path".to_string()))?;
+    if !path.join("init").is_file() {
+        return Err(DriverError::Transient(format!(
+            "nspawn closure {} has no init",
+            path.display()
+        )));
+    }
+    Ok(path)
 }
 
-/// Startup sweep (spec §5.7): `machinectl terminate` every `rr-*` machine —
-/// leftovers of a crashed daemon. `machinectl list` works unprivileged; the
-/// terminate goes through sudo. Best-effort, never fails the caller.
 pub async fn sweep(cfg: &ExecutionConfig) {
-    sweep_with_bins(&Bins::from_cfg(cfg)).await;
-}
-
-async fn sweep_with_bins(bins: &Bins) {
-    let out = tokio::process::Command::new(&bins.machinectl)
-        .args(["list", "--output=json"])
-        .output()
-        .await;
-    let stdout = match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-        Ok(o) => {
-            tracing::warn!(
-                "nspawn sweep: machinectl list failed: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-            return;
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "nspawn sweep: machinectl list failed to spawn");
-            return;
-        }
-    };
-    let machines: Vec<serde_json::Value> = match serde_json::from_str(&stdout) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(error = %e, "nspawn sweep: cannot parse machinectl list JSON");
-            return;
-        }
-    };
-    for machine in machines {
-        let Some(name) = machine.get("machine").and_then(|m| m.as_str()) else {
-            continue;
-        };
-        if !is_run_machine(name) {
-            continue;
-        }
-        tracing::info!(machine = %name, "startup sweep: terminating orphaned nspawn machine");
-        sudo_fire_and_forget(&bins.sudo, &["machinectl", "terminate", name]).await;
+    let bins = Bins::from_cfg(cfg);
+    if let Err(e) = sweep_with_bins(cfg, &bins).await {
+        tracing::warn!("nspawn sweep: {e}");
     }
 }
 
-/// Extra context for error messages.
+async fn sweep_with_bins(cfg: &ExecutionConfig, bins: &Bins) -> Result<(), DriverError> {
+    let args = [
+        HELPER_BINARY.to_string(),
+        "sweep".to_string(),
+        instance_id(cfg)?.to_string(),
+    ];
+    helper(&bins.sudo, &args).await.map(|_| ())
+}
+
 trait Context {
     fn context(self, what: &str) -> DriverError;
 }
@@ -799,26 +706,15 @@ impl Context for DriverError {
 mod tests {
     use super::*;
 
-    #[test]
-    fn machine_and_veth_names_fit_ifnamsiz() {
-        assert_eq!(run_machine_name(42), "rr-42");
-        assert_eq!(veth_name(42), "ve-rr-42");
-        // IFNAMSIZ-1 = 15: even a 9-digit run id fits with room to spare.
-        assert!(veth_name(999_999_999).len() <= 15);
-        assert!(is_run_machine("rr-42"));
-        assert!(!is_run_machine("rr-"));
-        assert!(!is_run_machine("rr-web"));
-        assert!(!is_run_machine("remoter-run-42"));
-        assert!(!is_run_machine("debian"));
-    }
+    const INSTANCE: &str = "0123456789abcdef0123456789abcdef";
 
-    #[test]
-    fn parse_systemd_version_reads_the_first_line() {
-        assert_eq!(parse_systemd_version("systemd 257 (257.9)\n+PAM +AUDIT"), Some(257));
-        assert_eq!(parse_systemd_version("systemd 256\n"), Some(256));
-        assert_eq!(parse_systemd_version("garbage"), None);
-        assert_eq!(parse_systemd_version(""), None);
-        assert_eq!(parse_systemd_version("systemd (257)"), None);
+    fn test_cfg() -> ExecutionConfig {
+        ExecutionConfig {
+            mode: crate::config::ExecutionMode::Nspawn,
+            nspawn_closure_ref: "test#agentContainer".to_string(),
+            nspawn_instance_id: Some(INSTANCE.to_string()),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -828,14 +724,7 @@ mod tests {
         assert_eq!(get("CI"), Some("1"));
         assert_eq!(get("REMOTER_EXECUTION"), Some("nspawn"));
         assert_eq!(get("REMOTER_AGENT_TASK_ID"), Some("7"));
-        assert_eq!(env.len(), 3, "{env:?}");
-        // The daemon provides no project services in nspawn mode: no
-        // `*_DATABASE_URL`s (the project's devenv.nix defines its own) and no
-        // `REMOTER_AGENT_PORT_BASE` (the machine's netns is private to the
-        // run, so default ports are safe).
-        assert!(env.iter().all(|(k, _)| !k.ends_with("DATABASE_URL")));
-        assert!(env.iter().all(|(k, _)| k != "REMOTER_AGENT_PORT_BASE"));
-        assert!(env.iter().all(|(k, _)| k != "REMOTER_CONTAINER"));
+        assert_eq!(env.len(), 3);
     }
 
     #[test]
@@ -864,84 +753,22 @@ mod tests {
             nspawn_api_url("http://localhost.evil.com", "10.231.8.1"),
             "http://localhost.evil.com"
         );
-        assert_eq!(
-            nspawn_api_url("https://example.com/localhost", "10.231.8.1"),
-            "https://example.com/localhost"
-        );
     }
 
     #[test]
-    fn net_blocks_allocate_distinct_and_release_on_drop() {
-        let pool = NetBlocks::new("10.231").unwrap();
-        let a = pool.allocate().unwrap();
-        let b = pool.allocate().unwrap();
-        assert_eq!(a.host_ip(), "10.231.0.1");
-        assert_eq!(a.machine_ip(), "10.231.0.2");
-        assert_eq!(b.host_ip(), "10.231.4.1");
-        assert_eq!(pool.allocated_count(), 2);
-        drop(a);
-        assert_eq!(pool.allocated_count(), 1);
-        // The released block is handed out again.
-        let c = pool.allocate().unwrap();
-        assert_eq!(c.host_ip(), "10.231.0.1");
-    }
-
-    #[test]
-    fn net_blocks_exhaust_and_validate_base() {
-        let pool = NetBlocks::new("10.231").unwrap();
-        let blocks: Vec<_> = (0..NET_POOL_BLOCKS).map(|_| pool.allocate().unwrap()).collect();
-        assert_eq!(blocks.len() as u32, NET_POOL_BLOCKS);
-        assert!(pool.allocate().is_none());
-        // Highest block stays inside the /16: 4*(64-1)+3 = 255.
-        assert_eq!(blocks[63].machine_ip(), "10.231.252.2");
-
-        assert!(NetBlocks::new("10.231.1").is_err());
-        assert!(NetBlocks::new("10").is_err());
-        assert!(NetBlocks::new("10.x").is_err());
-        assert!(NetBlocks::new("10.300").is_err());
-    }
-
-    #[test]
-    fn network_dropin_carries_the_block_addresses() {
-        let pool = NetBlocks::new("10.231").unwrap();
-        let block = pool.allocate().unwrap();
-        let dir = std::env::temp_dir().join(format!("remoter-nspawn-dropin-{}", std::process::id()));
+    fn instance_identity_is_persistent_and_exclusively_locked() {
+        let dir = std::env::temp_dir().join(format!("remoter-nspawn-identity-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let net_dir = write_network_dropin(&dir, &block).unwrap();
-        let conf = std::fs::read_to_string(net_dir.join("10-host0.network")).unwrap();
-        assert!(conf.contains("Name=host0"), "{conf}");
-        assert!(conf.contains("Address=10.231.0.2/30"), "{conf}");
-        assert!(conf.contains("Gateway=10.231.0.1"), "{conf}");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// Stub `sudo`: records every argv line; the boot command (`-n
-    /// systemd-nspawn …`) is replaced by a short-lived sleep so the guard's
-    /// child handling has a live process; everything else exits 0 (readiness
-    /// probes succeed immediately, terminate/net-down are recorded).
-    fn stub_sudo(dir: &Path) -> PathBuf {
-        let stub = dir.join("sudo-stub.sh");
-        crate::testutil::write_executable_script(
-            &stub,
-            &format!(
-                "#!/bin/sh\necho \"$*\" >> '{}'\nif [ \"$1\" = \"-n\" ] && [ \"$2\" = \"systemd-nspawn\" ]; then exec sleep 2; fi\nexit 0\n",
-                dir.join("sudo.log").display()
-            ),
+        let identity = lock_instance(&dir).unwrap();
+        assert!(valid_instance_id(identity.id()));
+        assert!(lock_instance(&dir).is_err());
+        let id = identity.id().to_string();
+        drop(identity);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("nspawn-instance-id")).unwrap().trim(),
+            id
         );
-        stub
-    }
-
-    fn test_spec<'a>(cfg: &'a ExecutionConfig, run_id: i32, paths: &'a TestPaths) -> NspawnSpec<'a> {
-        NspawnSpec {
-            cfg,
-            driver_kind: "stub",
-            run_id,
-            closure: &paths.closure,
-            worktree: &paths.worktree,
-            repo: &paths.repo,
-            agent_home: &paths.agent_home,
-            refs: &[],
-        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     struct TestPaths {
@@ -966,6 +793,7 @@ mod tests {
             for d in [&paths.closure, &paths.worktree, &paths.repo, &paths.agent_home] {
                 std::fs::create_dir_all(d).unwrap();
             }
+            std::fs::write(paths.closure.join("init"), "#!/bin/sh\n").unwrap();
             paths
         }
     }
@@ -976,209 +804,380 @@ mod tests {
         }
     }
 
-    fn bins_for(sudo_stub: &Path) -> Bins {
+    fn test_spec<'a>(cfg: &'a ExecutionConfig, run_id: i32, paths: &'a TestPaths) -> NspawnSpec<'a> {
+        NspawnSpec {
+            cfg,
+            driver_kind: "stub",
+            run_id,
+            worktree: &paths.worktree,
+            repo: &paths.repo,
+            agent_home: &paths.agent_home,
+            refs: &[],
+        }
+    }
+
+    fn stub_sudo(dir: &Path, boot_succeeds: bool) -> PathBuf {
+        let stub = dir.join("sudo-stub.sh");
+        let net_up = if boot_succeeds {
+            ""
+        } else {
+            "if [ \"$3\" = net-up ]; then exit 1; fi\n"
+        };
+        let boot = if boot_succeeds { "exec sleep 2" } else { "exit 1" };
+        crate::testutil::write_executable_script(
+            &stub,
+            &format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\nif [ \"$3\" = acquire ]; then echo 'rr-0 ve-rr-0 10.231.0.1 10.231.0.2'; exit 0; fi\nif [ \"$3\" = boot ]; then {boot}; fi\n{net_up}exit 0\n",
+                dir.join("sudo.log").display()
+            ),
+        );
+        stub
+    }
+
+    fn bins_for(paths: &TestPaths, sudo: &Path) -> Bins {
+        let nix = paths.root.join("nix-stub.sh");
+        crate::testutil::write_executable_script(
+            &nix,
+            &format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\necho '{}'\n",
+                paths.root.join("nix.log").display(),
+                paths.closure.display()
+            ),
+        );
         Bins {
-            sudo: sudo_stub.to_string_lossy().into_owned(),
-            nspawn: "systemd-nspawn".to_string(),
-            systemd_run: "systemd-run".to_string(),
-            machinectl: "machinectl".to_string(),
+            sudo: sudo.to_string_lossy().into_owned(),
+            nix: nix.to_string_lossy().into_owned(),
+            nix_store: "nix-store".to_string(),
         }
     }
 
     #[tokio::test]
-    async fn start_boots_with_the_mount_contract_and_teardown_cleans_up() {
+    async fn start_boots_through_the_helper_and_teardown_cleans_up() {
         let paths = TestPaths::new("start");
-        let sudo_stub = stub_sudo(&paths.root);
-        let cfg = ExecutionConfig::default();
-        let bins = bins_for(&sudo_stub);
-
+        let sudo = stub_sudo(&paths.root, true);
+        let cfg = test_cfg();
+        let bins = bins_for(&paths, &sudo);
         let guard = start_inner(&test_spec(&cfg, 77, &paths), &bins).await.unwrap();
-        assert_eq!(guard.machine_name(), "rr-77");
-        // exec_env's API-URL rewrite resolves through the registry.
+        assert_eq!(guard.machine_name(), "rr-0");
         assert_eq!(
             nspawn_api_url_for("http://localhost:8181", 77),
-            format!("http://{}:8181", guard.host_ip)
+            "http://10.231.0.1:8181"
         );
-
         let log = std::fs::read_to_string(paths.root.join("sudo.log")).unwrap();
-        // Boot argv: machine name, closure rootfs, private veth, and the
-        // mount contract (host store ro, worktree at /work, repo .git at its
-        // host path, agent home at /root, networkd drop-in).
-        let boot = format!(
-            "-n systemd-nspawn --boot --machine=rr-77 --directory={}",
-            paths.closure.display()
-        );
-        assert!(log.contains(&boot), "{log}");
-        assert!(
-            log.contains("--register=yes --network-veth --bind-ro=/nix/store"),
-            "{log}"
-        );
-        assert!(
-            log.contains(&format!("--bind={}:{}", paths.worktree.display(), WORK_DIR)),
-            "{log}"
-        );
-        let git_dir = paths.repo.join(".git");
-        assert!(
-            log.contains(&format!("--bind={}:{}", git_dir.display(), git_dir.display())),
-            "{log}"
-        );
-        assert!(
-            log.contains(&format!("--bind={}:/root", paths.agent_home.display())),
-            "{log}"
-        );
-        assert!(
-            log.contains(&format!(
-                "--bind={}/network:/etc/systemd/network",
-                guard.run_dir.display()
-            )),
-            "{log}"
-        );
-        // Host veth config via the pinned helper interface.
-        assert!(
-            log.contains(&format!("-n remoter-nspawnctl net-up ve-rr-77 {} 30", guard.host_ip)),
-            "{log}"
-        );
-        // Readiness is a single machine-level exec probe — the daemon waits
-        // on no project services (those are the project's own devenv
-        // processes, brought up by run.rs after the boot).
-        assert!(
-            log.contains("-n systemd-run -M rr-77 --pipe --quiet --wait --collect -- true"),
-            "{log}"
-        );
-        assert!(!log.contains("pg_isready"), "{log}");
-        assert!(!log.contains("systemctl is-active"), "{log}");
-        // The networkd drop-in is live while the machine runs.
-        let conf = std::fs::read_to_string(guard.run_dir.join("network/10-host0.network")).unwrap();
-        assert!(conf.contains(&format!("Gateway={}", guard.host_ip)), "{conf}");
-
+        assert!(log.contains(&format!("remoter-nspawnctl acquire {INSTANCE} 77 10.231")));
+        assert!(log.contains(&format!(
+            "remoter-nspawnctl boot {INSTANCE} 77 {} {} {} {}",
+            paths.closure.display(),
+            paths.worktree.display(),
+            paths.repo.display(),
+            paths.agent_home.display()
+        )));
+        assert!(log.contains(&format!("remoter-nspawnctl net-up {INSTANCE} 77")));
+        assert!(log.contains(&format!("remoter-nspawnctl exec {INSTANCE} 77 -- true")));
+        assert!(!log.contains("systemd-nspawn"));
+        assert!(!log.contains("systemd-run"));
+        assert!(!log.contains("machinectl"));
+        let nix_log = std::fs::read_to_string(paths.root.join("nix.log")).unwrap();
+        assert!(nix_log.contains("--out-link"), "{nix_log}");
+        assert!(!nix_log.contains("--no-link"), "{nix_log}");
+        let run_dir = guard.run_dir.clone();
         guard.teardown().await;
         let log = std::fs::read_to_string(paths.root.join("sudo.log")).unwrap();
-        assert!(log.contains("-n machinectl terminate rr-77"), "{log}");
-        assert!(log.contains("-n remoter-nspawnctl net-down ve-rr-77"), "{log}");
-        assert_eq!(host_ip_for(77), None, "teardown unregisters the host IP");
+        assert!(log.contains(&format!("remoter-nspawnctl stop {INSTANCE} 77")));
+        assert_eq!(host_ip_for(77), None);
+        assert!(!run_dir.exists());
     }
 
     #[tokio::test]
-    async fn drop_without_teardown_still_terminates_and_nets_down() {
+    async fn drop_without_teardown_still_stops_the_lease() {
         let paths = TestPaths::new("drop");
-        let sudo_stub = stub_sudo(&paths.root);
-        let cfg = ExecutionConfig::default();
-        let bins = bins_for(&sudo_stub);
-
+        let sudo = stub_sudo(&paths.root, true);
+        let cfg = test_cfg();
+        let bins = bins_for(&paths, &sudo);
         let guard = start_inner(&test_spec(&cfg, 78, &paths), &bins).await.unwrap();
         let run_dir = guard.run_dir.clone();
         drop(guard);
         let log = std::fs::read_to_string(paths.root.join("sudo.log")).unwrap();
-        assert!(log.contains("-n machinectl terminate rr-78"), "{log}");
-        assert!(log.contains("-n remoter-nspawnctl net-down ve-rr-78"), "{log}");
+        assert!(log.contains(&format!("remoter-nspawnctl stop {INSTANCE} 78")));
         assert_eq!(host_ip_for(78), None);
-        assert!(!run_dir.exists(), "drop removes the per-run temp dir");
+        assert!(!run_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn drop_kills_an_unregistered_boot_process_group() {
+        let paths = TestPaths::new("drop-unregistered");
+        let sudo = paths.root.join("sudo-boot-group.sh");
+        crate::testutil::write_executable_script(
+            &sudo,
+            &format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\nif [ \"$3\" = acquire ]; then echo 'rr-0 ve-rr-0 10.231.0.1 10.231.0.2'; exit 0; fi\nif [ \"$3\" = boot ]; then sleep 30 & echo $! > '{}'; wait; fi\nexit 0\n",
+                paths.root.join("sudo.log").display(),
+                paths.root.join("boot.pid").display()
+            ),
+        );
+        let bins = bins_for(&paths, &sudo);
+        let cfg = test_cfg();
+        let guard = start_inner(&test_spec(&cfg, 83, &paths), &bins).await.unwrap();
+        let pid = std::fs::read_to_string(paths.root.join("boot.pid")).unwrap();
+        let pid = pid.trim();
+        drop(guard);
+
+        let mut reaped = false;
+        for _ in 0..100 {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", pid])
+                .output()
+                .unwrap();
+            let state = String::from_utf8_lossy(&out.stdout);
+            if state.trim().is_empty() || state.starts_with('Z') {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(reaped, "unregistered boot process {pid} is still running");
     }
 
     #[tokio::test]
     async fn failed_readiness_rolls_back_the_boot() {
         let paths = TestPaths::new("rollback");
-        // sudo stub: everything fails → net-up never succeeds; the boot
-        // process (sleep) outlives the probe loop only if we bail on time.
-        // Make the boot die instantly instead: readiness waits fail fast on
-        // the dead child, and the rollback path runs.
-        let stub = paths.root.join("sudo-stub.sh");
+        let sudo = stub_sudo(&paths.root, false);
+        let cfg = test_cfg();
+        let bins = bins_for(&paths, &sudo);
+        let err = start_inner(&test_spec(&cfg, 79, &paths), &bins).await.err().unwrap();
+        assert!(err.to_string().contains("died"), "{err}");
+        let log = std::fs::read_to_string(paths.root.join("sudo.log")).unwrap();
+        assert!(log.contains(&format!("remoter-nspawnctl stop {INSTANCE} 79")));
+    }
+
+    #[tokio::test]
+    async fn cancelling_closure_realization_removes_the_run_root() {
+        let paths = TestPaths::new("cancel-closure");
+        let nix = paths.root.join("nix-hang.sh");
+        crate::testutil::write_executable_script(&nix, "#!/bin/sh\nsleep 30\n");
+        let bins = Bins {
+            sudo: "sudo".to_string(),
+            nix: nix.to_string_lossy().into_owned(),
+            nix_store: "nix-store".to_string(),
+        };
+        let cfg = test_cfg();
+        let run_dir = std::env::temp_dir().join(format!("remoter-nspawn-{}-81", std::process::id()));
+        let spec = test_spec(&cfg, 81, &paths);
+        let mut future = Box::pin(start_inner(&spec, &bins));
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            _ = &mut future => panic!("closure realization unexpectedly completed"),
+        }
+        drop(future);
+        assert!(!run_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn cancelling_lease_acquisition_stops_and_removes_startup_state() {
+        let paths = TestPaths::new("cancel-acquire");
+        let sudo = paths.root.join("sudo-hang.sh");
         crate::testutil::write_executable_script(
-            &stub,
+            &sudo,
             &format!(
-                "#!/bin/sh\necho \"$*\" >> '{}'\nif [ \"$1\" = \"-n\" ] && [ \"$2\" = \"systemd-nspawn\" ]; then exit 1; fi\nexit 0\n",
+                "#!/bin/sh\necho \"$*\" >> '{}'\nif [ \"$3\" = acquire ]; then sleep 30; fi\nexit 0\n",
                 paths.root.join("sudo.log").display()
             ),
         );
-        let cfg = ExecutionConfig::default();
-        let bins = bins_for(&stub);
-
-        let err = start_inner(&test_spec(&cfg, 79, &paths), &bins).await.err().unwrap();
-        let msg = err.to_string();
-        assert!(msg.contains("died"), "{msg}");
+        let bins = bins_for(&paths, &sudo);
+        let cfg = test_cfg();
+        let run_dir = std::env::temp_dir().join(format!("remoter-nspawn-{}-82", std::process::id()));
+        let spec = test_spec(&cfg, 82, &paths);
+        let mut future = Box::pin(start_inner(&spec, &bins));
+        for _ in 0..100 {
+            let started = std::fs::read_to_string(paths.root.join("sudo.log"))
+                .is_ok_and(|log| log.contains(&format!("remoter-nspawnctl acquire {INSTANCE} 82")));
+            if started {
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                _ = &mut future => panic!("lease acquisition unexpectedly completed"),
+            }
+        }
+        drop(future);
+        assert!(!run_dir.exists());
         let log = std::fs::read_to_string(paths.root.join("sudo.log")).unwrap();
-        assert!(log.contains("-n machinectl terminate rr-79"), "{log}");
-        assert!(log.contains("-n remoter-nspawnctl net-down ve-rr-79"), "{log}");
+        assert!(log.contains(&format!("remoter-nspawnctl stop {INSTANCE} 82")), "{log}");
     }
 
     #[tokio::test]
-    async fn sweep_terminates_only_remoter_run_machines() {
-        let dir = std::env::temp_dir().join(format!("remoter-nspawn-sweep-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let sudo_stub = stub_sudo(&dir);
-        let machinectl = dir.join("machinectl-stub.sh");
-        crate::testutil::write_executable_script(
-            &machinectl,
-            "#!/bin/sh\nprintf '%s' '[{\"machine\":\"rr-9\",\"class\":\"container\"},{\"machine\":\"debian\",\"class\":\"container\"},{\"machine\":\"rr-web\",\"class\":\"container\"},{\"machine\":\"rr-\",\"class\":\"container\"}]'\n",
-        );
-        let bins = Bins {
-            machinectl: machinectl.to_string_lossy().into_owned(),
-            ..bins_for(&sudo_stub)
+    async fn provisioning_failure_unlocks_the_worktree() {
+        let paths = TestPaths::new("provision-lock");
+        std::fs::remove_dir(&paths.worktree).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&paths.repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
-        sweep_with_bins(&bins).await;
-        let log = std::fs::read_to_string(dir.join("sudo.log")).unwrap();
-        assert!(log.contains("-n machinectl terminate rr-9"), "{log}");
-        assert!(!log.contains("debian"), "{log}");
-        assert!(!log.contains("rr-web"), "{log}");
-        std::fs::remove_dir_all(&dir).ok();
+        git(&["init"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(paths.repo.join("tracked"), "content\n").unwrap();
+        git(&["add", "tracked"]);
+        git(&["commit", "-m", "initial"]);
+        git(&["worktree", "add", "--detach", paths.worktree.to_str().unwrap()]);
+        std::fs::create_dir_all(paths.repo.join(".remoter")).unwrap();
+        std::fs::write(paths.repo.join(".remoter/kimi-config.toml"), "model = 'test'\n").unwrap();
+        std::fs::remove_dir_all(&paths.agent_home).unwrap();
+        std::fs::write(&paths.agent_home, "not a directory").unwrap();
+        let cfg = test_cfg();
+        let mut spec = test_spec(&cfg, 80, &paths);
+        spec.driver_kind = "kimi-acp";
+
+        assert!(start(spec).await.is_err());
+
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&paths.repo)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&out.stdout);
+        assert!(!listing.contains("locked"), "{listing}");
     }
 
     #[tokio::test]
-    async fn sweep_tolerates_a_failing_machinectl() {
-        let dir = std::env::temp_dir().join(format!("remoter-nspawn-sweep-fail-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let sudo_stub = stub_sudo(&dir);
-        let machinectl = dir.join("machinectl-stub.sh");
-        crate::testutil::write_executable_script(&machinectl, "#!/bin/sh\nexit 1\n");
-        let bins = Bins {
-            machinectl: machinectl.to_string_lossy().into_owned(),
-            ..bins_for(&sudo_stub)
-        };
-        sweep_with_bins(&bins).await; // must not panic
-        assert!(!dir.join("sudo.log").exists(), "no terminate without a listing");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn resolve_closure_accepts_an_existing_directory() {
-        let dir = std::env::temp_dir().join(format!("remoter-nspawn-closure-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let cfg = ExecutionConfig {
-            nspawn_closure_ref: dir.to_string_lossy().into_owned(),
-            ..Default::default()
-        };
-        assert_eq!(resolve_closure(&cfg).await.unwrap(), dir);
-        let missing = ExecutionConfig {
-            nspawn_closure_ref: dir.join("nope").to_string_lossy().into_owned(),
-            ..Default::default()
-        };
-        assert!(resolve_closure(&missing).await.is_err());
-        std::fs::remove_dir_all(&dir).ok();
+    async fn sweep_is_scoped_to_the_daemon_instance() {
+        let paths = TestPaths::new("sweep");
+        let sudo = stub_sudo(&paths.root, true);
+        let cfg = test_cfg();
+        let bins = bins_for(&paths, &sudo);
+        sweep_with_bins(&cfg, &bins).await.unwrap();
+        let log = std::fs::read_to_string(paths.root.join("sudo.log")).unwrap();
+        assert!(log.contains(&format!("remoter-nspawnctl sweep {INSTANCE}")));
+        assert!(!log.contains("machinectl"));
     }
 
     #[test]
-    fn exec_args_match_the_wrap_command_contract() {
-        let bins = Bins {
-            sudo: "sudo".to_string(),
-            nspawn: "systemd-nspawn".to_string(),
-            systemd_run: "systemd-run".to_string(),
-            machinectl: "machinectl".to_string(),
-        };
+    fn exec_args_use_the_helper_contract() {
         assert_eq!(
-            exec_args(&bins, "rr-5", &["true"]),
-            [
-                "systemd-run",
-                "-M",
-                "rr-5",
-                "--pipe",
-                "--quiet",
-                "--wait",
-                "--collect",
-                "--",
-                "true"
-            ]
+            exec_args(INSTANCE, 5, &["true"]),
+            [HELPER_BINARY, "exec", INSTANCE, "5", "--", "true"]
         );
+    }
+
+    #[test]
+    fn lease_parser_requires_all_addresses() {
+        let lease = parse_lease("rr-2 ve-rr-2 10.231.8.1 10.231.8.2").unwrap();
+        assert_eq!(lease.machine, "rr-2");
+        assert_eq!(lease.host_ip, "10.231.8.1");
+        assert!(parse_lease("rr-2").is_err());
+    }
+
+    fn helper_command(
+        root: &Path,
+        state: &Path,
+        policy: &Path,
+        path: &std::ffi::OsStr,
+        args: &[&str],
+    ) -> std::process::Output {
+        std::process::Command::new(root.join("scripts/remoter-nspawnctl"))
+            .args(args)
+            .env("REMOTER_NSPAWNCTL_TEST", "1")
+            .env("REMOTER_NSPAWNCTL_STATE_DIR", state)
+            .env("REMOTER_NSPAWNCTL_CONFIG", policy)
+            .env("PATH", path)
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn helper_leases_are_host_wide_and_sweep_is_instance_scoped() {
+        if unsafe { libc::getuid() } == 0 {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("remoter-nspawn-helper-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let workspace = dir.join("workspace");
+        let agent_home = dir.join("agent-home");
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&agent_home).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let state = dir.join("state");
+        let policy = dir.join("nspawnctl.conf");
+        std::fs::write(
+            &policy,
+            format!(
+                "workspace_root={}\nagent_home={}\npool_base=10.231\n",
+                workspace.display(),
+                agent_home.display()
+            ),
+        )
+        .unwrap();
+        crate::testutil::write_executable_script(
+            &bin.join("machinectl"),
+            "#!/bin/sh\necho \"Machine ${2:-unknown} does not exist.\" >&2\nexit 1\n",
+        );
+        crate::testutil::write_executable_script(&bin.join("ip"), "#!/bin/sh\nexit 0\n");
+        crate::testutil::write_executable_script(&bin.join("sysctl"), "#!/bin/sh\nexit 0\n");
+        let iptables_log = dir.join("iptables.log");
+        crate::testutil::write_executable_script(
+            &bin.join("iptables"),
+            &format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\ncase \" $* \" in *' -C '*) exit 1;; esac\nexit 0\n",
+                iptables_log.display()
+            ),
+        );
+        let path = std::env::join_paths(
+            std::iter::once(bin.clone()).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let instance_b = "fedcba9876543210fedcba9876543210";
+        let a = helper_command(&root, &state, &policy, &path, &["acquire", INSTANCE, "7", "10.231"]);
+        assert!(a.status.success(), "{}", String::from_utf8_lossy(&a.stderr));
+        assert_eq!(
+            String::from_utf8_lossy(&a.stdout).trim(),
+            "rr-0 ve-rr-0 10.231.0.1 10.231.0.2"
+        );
+        let b = helper_command(&root, &state, &policy, &path, &["acquire", instance_b, "7", "10.231"]);
+        assert!(b.status.success(), "{}", String::from_utf8_lossy(&b.stderr));
+        assert_eq!(
+            String::from_utf8_lossy(&b.stdout).trim(),
+            "rr-1 ve-rr-1 10.231.4.1 10.231.4.2"
+        );
+        let again = helper_command(&root, &state, &policy, &path, &["acquire", INSTANCE, "7", "10.231"]);
+        assert_eq!(again.stdout, a.stdout);
+
+        let net = helper_command(&root, &state, &policy, &path, &["net-up", instance_b, "7"]);
+        assert!(net.status.success(), "{}", String::from_utf8_lossy(&net.stderr));
+        let rules = std::fs::read_to_string(&iptables_log).unwrap();
+        assert!(
+            rules.contains("-I FORWARD 1 -i ve-rr-+ -o ve-rr-+ -j REJECT"),
+            "{rules}"
+        );
+        let rejected = helper_command(&root, &state, &policy, &path, &["exec", instance_b, "7", "--help"]);
+        assert!(!rejected.status.success());
+
+        let swept = helper_command(&root, &state, &policy, &path, &["sweep", INSTANCE]);
+        assert!(swept.status.success(), "{}", String::from_utf8_lossy(&swept.stderr));
+        let b_still_live = helper_command(&root, &state, &policy, &path, &["acquire", instance_b, "7", "10.231"]);
+        assert_eq!(b_still_live.stdout, b.stdout);
+        let a_reallocated = helper_command(&root, &state, &policy, &path, &["acquire", INSTANCE, "7", "10.231"]);
+        assert_eq!(a_reallocated.stdout, a.stdout);
+
+        crate::testutil::write_executable_script(
+            &bin.join("machinectl"),
+            "#!/bin/sh\necho 'DBus connection temporarily unavailable' >&2\nexit 1\n",
+        );
+        let unknown = helper_command(&root, &state, &policy, &path, &["stop", instance_b, "7"]);
+        assert!(!unknown.status.success());
+        let b_retained = helper_command(&root, &state, &policy, &path, &["acquire", instance_b, "7", "10.231"]);
+        assert_eq!(b_retained.stdout, b.stdout);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

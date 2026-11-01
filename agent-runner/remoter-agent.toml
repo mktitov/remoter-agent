@@ -27,7 +27,7 @@ stall_grace_secs    = 30
 # REMOTER_AGENT_PORT_BASE inside); the daemon checks `docker info` at startup
 # and fails to boot without it.
 # [execution]
-# mode = "container"               # "host" | "container"
+# mode = "container"               # "host" | "container" | "nspawn"
 # docker_binary = "docker"
 # image_tag_prefix = "remoter-agent"   # tags: <prefix>:p<project_id>-<sha256-16>
 #                                      # over the project's .remoter/agent.Dockerfile
@@ -56,45 +56,40 @@ stall_grace_secs    = 30
 #                                      # to the dir and seeds the cache via the
 #                                      # project's .remoter/seed-nix-cache.sh hook.
 #
-# --- nspawn mode (NixOS hosts; ticket #237) ---
-# A third mode that boots each run in a systemd-nspawn machine instead of a
-# docker container: no image bake — the machine's rootfs is a small shared
-# NixOS closure built from this repo's flake (`agentContainer` output) and
-# the host /nix/store is bind-mounted read-only into it. The machine is
-# minimal and generic — project services (postgres, …) come from each
-# project's own devenv.nix, started via `devenv up` inside the machine's
-# private per-run netns (default ports like 5432 need no remapping).
-# mode = "nspawn"                  # "host" | "container" | "nspawn"
+# --- nspawn mode (NixOS hosts) ---
+# Full architecture, setup, networking, and troubleshooting guide:
+# ../README.md → "systemd-nspawn execution mode (NixOS)".
+# Nspawn replaces Docker, but is still OS-level container isolation; use host
+# mode to run directly on the host. Each run boots an ephemeral NixOS machine
+# from a shared closure. No per-project Docker image or DB sidecar is used:
+# project services come from its devenv.nix and are pre-built on the host.
+# mode = "nspawn"
 # nspawn_closure_ref = "path:/etc/remoter-agent#agentContainer"
-#                                  # flake ref of the shared container closure; built
-#                                  # lazily on the first nspawn run via
-#                                  # `nix build <ref> --no-link --print-out-paths`
-#                                  # (content-addressed, no-op once in the host store)
-# nspawn_net_pool_base = "10.231"  # per-run /30 blocks from <base>.0.0/16: host side of
-#                                  # ve-rr-<id> gets the block's .1, the machine's
-#                                  # host0 gets .2 (the nspawn analogue of
-#                                  # host.docker.internal); must stay a two-octet prefix
-# sudo_binary = "sudo"             # prefixes systemd-nspawn / systemd-run / machinectl
-#                                  # and the remoter-nspawnctl helper
+#                                  # flake output or an existing /nix/store path;
+#                                  # each run realizes it with its own GC root
+# nspawn_net_pool_base = "10.231"  # must match the helper policy below
+# agent_home = "~/.local/share/remoter-agent/agent-home"
+# sudo_binary = "sudo"             # invokes only remoter-nspawnctl
 #
-# Required NixOS host setup for nspawn mode:
-#   1. Install the helper root-owned, e.g.
-#        environment.systemPackages = [
-#          (pkgs.writeShellScriptBin "remoter-nspawnctl"
-#            (builtins.readFile ./remoter-nspawnctl))   # agent-runner/scripts/
-#        ];
-#   2. sudoers (security.sudo.extraRules) — NOPASSWD for the daemon user on
-#      the helper AND the three systemd tools, which the daemon invokes
-#      directly as `sudo -n <tool> ...`:
-#        remoter-nspawnctl * , systemd-nspawn * , systemd-run * , machinectl *
-#      The startup check `sudo -n remoter-nspawnctl check` fails closed if a
-#      rule is missing.
-#   3. Host systemd >= 256 (NixOS 24.11+) — agent exec uses
-#      `systemd-run -M <machine> --pipe --wait --collect`.
-# Container mode: kimi auth comes from the project's .remoter/kimi-config.toml,
-# rendered into <agent_home>/.kimi-code/config.toml at every container start —
-# ${KIMI_API_KEY} is substituted from the daemon's own environment, so export
-# the key in the systemd unit (Environment=/EnvironmentFile=).
+# Required NixOS host setup (complete NixOS example in README):
+#   1. Install agent-runner/scripts/remoter-nspawnctl root-owned and python3.
+#   2. Install /etc/remoter-agent/nspawnctl.conf root-owned, mode 0644 or
+#      stricter, with absolute paths matching this daemon's effective config:
+#        workspace_root=/var/lib/remoter-agent
+#        agent_home=/var/lib/remoter-agent/agent-home
+#        pool_base=10.231
+#      The helper rejects every bind source outside these allowed roots.
+#   3. Grant the daemon user NOPASSWD for ONLY the exact remoter-nspawnctl via
+#      security.sudo.extraRules. Do not whitelist systemd-nspawn, systemd-run,
+#      or machinectl directly. `sudo -n remoter-nspawnctl check` gates startup.
+#   4. Host systemd >= 256 — agent exec uses systemd-run -M --pipe.
+#   5. Install driver.agent_program and driver.remoter_mcp_command so their
+#      canonical executable paths are under /nix/store. Host /nix/store and the
+#      Nix database are read-only in the guest; Nix builds inside are disabled.
+# Container and nspawn modes: kimi auth comes from the project's
+# .remoter/kimi-config.toml, rendered into <agent_home>/.kimi-code/config.toml
+# at every runtime start — ${KIMI_API_KEY} is substituted from the daemon's own
+# environment, so export the key in the systemd unit (Environment=/EnvironmentFile=).
 
 [driver]
 kind = "kimi-acp"    # dry-run = "stub"; real ACP agents = "kimi-acp" or "opencode-acp"
@@ -106,8 +101,8 @@ kind = "kimi-acp"    # dry-run = "stub"; real ACP agents = "kimi-acp" or "openco
 # Values must match the ids advertised by the agent CLI (the permanent error
 # names the advertised choices on mismatch); empty or absent keys
 # leave the agent's default in place. With a provisioned config.toml
-# (container mode: the project's .remoter/kimi-config.toml rendered into the
-# agent home, KIMI_API_KEY substituted from the daemon's environment) the ids
+# (container/nspawn mode: the project's .remoter/kimi-config.toml rendered into
+# the agent home, KIMI_API_KEY substituted from the daemon's environment) the ids
 # are the catalog keys from that file. Recommended pairing for cost/speed:
 #   plan = K3 + max reasoning, implement = K2.7 Coding.
 # Note: kimi's thinking values are model-dependent — kimi-for-coding accepts

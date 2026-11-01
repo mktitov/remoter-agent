@@ -1059,8 +1059,8 @@ fn run_env(rc: &RunContext) -> Vec<(String, String)> {
 }
 
 /// The `RunSpec.exec` for a driver turn: host (optionally devenv-wrapped),
-/// `docker exec` into the run container, or `sudo systemd-run -M --pipe` into
-/// the run machine.
+/// `docker exec` into the run container, or the nspawn helper's fixed
+/// `systemd-run -M --pipe` wrapper.
 pub(crate) fn exec_env(config: &Config, run_id: i32, devenv: bool) -> ExecEnv {
     let sessions_dir = || {
         config.driver.sessions_dir.clone().unwrap_or_else(|| {
@@ -1087,7 +1087,8 @@ pub(crate) fn exec_env(config: &Config, run_id: i32, devenv: bool) -> ExecEnv {
     if config.execution.is_nspawn() {
         return ExecEnv::Nspawn(workspace::NspawnExec {
             sudo: config.execution.sudo_binary.clone(),
-            machine: nspawn::run_machine_name(run_id),
+            instance_id: config.execution.nspawn_instance_id.clone().unwrap_or_default(),
+            run_id,
             work_dir: std::path::PathBuf::from(nspawn::WORK_DIR),
             devenv,
             sessions_dir: sessions_dir(),
@@ -1159,14 +1160,10 @@ pub(crate) async fn start_container_runtime(
         }
         return Ok(Some(RunRuntime::Containers(containers)));
     }
-    let closure = nspawn::resolve_closure(&config.execution)
-        .await
-        .map_err(|e| RunFailure::new(e, None))?;
     let machine = nspawn::start(nspawn::NspawnSpec {
         cfg: &config.execution,
         driver_kind: &config.driver.kind,
         run_id,
-        closure: &closure,
         worktree,
         repo: &repo,
         agent_home: &config.execution.agent_home(&config.workspace_root),
@@ -1265,6 +1262,11 @@ async fn nspawn_services_up(
         ));
     }
 
+    nspawn_services_start(config, run_id, env).await
+}
+
+async fn nspawn_services_start(config: &Config, run_id: i32, env: &[(String, String)]) -> Result<(), RunFailure> {
+    let _ = nspawn_devenv(config, run_id, env, &["processes", "down"]).await;
     let result = async {
         nspawn_devenv(config, run_id, env, &["up", "-d"]).await?;
         nspawn_devenv(config, run_id, env, &["processes", "wait", "--timeout", "120"]).await
@@ -3617,5 +3619,41 @@ kind = "stub"
         assert!(reqs[1].contains("implement run #99 finished → review"), "{reqs:?}");
         assert!(reqs[3].starts_with("POST /api/v1/tasks/42/comments"), "{reqs:?}");
         assert!(reqs[3].contains("finished without writing the task report"), "{reqs:?}");
+    }
+
+    #[tokio::test]
+    async fn nspawn_services_clear_stale_state_before_up() {
+        let dir = std::env::temp_dir().join(format!("remoter-nspawn-services-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("sudo.log");
+        let sudo = dir.join("sudo");
+        crate::testutil::write_executable_script(
+            &sudo,
+            &format!("#!/bin/sh\necho \"$*\" >> '{}'\nexit 0\n", log.display()),
+        );
+        let mut config = Config::from_toml_str(
+            r#"
+api_url = "http://localhost:8181"
+workspace_root = "/tmp/remoter-nspawn-services"
+[driver]
+kind = "stub"
+[execution]
+mode = "nspawn"
+"#,
+            Some("tok".to_string()),
+        )
+        .unwrap();
+        config.execution.sudo_binary = sudo.to_string_lossy().into_owned();
+        config.execution.nspawn_instance_id = Some("0123456789abcdef0123456789abcdef".to_string());
+
+        nspawn_services_start(&config, 42, &[]).await.unwrap();
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        let down = calls.find("processes down").unwrap();
+        let up = calls.find("up -d").unwrap();
+        let wait = calls.find("processes wait --timeout 120").unwrap();
+        assert!(down < up && up < wait, "{calls}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

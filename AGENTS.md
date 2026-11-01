@@ -59,9 +59,9 @@ contract with a few deltas:
 - Your cwd is the ticket worktree mounted at `/work`.
 - The daemon's host is the run's gateway IP (the `.1` of the run's /30 from
   the `10.231` pool); `REMOTER_API_URL` already points there.
-- `/nix/store` is the host store bind-mounted **read-only** — never nix-build
-  inside the machine; missing paths mean the daemon should pre-warm them on
-  the host.
+- `/nix/store` and `/nix/var/nix/db` are the host store and validity database,
+  bind-mounted **read-only** — never nix-build inside the machine; missing
+  paths mean the daemon should pre-warm them on the host.
 
 ## Agent container image (`.remoter/`)
 

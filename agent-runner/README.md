@@ -168,6 +168,19 @@ docker container instead of on the host:
   automatically after every run (a startup sweep reaps leftovers from a
   crashed daemon).
 
+## systemd-nspawn mode
+
+On NixOS, `[execution] mode = "nspawn"` replaces Docker with an ephemeral
+`systemd-nspawn` machine booted from the shared `agentContainer` NixOS closure.
+It is still OS-level container isolation; use host mode to run without it.
+Nspawn mode uses the project's own devenv services rather than Docker sidecars,
+shares the host Nix store read-only, and requires the root-owned
+`remoter-nspawnctl` helper and matching sudo/policy configuration.
+
+See [systemd-nspawn execution mode (NixOS)](../README.md#systemd-nspawn-execution-mode-nixos)
+for the architecture, complete NixOS and TOML examples, `/nix/store` executable
+requirements, networking, lifecycle, verification, and troubleshooting.
+
 ## Tests
 
 ```sh

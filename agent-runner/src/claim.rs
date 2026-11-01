@@ -200,8 +200,8 @@ impl Daemon {
         // sweep failure must never block reconciliation.
         workspace::down_all_worktrees(&self.config.workspace_root).await;
         // Container mode: reap run/sidecar containers a crashed daemon leaked
-        // (labeled remoter.run_id; containers spec §4). Nspawn mode: terminate
-        // leftover `rr-*` machines likewise.
+        // (labeled remoter.run_id; containers spec §4). Nspawn mode: stop only
+        // helper leases owned by this persisted daemon identity.
         if self.config.execution.is_container() {
             crate::container::sweep(&self.config.execution).await;
         } else if self.config.execution.is_nspawn() {

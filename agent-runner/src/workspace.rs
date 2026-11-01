@@ -885,7 +885,7 @@ pub enum ExecEnv {
     },
     /// Inside the run container via `docker exec` (container mode).
     Container(ContainerExec),
-    /// Inside the run machine via `sudo systemd-run -M --pipe` (nspawn mode).
+    /// Inside the run machine via `sudo remoter-nspawnctl exec` (nspawn mode).
     Nspawn(NspawnExec),
 }
 
@@ -915,8 +915,10 @@ pub struct ContainerExec {
 pub struct NspawnExec {
     /// The sudo binary (config `execution.sudo_binary`).
     pub sudo: String,
-    /// The run machine's name (`systemd-run -M` target).
-    pub machine: String,
+    /// Persistent daemon identity owning the helper lease.
+    pub instance_id: String,
+    /// Backend run ID identifying the lease within this daemon.
+    pub run_id: i32,
     /// The worktree mount point inside the machine (`/work`).
     pub work_dir: PathBuf,
     /// The worktree uses devenv — wrap as `devenv shell -- …` *inside* the
@@ -952,10 +954,9 @@ impl ExecEnv {
 /// (with `CI=1` / `DEVENV_NO_AI_AGENT=1`); without, it runs directly.
 /// Container mode: `docker exec -i -w /work [-e K=V]… <run> [devenv shell …
 /// --] <program> <args>` — the devenv shell is entered *inside* the container,
-/// where the image has it warmed. Nspawn mode: `sudo -n systemd-run -M
-/// <machine> --pipe --quiet --wait --collect --working-directory=/work
-/// [--setenv=K=V]… -- env -u REMOTER_TOKEN [devenv shell … --] <program>
-/// <args>` — `--pipe` passes stdio through like `docker exec -i`.
+/// where the image has it warmed. Nspawn mode uses the root-owned helper's
+/// fixed `systemd-run -M --pipe` invocation, preserving stdio and environment
+/// without granting the daemon arbitrary systemd-run arguments.
 pub fn wrap_command(
     dir: &Path,
     exec: &ExecEnv,
@@ -967,14 +968,10 @@ pub fn wrap_command(
         ExecEnv::Nspawn(n) => {
             let mut cmd = std::process::Command::new(&n.sudo);
             cmd.arg("-n")
-                .arg("systemd-run")
-                .arg("-M")
-                .arg(&n.machine)
-                .arg("--pipe")
-                .arg("--quiet")
-                .arg("--wait")
-                .arg("--collect")
-                .arg(format!("--working-directory={}", n.work_dir.display()))
+                .arg(crate::nspawn::HELPER_BINARY)
+                .arg("exec")
+                .arg(&n.instance_id)
+                .arg(n.run_id.to_string())
                 .arg("--setenv=CI=1");
             if n.devenv {
                 cmd.arg("--setenv=DEVENV_NO_AI_AGENT=1");
@@ -995,8 +992,6 @@ pub fn wrap_command(
                     .arg("--");
             }
             cmd.arg(program).args(args);
-            // `systemd-run` runs on the host; `current_dir` is meaningless
-            // for the in-machine process but harmless for the CLI itself.
             cmd
         }
         ExecEnv::Container(c) => {
@@ -2588,10 +2583,11 @@ mod tests {
     }
 
     #[test]
-    fn wrap_command_nspawn_uses_systemd_run_pipe() {
+    fn wrap_command_nspawn_uses_helper_exec() {
         let exec = ExecEnv::Nspawn(NspawnExec {
             sudo: "sudo".to_string(),
-            machine: "rr-7".to_string(),
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            run_id: 7,
             work_dir: PathBuf::from("/work"),
             devenv: true,
             sessions_dir: PathBuf::from("/agent-home/.kimi-code/sessions"),
@@ -2605,14 +2601,10 @@ mod tests {
             args,
             [
                 "-n",
-                "systemd-run",
-                "-M",
-                "rr-7",
-                "--pipe",
-                "--quiet",
-                "--wait",
-                "--collect",
-                "--working-directory=/work",
+                "remoter-nspawnctl",
+                "exec",
+                "0123456789abcdef0123456789abcdef",
+                "7",
                 "--setenv=CI=1",
                 "--setenv=DEVENV_NO_AI_AGENT=1",
                 "--setenv=REMOTER_EXECUTION=nspawn",
@@ -2635,7 +2627,8 @@ mod tests {
     fn wrap_command_nspawn_without_devenv_runs_the_program_directly() {
         let exec = ExecEnv::Nspawn(NspawnExec {
             sudo: "sudo".to_string(),
-            machine: "rr-9".to_string(),
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            run_id: 9,
             work_dir: PathBuf::from("/work"),
             devenv: false,
             sessions_dir: PathBuf::from("/agent-home/.kimi-code/sessions"),
@@ -2648,14 +2641,10 @@ mod tests {
             args,
             [
                 "-n",
-                "systemd-run",
-                "-M",
-                "rr-9",
-                "--pipe",
-                "--quiet",
-                "--wait",
-                "--collect",
-                "--working-directory=/work",
+                "remoter-nspawnctl",
+                "exec",
+                "0123456789abcdef0123456789abcdef",
+                "9",
                 "--setenv=CI=1",
                 "--setenv=REMOTER_EXECUTION=nspawn",
                 "--",
@@ -2670,12 +2659,10 @@ mod tests {
 
     #[test]
     fn wrap_command_nspawn_env_is_argv_not_shell() {
-        // Values with spaces or shell metacharacters travel as single
-        // `--setenv=` argv elements — there is no `sh -c` anywhere in the
-        // invocation, so no quoting layer can reinterpret them.
         let exec = ExecEnv::Nspawn(NspawnExec {
             sudo: "sudo".to_string(),
-            machine: "rr-3".to_string(),
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            run_id: 3,
             work_dir: PathBuf::from("/work"),
             devenv: false,
             sessions_dir: PathBuf::from("/agent-home/.kimi-code/sessions"),

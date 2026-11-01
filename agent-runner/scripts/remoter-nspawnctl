@@ -1,114 +1,658 @@
 #!/bin/sh
-# remoter-nspawnctl — privileged helper for remoter-agent's nspawn execution
-# mode (`execution.mode = "nspawn"`, ticket #237). The daemon stays an
-# unprivileged user and reaches the few root operations it needs through this
-# script, invoked non-interactively:
-#
-#   sudo -n remoter-nspawnctl <subcommand> [args]
-#
-# Install root-owned (e.g. via the NixOS snippet in remoter-agent.toml's
-# [execution] comments) and grant the daemon user NOPASSWD for exactly this
-# file in sudoers — plus systemd-nspawn / systemd-run / machinectl, which the
-# daemon invokes directly.
-#
-# Subcommands:
-#   check
-#       Exit 0 if the host can run nspawn mode (systemd-nspawn, machinectl,
-#       systemd-run and the networking tools are present). The daemon runs
-#       this at startup and refuses to boot otherwise.
-#   net-up <ifname> <host_ip> <prefix_len>
-#       Idempotent host-side setup for one run's veth interface: assign
-#       <host_ip>/<prefix_len> to <ifname>, ensure the pool-wide masquerade
-#       rule exists, enable IPv4 forwarding. The pool subnet is derived from
-#       <host_ip>'s first two octets as a /16 (matches the daemon's
-#       nspawn_net_pool_base convention, e.g. 10.231 -> 10.231.0.0/16).
-#   net-down <ifname> <host_ip>
-#       Remove the run's address from <ifname> (already-gone is fine). The
-#       pool masquerade rule is deliberately left in place — it is one-time,
-#       pool-wide state, not per-run.
+# remoter-nspawnctl — the only privileged command used by nspawn execution.
+# Install root-owned and grant the daemon user NOPASSWD sudo for exactly this
+# file. All other nspawn, systemd-run, machinectl, and network operations are
+# constrained by the leases and root-owned policy used here.
 set -eu
+umask 077
 
-prog=$(basename "$0")
+prog=${0##*/}
+state_dir=/run/remoter-nspawnctl
+config_file=/etc/remoter-agent/nspawnctl.conf
+euid=$(id -u)
+test_mode=0
+
+# These overrides are deliberately unavailable to root, including root
+# processes which happen to inherit REMOTER_NSPAWNCTL_TEST=1.
+if [ "${REMOTER_NSPAWNCTL_TEST:-0}" = "1" ] && [ "$euid" -ne 0 ]; then
+    test_mode=1
+    state_dir=${REMOTER_NSPAWNCTL_STATE_DIR:-$state_dir}
+    config_file=${REMOTER_NSPAWNCTL_CONFIG:-$config_file}
+elif [ "$euid" -ne 0 ]; then
+    echo "$prog: must run as root" >&2
+    exit 1
+fi
+
+invoking_uid=${SUDO_UID:-$euid}
+case "$invoking_uid" in
+    ''|*[!0-9]*)
+        echo "$prog: invalid invoking UID" >&2
+        exit 1
+        ;;
+esac
 
 usage() {
     cat >&2 <<EOF
 usage: $prog check
-       $prog net-up <ifname> <host_ip> <prefix_len>
-       $prog net-down <ifname> <host_ip>
+       $prog acquire <instance-32-lowercase-hex> <run-id-positive-int> <pool-base-two-octets>
+       $prog boot <instance> <run-id> <closure> <worktree> <repo> <agent-home> [--ref <mount-name> <ref-worktree> <ref-repo>]...
+       $prog net-up <instance> <run-id>
+       $prog exec <instance> <run-id> [--setenv=NAME=VALUE]... -- <program> [args...]
+       $prog terminate <instance> <run-id>
+       $prog stop <instance> <run-id>
+       $prog sweep <instance>
 EOF
-    exit 64 # EX_USAGE
+    exit 64
 }
-
-have() { command -v "$1" >/dev/null 2>&1; }
 
 die() {
     echo "$prog: $*" >&2
     exit 1
 }
 
-[ $# -ge 1 ] || usage
-cmd=$1
-shift
+have() {
+    command -v "$1" >/dev/null 2>&1
+}
 
-case "$cmd" in
-check)
-    [ $# -eq 0 ] || usage
-    missing=""
-    for tool in systemd-nspawn machinectl systemd-run ip iptables; do
-        if ! have "$tool"; then
-            missing="$missing $tool"
+valid_instance() {
+    [ "${#1}" -eq 32 ] || return 1
+    case "$1" in
+        *[!0-9a-f]*) return 1 ;;
+    esac
+    return 0
+}
+
+valid_run_id() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$1" -gt 0 ] 2>/dev/null
+}
+
+valid_octet() {
+    case "$1" in
+        0|[1-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+valid_pool() {
+    case "$1" in
+        *.*) ;;
+        *) return 1 ;;
+    esac
+    pool_a=${1%%.*}
+    pool_b=${1#*.}
+    case "$pool_b" in
+        *.*) return 1 ;;
+    esac
+    valid_octet "$pool_a" && valid_octet "$pool_b"
+}
+
+trim() {
+    REPLY=$1
+    REPLY=${REPLY#"${REPLY%%[![:space:]]*}"}
+    REPLY=${REPLY%"${REPLY##*[![:space:]]}"}
+}
+
+check_not_group_or_world_writable() {
+    mode=$(stat -Lc '%a' -- "$1") || die "cannot stat $1"
+    case "$mode" in
+        ''|*[!0-7]*) die "invalid file mode on $1" ;;
+        *[2367]) die "$1 must not be world-writable" ;;
+    esac
+    without_other=${mode%?}
+    case "$without_other" in
+        *[2367]) die "$1 must not be group-writable" ;;
+    esac
+}
+
+load_policy() {
+    [ -f "$config_file" ] || die "missing policy config $config_file"
+    if [ "$test_mode" -eq 0 ]; then
+        owner=$(stat -Lc '%u' -- "$config_file") || die "cannot stat $config_file"
+        [ "$owner" = "0" ] || die "$config_file must be root-owned"
+        check_not_group_or_world_writable "$config_file"
+    fi
+
+    policy_workspace=
+    policy_agent_home=
+    policy_pool=
+    seen_workspace=0
+    seen_agent_home=0
+    seen_pool=0
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        trim "$line"
+        line=$REPLY
+        case "$line" in
+            ''|\#*) continue ;;
+            *=*) ;;
+            *) die "invalid policy line: $line" ;;
+        esac
+        key=${line%%=*}
+        value=${line#*=}
+        trim "$key"
+        key=$REPLY
+        trim "$value"
+        value=$REPLY
+        case "$value" in
+            \"*)
+                case "$value" in
+                    ?*\") value=${value#\"}; value=${value%\"} ;;
+                    *) die "unterminated quote in policy" ;;
+                esac
+                ;;
+            \'*)
+                case "$value" in
+                    ?*\') value=${value#\'}; value=${value%\'} ;;
+                    *) die "unterminated quote in policy" ;;
+                esac
+                ;;
+        esac
+
+        case "$key" in
+            workspace_root)
+                [ "$seen_workspace" -eq 0 ] || die "duplicate workspace_root"
+                policy_workspace=$value
+                seen_workspace=1
+                ;;
+            agent_home)
+                [ "$seen_agent_home" -eq 0 ] || die "duplicate agent_home"
+                policy_agent_home=$value
+                seen_agent_home=1
+                ;;
+            pool_base)
+                [ "$seen_pool" -eq 0 ] || die "duplicate pool_base"
+                policy_pool=$value
+                seen_pool=1
+                ;;
+            *) die "unknown policy key $key" ;;
+        esac
+    done < "$config_file"
+
+    [ "$seen_workspace" -eq 1 ] && [ "$seen_agent_home" -eq 1 ] && [ "$seen_pool" -eq 1 ] \
+        || die "policy must contain workspace_root, agent_home, and pool_base"
+    case "$policy_workspace" in /*) ;; *) die "workspace_root must be absolute" ;; esac
+    case "$policy_agent_home" in /*) ;; *) die "agent_home must be absolute" ;; esac
+    valid_pool "$policy_pool" || die "invalid policy pool_base"
+
+    canonical_dir "$policy_workspace"
+    policy_workspace=$CANONICAL
+    canonical_dir "$policy_agent_home"
+    policy_agent_home=$CANONICAL
+}
+
+ensure_state() {
+    if [ ! -d "$state_dir" ]; then
+        mkdir -m 700 -- "$state_dir" || die "cannot create $state_dir"
+    fi
+    [ -d "$state_dir" ] && [ ! -L "$state_dir" ] || die "$state_dir is not a directory"
+    if [ "$test_mode" -eq 0 ]; then
+        owner=$(stat -c '%u' -- "$state_dir") || die "cannot stat $state_dir"
+        [ "$owner" = "0" ] || die "$state_dir must be root-owned"
+        check_not_group_or_world_writable "$state_dir"
+    fi
+}
+
+lock_state() {
+    exec 9>"$state_dir/allocation.lock"
+    flock -x 9
+}
+
+unlock_state() {
+    flock -u 9
+    exec 9>&-
+}
+
+canonical_dir() {
+    [ -d "$1" ] || die "not a directory: $1"
+    CANONICAL=$(readlink -f -- "$1") || die "cannot canonicalize $1"
+    [ -n "$CANONICAL" ] && [ -d "$CANONICAL" ] || die "cannot canonicalize $1"
+}
+
+load_lease() {
+    lease_slot=$1
+    lease_file=$state_dir/lease-$lease_slot
+    [ -f "$lease_file" ] || return 1
+    if ! IFS=' ' read -r lease_instance lease_run lease_uid lease_pool lease_host_ip lease_machine_ip lease_extra < "$lease_file"; then
+        die "invalid lease $lease_file"
+    fi
+    [ -z "${lease_extra:-}" ] || die "invalid lease $lease_file"
+    valid_instance "$lease_instance" || die "invalid lease $lease_file"
+    valid_run_id "$lease_run" || die "invalid lease $lease_file"
+    case "$lease_uid" in ''|*[!0-9]*) die "invalid lease $lease_file" ;; esac
+    valid_pool "$lease_pool" || die "invalid lease $lease_file"
+    third_octet=$((lease_slot * 4))
+    [ "$lease_host_ip" = "$lease_pool.$third_octet.1" ] || die "invalid lease $lease_file"
+    [ "$lease_machine_ip" = "$lease_pool.$third_octet.2" ] || die "invalid lease $lease_file"
+    lease_machine=rr-$lease_slot
+    lease_ifname=ve-rr-$lease_slot
+    lease_net_dir=$state_dir/net-$lease_slot
+}
+
+find_lease() {
+    wanted_instance=$1
+    wanted_run=$2
+    slot=0
+    while [ "$slot" -lt 64 ]; do
+        if [ -f "$state_dir/lease-$slot" ]; then
+            load_lease "$slot"
+            if [ "$lease_instance" = "$wanted_instance" ] && [ "$lease_run" = "$wanted_run" ]; then
+                return 0
+            fi
+        fi
+        slot=$((slot + 1))
+    done
+    return 1
+}
+
+require_lease_owner() {
+    [ "$lease_uid" = "$invoking_uid" ] || die "lease belongs to another UID"
+}
+
+write_network_dropin() {
+    net_dir=$1
+    host_ip=$2
+    machine_ip=$3
+    if [ ! -d "$net_dir" ]; then
+        mkdir -m 700 -- "$net_dir"
+    fi
+    [ -d "$net_dir" ] && [ ! -L "$net_dir" ] || die "invalid lease network directory"
+    net_tmp=$net_dir/.80-host0.network.$$
+    printf '%s\n' \
+        '[Match]' \
+        'Name=host0' \
+        '' \
+        '[Network]' \
+        "Address=$machine_ip/30" \
+        "Gateway=$host_ip" \
+        'DNS=1.1.1.1' > "$net_tmp"
+    mv -f -- "$net_tmp" "$net_dir/80-host0.network"
+}
+
+recognized_absence() {
+    case "$1" in
+        *"command not found"*|*"machinectl: not found"*|*"No such file or directory"*|*"DBus"*|*"dbus"*)
+            return 1
+            ;;
+        *"does not exist"*|*"Does not exist"*|*"not found"*|*"Not found"*|*"No machine "*" known"*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+probe_machine() {
+    if machine_output=$(machinectl show "$1" 2>&1); then
+        machine_state=present
+        return 0
+    fi
+
+    if recognized_absence "$machine_output"; then
+        machine_state=absent
+        return 2
+    fi
+    machine_state=unknown
+    return 1
+}
+
+machine_state_error() {
+    die "cannot determine machine $1 state: $machine_output"
+}
+
+terminate_loaded_lease() {
+    if probe_machine "$lease_machine"; then
+        if ! terminate_output=$(machinectl terminate "$lease_machine" 2>&1); then
+            recognized_absence "$terminate_output" && return 0
+            die "cannot terminate machine $lease_machine: $terminate_output"
+        fi
+    else
+        rc=$?
+        [ "$rc" -eq 2 ] || machine_state_error "$lease_machine"
+    fi
+}
+
+stop_loaded_lease() {
+    waited=0
+    while :; do
+        if probe_machine "$lease_machine"; then
+            waited=$((waited + 1))
+            [ "$waited" -le 100 ] || die "machine $lease_machine is still present; lease retained"
+            sleep 0.1
+        else
+            rc=$?
+            [ "$rc" -eq 2 ] || machine_state_error "$lease_machine"
+            break
         fi
     done
-    if [ -n "$missing" ]; then
-        echo "$prog: missing required tools:$missing" >&2
-        exit 1
-    fi
-    ;;
 
-net-up)
-    [ $# -eq 3 ] || usage
-    ifname=$1
-    host_ip=$2
-    prefix_len=$3
+    # The veth normally disappears with the machine. Removing an absent
+    # address or an address on an absent interface is deliberately a no-op.
+    ip addr del "$lease_host_ip/30" dev "$lease_ifname" >/dev/null 2>&1 || true
+    rm -f -- "$lease_file"
+    rm -f -- "$lease_net_dir/80-host0.network"
+    rmdir -- "$lease_net_dir" >/dev/null 2>&1 || true
+}
 
-    # Interface address (idempotent).
-    if ! ip addr show dev "$ifname" | grep -q "inet ${host_ip}/"; then
-        ip addr add "${host_ip}/${prefix_len}" dev "$ifname"
-    fi
-    ip link set dev "$ifname" up
+boot_exec() {
+    unlock_state
+    exec python3 -c '
+import os
+import sys
 
-    # One-time masquerade for the whole pool subnet (/16 derived from the
-    # pool base), so machines reach the host's network (e.g. the Remoter API
-    # proxied via the gateway, or outbound fetches).
-    pool_prefix=$(echo "$host_ip" | cut -d. -f1-2)
-    pool_subnet="${pool_prefix}.0.0/16"
-    if ! iptables -t nat -C POSTROUTING -s "$pool_subnet" -j MASQUERADE 2>/dev/null; then
-        iptables -t nat -A POSTROUTING -s "$pool_subnet" -j MASQUERADE
-    fi
 
-    # Forwarding is required for the NAT path. This flips the runtime value
-    # only; NixOS hosts should also set boot.kernel.sysctl
-    #."net.ipv4.ip_forward" = true so it survives reboots.
-    if [ "$(cat /proc/sys/net/ipv4/ip_forward)" != "1" ]; then
+def fail(message):
+    raise SystemExit("remoter-nspawnctl: " + message)
+
+
+def open_dir(path, label):
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        fail(f"cannot open {label}: {exc}")
+    try:
+        target = os.readlink(f"/proc/self/fd/{fd}")
+    except OSError as exc:
+        os.close(fd)
+        fail(f"cannot inspect {label}: {exc}")
+    if not target.startswith("/") or target.endswith(" (deleted)"):
+        os.close(fd)
+        fail(f"invalid {label} target")
+    os.set_inheritable(fd, True)
+    return fd, target
+
+
+def within(path, root):
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def source(fd):
+    return f"/proc/self/fd/{fd}"
+
+
+def safe_destination(path, label):
+    if ":" in path or "\n" in path:
+        fail(f"invalid {label} destination")
+
+
+machine, workspace, agent_policy, net_dir = sys.argv[1:5]
+closure_path, worktree_path, repo_path, agent_path = sys.argv[5:9]
+refs = sys.argv[9:]
+
+closure_fd, closure_target = open_dir(closure_path, "closure")
+if closure_target == "/nix/store" or not within(closure_target, "/nix/store"):
+    fail("closure must be under /nix/store")
+if not os.access(source(closure_fd) + "/init", os.X_OK):
+    fail("closure init is not executable")
+
+worktree_fd, worktree_target = open_dir(worktree_path, "worktree")
+if not within(worktree_target, workspace):
+    fail("worktree is outside workspace_root")
+repo_fd, repo_target = open_dir(os.path.join(repo_path, ".git"), "repo .git")
+if not within(repo_target, workspace):
+    fail("repo .git is outside workspace_root")
+safe_destination(repo_target, "repo .git")
+agent_fd, agent_target = open_dir(agent_path, "agent home")
+if agent_target != agent_policy:
+    fail("agent home does not match policy")
+net_fd, net_target = open_dir(net_dir, "lease network directory")
+if net_target != os.path.realpath(net_dir):
+    fail("lease network directory does not match its lease")
+if not os.path.isfile(source(net_fd) + "/80-host0.network"):
+    fail("lease network config is missing")
+
+command = [
+    "systemd-nspawn",
+    "--boot",
+    "--ephemeral",
+    f"--machine={machine}",
+    f"--directory={source(closure_fd)}",
+    "--register=yes",
+    "--network-veth",
+    "--bind-ro=/nix/store",
+    "--bind-ro=/nix/var/nix/db",
+    f"--bind={source(worktree_fd)}:/work",
+    f"--bind={source(repo_fd)}:{repo_target}",
+    f"--bind={source(agent_fd)}:/root",
+    f"--bind-ro={source(net_fd)}:/etc/systemd/network",
+]
+
+if len(refs) % 4:
+    fail("invalid reference mount arguments")
+allowed_mount_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"
+for offset in range(0, len(refs), 4):
+    marker, name, ref_worktree, ref_repo = refs[offset:offset + 4]
+    if marker != "--ref":
+        fail("invalid reference mount marker")
+    if not name or name in (".", "..") or any(c not in allowed_mount_chars for c in name):
+        fail("invalid ref mount name")
+    ref_fd, ref_target = open_dir(ref_worktree, "ref worktree")
+    if not within(ref_target, workspace):
+        fail("ref worktree is outside workspace_root")
+    ref_git_fd, ref_git_target = open_dir(os.path.join(ref_repo, ".git"), "ref .git")
+    if not within(ref_git_target, workspace):
+        fail("ref .git is outside workspace_root")
+    safe_destination(ref_git_target, "ref .git")
+    command.extend([
+        f"--bind-ro={source(ref_fd)}:/work/.refs/{name}",
+        f"--bind-ro={source(ref_git_fd)}:{ref_git_target}",
+    ])
+
+command.append(source(closure_fd) + "/init")
+try:
+    os.execvp("systemd-nspawn", command)
+except OSError as exc:
+    fail(f"cannot exec systemd-nspawn: {exc}")
+' "$lease_machine" "$policy_workspace" "$policy_agent_home" "$lease_net_dir" "$@"
+}
+
+[ $# -ge 1 ] || usage
+command=$1
+shift
+
+case "$command" in
+    check)
+        [ $# -eq 0 ] || usage
+        missing=
+        for tool in systemd-nspawn machinectl systemd-run ip iptables sysctl flock readlink stat python3; do
+            if ! have "$tool"; then
+                missing="$missing $tool"
+            fi
+        done
+        [ -z "$missing" ] || die "missing required tools:$missing"
+        load_policy
+        ensure_state
+        ;;
+
+    acquire)
+        [ $# -eq 3 ] || usage
+        instance=$1
+        run_id=$2
+        pool_base=$3
+        valid_instance "$instance" || die "instance must be exactly 32 lowercase hex characters"
+        valid_run_id "$run_id" || die "run-id must be a positive integer"
+        valid_pool "$pool_base" || die "pool base must be two decimal octets"
+        load_policy
+        [ "$pool_base" = "$policy_pool" ] || die "pool base does not match policy"
+        ensure_state
+        lock_state
+
+        if find_lease "$instance" "$run_id"; then
+            require_lease_owner
+            [ "$lease_pool" = "$pool_base" ] || die "existing lease uses another pool"
+            printf '%s %s %s %s\n' "$lease_machine" "$lease_ifname" "$lease_host_ip" "$lease_machine_ip"
+            exit 0
+        fi
+
+        slot=0
+        while [ "$slot" -lt 64 ] && [ -e "$state_dir/lease-$slot" ]; do
+            slot=$((slot + 1))
+        done
+        [ "$slot" -lt 64 ] || die "no free nspawn slots"
+        lease_slot=$slot
+        lease_instance=$instance
+        lease_run=$run_id
+        lease_uid=$invoking_uid
+        lease_pool=$pool_base
+        third_octet=$((slot * 4))
+        lease_host_ip=$pool_base.$third_octet.1
+        lease_machine_ip=$pool_base.$third_octet.2
+        lease_machine=rr-$slot
+        lease_ifname=ve-rr-$slot
+        lease_net_dir=$state_dir/net-$slot
+        write_network_dropin "$lease_net_dir" "$lease_host_ip" "$lease_machine_ip"
+        lease_tmp=$state_dir/.lease-$slot.$$
+        printf '%s %s %s %s %s %s\n' \
+            "$lease_instance" "$lease_run" "$lease_uid" "$lease_pool" \
+            "$lease_host_ip" "$lease_machine_ip" > "$lease_tmp"
+        mv -f -- "$lease_tmp" "$state_dir/lease-$slot"
+        printf '%s %s %s %s\n' "$lease_machine" "$lease_ifname" "$lease_host_ip" "$lease_machine_ip"
+        ;;
+
+    boot)
+        [ $# -ge 6 ] || usage
+        instance=$1
+        run_id=$2
+        closure=$3
+        worktree=$4
+        repo=$5
+        agent_home=$6
+        shift 6
+        [ $(($# % 4)) -eq 0 ] || usage
+        valid_instance "$instance" || die "invalid instance"
+        valid_run_id "$run_id" || die "invalid run-id"
+        load_policy
+        ensure_state
+        lock_state
+        find_lease "$instance" "$run_id" || die "no lease for this instance/run"
+        require_lease_owner
+        [ "$lease_pool" = "$policy_pool" ] || die "lease pool does not match policy"
+
+        boot_exec "$closure" "$worktree" "$repo" "$agent_home" "$@"
+        ;;
+
+    net-up)
+        [ $# -eq 2 ] || usage
+        instance=$1
+        run_id=$2
+        valid_instance "$instance" || die "invalid instance"
+        valid_run_id "$run_id" || die "invalid run-id"
+        ensure_state
+        lock_state
+        find_lease "$instance" "$run_id" || die "no lease for this instance/run"
+        require_lease_owner
+
+        ip addr replace "$lease_host_ip/30" dev "$lease_ifname"
+        ip link set dev "$lease_ifname" up
+        pool_subnet=$lease_pool.0.0/16
+        if ! iptables -t nat -C POSTROUTING -s "$pool_subnet" -j MASQUERADE 2>/dev/null; then
+            iptables -t nat -A POSTROUTING -s "$pool_subnet" -j MASQUERADE
+        fi
+        if ! iptables -C FORWARD -i ve-rr-+ -o ve-rr-+ -j REJECT 2>/dev/null; then
+            iptables -I FORWARD 1 -i ve-rr-+ -o ve-rr-+ -j REJECT
+        fi
         sysctl -w net.ipv4.ip_forward=1 >/dev/null
-    fi
-    ;;
+        ;;
 
-net-down)
-    [ $# -eq 2 ] || usage
-    ifname=$1
-    host_ip=$2
+    exec)
+        [ $# -ge 2 ] || usage
+        instance=$1
+        run_id=$2
+        shift 2
+        valid_instance "$instance" || die "invalid instance"
+        valid_run_id "$run_id" || die "invalid run-id"
+        ensure_state
+        lock_state
+        find_lease "$instance" "$run_id" || die "no lease for this instance/run"
+        require_lease_owner
 
-    # The prefix length is not passed in; recover it from the interface.
-    # Already-gone (interface destroyed with the machine) is fine.
-    current=$(ip -o -4 addr show dev "$ifname" 2>/dev/null \
-        | awk '{print $4}' | grep "^${host_ip}/" || true)
-    if [ -n "$current" ]; then
-        ip addr del "$current" dev "$ifname"
-    fi
-    ;;
+        after_separator=0
+        have_program=0
+        for arg do
+            if [ "$after_separator" -eq 0 ]; then
+                if [ "$arg" = "--" ]; then
+                    after_separator=1
+                    continue
+                fi
+                case "$arg" in
+                    --setenv=*=*)
+                        env_spec=${arg#--setenv=}
+                        env_name=${env_spec%%=*}
+                        case "$env_name" in
+                            [A-Za-z_]*) ;;
+                            *) die "invalid environment variable name" ;;
+                        esac
+                        case "$env_name" in
+                            *[!A-Za-z0-9_]*) die "invalid environment variable name" ;;
+                        esac
+                        ;;
+                    *) die "only --setenv=NAME=VALUE options are allowed before --" ;;
+                esac
+            else
+                if [ "$have_program" -eq 0 ]; then
+                    [ -n "$arg" ] || die "program must not be empty"
+                    have_program=1
+                fi
+            fi
+        done
+        [ "$after_separator" -eq 1 ] && [ "$have_program" -eq 1 ] || usage
 
-*)
-    usage
-    ;;
+        unlock_state
+        exec systemd-run -M "$lease_machine" --pipe --quiet --wait --collect \
+            --working-directory=/work "$@"
+        ;;
+
+    terminate)
+        [ $# -eq 2 ] || usage
+        instance=$1
+        run_id=$2
+        valid_instance "$instance" || die "invalid instance"
+        valid_run_id "$run_id" || die "invalid run-id"
+        ensure_state
+        lock_state
+        find_lease "$instance" "$run_id" || die "no lease for this instance/run"
+        require_lease_owner
+        terminate_loaded_lease
+        ;;
+
+    stop)
+        [ $# -eq 2 ] || usage
+        instance=$1
+        run_id=$2
+        valid_instance "$instance" || die "invalid instance"
+        valid_run_id "$run_id" || die "invalid run-id"
+        ensure_state
+        lock_state
+        if find_lease "$instance" "$run_id"; then
+            require_lease_owner
+            stop_loaded_lease
+        fi
+        ;;
+
+    sweep)
+        [ $# -eq 1 ] || usage
+        instance=$1
+        valid_instance "$instance" || die "invalid instance"
+        ensure_state
+        lock_state
+        slot=0
+        while [ "$slot" -lt 64 ]; do
+            if [ -f "$state_dir/lease-$slot" ]; then
+                load_lease "$slot"
+                if [ "$lease_instance" = "$instance" ] && [ "$lease_uid" = "$invoking_uid" ]; then
+                    terminate_loaded_lease
+                    stop_loaded_lease
+                fi
+            fi
+            slot=$((slot + 1))
+        done
+        ;;
+
+    *)
+        usage
+        ;;
 esac
