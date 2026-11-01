@@ -885,6 +885,8 @@ pub enum ExecEnv {
     },
     /// Inside the run container via `docker exec` (container mode).
     Container(ContainerExec),
+    /// Inside the run machine via `sudo remoter-nspawnctl exec` (nspawn mode).
+    Nspawn(NspawnExec),
 }
 
 /// Container-mode execution details threaded from the daemon to the driver.
@@ -908,6 +910,30 @@ pub struct ContainerExec {
     pub api_url: String,
 }
 
+/// Nspawn-mode execution details threaded from the daemon to the driver.
+#[derive(Debug, Clone)]
+pub struct NspawnExec {
+    /// The sudo binary (config `execution.sudo_binary`).
+    pub sudo: String,
+    /// Persistent daemon identity owning the helper lease.
+    pub instance_id: String,
+    /// Backend run ID identifying the lease within this daemon.
+    pub run_id: i32,
+    /// The worktree mount point inside the machine (`/work`).
+    pub work_dir: PathBuf,
+    /// The worktree uses devenv — wrap as `devenv shell -- …` *inside* the
+    /// machine (the host /nix/store is shared, so the shell resolves
+    /// instantly).
+    pub devenv: bool,
+    /// Host-side kimi sessions directory (`<agent_home>/.kimi-code/sessions`)
+    /// — where the wire files appear, since the machine mounts the agent home
+    /// at `/root`. Used by the token-usage fallback.
+    pub sessions_dir: PathBuf,
+    /// The backend API URL rewritten for in-machine reachability (loopback →
+    /// the run block's host-side veth address, e.g. `10.231.0.1`).
+    pub api_url: String,
+}
+
 impl ExecEnv {
     pub fn host(devenv: bool) -> Self {
         ExecEnv::Host { devenv }
@@ -918,6 +944,7 @@ impl ExecEnv {
         match self {
             ExecEnv::Host { devenv } => *devenv,
             ExecEnv::Container(c) => c.devenv,
+            ExecEnv::Nspawn(n) => n.devenv,
         }
     }
 }
@@ -927,7 +954,9 @@ impl ExecEnv {
 /// (with `CI=1` / `DEVENV_NO_AI_AGENT=1`); without, it runs directly.
 /// Container mode: `docker exec -i -w /work [-e K=V]… <run> [devenv shell …
 /// --] <program> <args>` — the devenv shell is entered *inside* the container,
-/// where the image has it warmed.
+/// where the image has it warmed. Nspawn mode uses the root-owned helper's
+/// fixed `systemd-run -M --pipe` invocation, preserving stdio and environment
+/// without granting the daemon arbitrary systemd-run arguments.
 pub fn wrap_command(
     dir: &Path,
     exec: &ExecEnv,
@@ -936,6 +965,35 @@ pub fn wrap_command(
     env: &[(String, String)],
 ) -> std::process::Command {
     match exec {
+        ExecEnv::Nspawn(n) => {
+            let mut cmd = std::process::Command::new(&n.sudo);
+            cmd.arg("-n")
+                .arg(crate::nspawn::HELPER_BINARY)
+                .arg("exec")
+                .arg(&n.instance_id)
+                .arg(n.run_id.to_string())
+                .arg("--setenv=CI=1");
+            if n.devenv {
+                cmd.arg("--setenv=DEVENV_NO_AI_AGENT=1");
+            }
+            for (k, v) in env {
+                cmd.arg(format!("--setenv={k}={v}"));
+            }
+            cmd.arg("--");
+            // Keep the legacy human token out of the agent process even when
+            // it is set on the daemon (the machine inherits nothing, but the
+            // explicit unset keeps the contract identical to container mode).
+            cmd.arg("env").arg("-u").arg("REMOTER_TOKEN");
+            if n.devenv {
+                cmd.arg("devenv")
+                    .arg("shell")
+                    .arg("--no-tui")
+                    .arg("--no-eval-cache")
+                    .arg("--");
+            }
+            cmd.arg(program).args(args);
+            cmd
+        }
         ExecEnv::Container(c) => {
             let mut cmd = std::process::Command::new(&c.docker);
             cmd.arg("exec").arg("-i").arg("-w").arg(&c.work_dir);
@@ -2521,6 +2579,99 @@ mod tests {
         let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert!(args.iter().any(|a| a == "GREETING=hello world"));
         assert!(args.iter().any(|a| a == "PAYLOAD=$(rm -rf /); `id`"));
+        assert!(!args.iter().any(|a| a == "sh" || a == "-c"));
+    }
+
+    #[test]
+    fn wrap_command_nspawn_uses_helper_exec() {
+        let exec = ExecEnv::Nspawn(NspawnExec {
+            sudo: "sudo".to_string(),
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            run_id: 7,
+            work_dir: PathBuf::from("/work"),
+            devenv: true,
+            sessions_dir: PathBuf::from("/agent-home/.kimi-code/sessions"),
+            api_url: "http://10.231.0.1:8181".to_string(),
+        });
+        let env = vec![("REMOTER_EXECUTION".to_string(), "nspawn".to_string())];
+        let cmd = wrap_command(Path::new("/host/wt"), &exec, "kimi", &["acp"], &env);
+        assert_eq!(cmd.get_program(), "sudo");
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            args,
+            [
+                "-n",
+                "remoter-nspawnctl",
+                "exec",
+                "0123456789abcdef0123456789abcdef",
+                "7",
+                "--setenv=CI=1",
+                "--setenv=DEVENV_NO_AI_AGENT=1",
+                "--setenv=REMOTER_EXECUTION=nspawn",
+                "--",
+                "env",
+                "-u",
+                "REMOTER_TOKEN",
+                "devenv",
+                "shell",
+                "--no-tui",
+                "--no-eval-cache",
+                "--",
+                "kimi",
+                "acp",
+            ]
+        );
+    }
+
+    #[test]
+    fn wrap_command_nspawn_without_devenv_runs_the_program_directly() {
+        let exec = ExecEnv::Nspawn(NspawnExec {
+            sudo: "sudo".to_string(),
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            run_id: 9,
+            work_dir: PathBuf::from("/work"),
+            devenv: false,
+            sessions_dir: PathBuf::from("/agent-home/.kimi-code/sessions"),
+            api_url: "http://10.231.0.1:8181".to_string(),
+        });
+        let env = vec![("REMOTER_EXECUTION".to_string(), "nspawn".to_string())];
+        let cmd = wrap_command(Path::new("/host/wt"), &exec, "just", &["db-up"], &env);
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            args,
+            [
+                "-n",
+                "remoter-nspawnctl",
+                "exec",
+                "0123456789abcdef0123456789abcdef",
+                "9",
+                "--setenv=CI=1",
+                "--setenv=REMOTER_EXECUTION=nspawn",
+                "--",
+                "env",
+                "-u",
+                "REMOTER_TOKEN",
+                "just",
+                "db-up",
+            ]
+        );
+    }
+
+    #[test]
+    fn wrap_command_nspawn_env_is_argv_not_shell() {
+        let exec = ExecEnv::Nspawn(NspawnExec {
+            sudo: "sudo".to_string(),
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            run_id: 3,
+            work_dir: PathBuf::from("/work"),
+            devenv: false,
+            sessions_dir: PathBuf::from("/agent-home/.kimi-code/sessions"),
+            api_url: "http://10.231.0.1:8181".to_string(),
+        });
+        let env = vec![("PAYLOAD".to_string(), "$(rm -rf /); `id`".to_string())];
+        let cmd = wrap_command(Path::new("/host/wt"), &exec, "kimi", &["acp"], &env);
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(args.iter().any(|a| a == "--setenv=PAYLOAD=$(rm -rf /); `id`"));
         assert!(!args.iter().any(|a| a == "sh" || a == "-c"));
     }
 

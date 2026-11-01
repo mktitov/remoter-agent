@@ -36,23 +36,39 @@ fn default_retention_days() -> u64 {
 }
 
 /// How run attempts are executed (docs/specs/remoter-agent-containers.md):
-/// bare on the host (`devenv shell --`) or inside a per-run OCI container.
+/// bare on the host (`devenv shell --`), inside a per-run OCI container, or
+/// inside a per-run systemd-nspawn machine (NixOS hosts only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionMode {
     #[default]
     Host,
     Container,
+    Nspawn,
 }
 
-/// Container-mode settings (`[execution]`). All of it is irrelevant in host
-/// mode — the defaults keep a host-mode config file free of docker keys.
+impl ExecutionMode {
+    /// The config-file spelling (serde `snake_case`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExecutionMode::Host => "host",
+            ExecutionMode::Container => "container",
+            ExecutionMode::Nspawn => "nspawn",
+        }
+    }
+}
+
+/// Container/nspawn-mode settings (`[execution]`). All of it is irrelevant in
+/// host mode — the defaults keep a host-mode config file free of docker and
+/// nspawn keys.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ExecutionConfig {
     /// `host` (default) runs the agent on the daemon host; `container` runs
     /// every attempt inside a per-run docker container with postgres/minio
-    /// sidecars. There is no silent fallback from `container` to `host`.
+    /// sidecars; `nspawn` boots a per-run systemd-nspawn machine from a NixOS
+    /// closure with the host `/nix/store` bind-mounted read-only. There is no
+    /// silent fallback from `container`/`nspawn` to `host`.
     #[serde(default)]
     pub mode: ExecutionMode,
     /// The docker CLI binary (default `docker`).
@@ -83,6 +99,24 @@ pub struct ExecutionConfig {
     /// rebuilding. Default: unset (disabled).
     #[serde(default)]
     pub nix_binary_cache_dir: Option<PathBuf>,
+    /// Nspawn mode only: the NixOS system closure booted per run — either a
+    /// flake ref with an attribute (`path:/etc/remoter-agent#agentContainer`)
+    /// or a plain store path to an already-built toplevel. Each run realizes
+    /// it through a per-run GC root.
+    #[serde(default = "default_nspawn_closure_ref")]
+    pub nspawn_closure_ref: String,
+    /// Nspawn mode only: the first two octets of the per-run /30 pool used
+    /// for the machine veth pair. The root-owned helper coordinates leases
+    /// host-wide and must be configured with the same pool.
+    #[serde(default = "default_nspawn_net_pool_base")]
+    pub nspawn_net_pool_base: String,
+    /// Nspawn mode only: the sudo binary used to invoke `remoter-nspawnctl`.
+    #[serde(default = "default_sudo_binary")]
+    pub sudo_binary: String,
+    /// Runtime-generated daemon identity, persisted by `main` for lease
+    /// ownership and crash recovery. Not an operator configuration key.
+    #[serde(skip)]
+    pub nspawn_instance_id: Option<String>,
 }
 
 impl Default for ExecutionConfig {
@@ -96,6 +130,10 @@ impl Default for ExecutionConfig {
             mc_image: default_mc_image(),
             agent_home: None,
             nix_binary_cache_dir: None,
+            nspawn_closure_ref: default_nspawn_closure_ref(),
+            nspawn_net_pool_base: default_nspawn_net_pool_base(),
+            sudo_binary: default_sudo_binary(),
+            nspawn_instance_id: None,
         }
     }
 }
@@ -103,6 +141,18 @@ impl Default for ExecutionConfig {
 impl ExecutionConfig {
     pub fn is_container(&self) -> bool {
         self.mode == ExecutionMode::Container
+    }
+
+    pub fn is_nspawn(&self) -> bool {
+        self.mode == ExecutionMode::Nspawn
+    }
+
+    /// Isolated modes (container, nspawn) share the spec §5.8 exemption:
+    /// postgres/minio live inside the per-run runtime, so runs get no
+    /// `REMOTER_AGENT_PORT_BASE` and nothing host-side to sweep but the
+    /// runtime itself.
+    pub fn is_isolated(&self) -> bool {
+        self.mode != ExecutionMode::Host
     }
 
     /// The effective agent home (default `<workspace_root>/agent-home`).
@@ -128,6 +178,15 @@ fn default_minio_image() -> String {
 }
 fn default_mc_image() -> String {
     "minio/mc:RELEASE.2025-08-13T08-35-41Z".to_string()
+}
+fn default_nspawn_closure_ref() -> String {
+    "path:/etc/remoter-agent#agentContainer".to_string()
+}
+fn default_nspawn_net_pool_base() -> String {
+    "10.231".to_string()
+}
+fn default_sudo_binary() -> String {
+    "sudo".to_string()
 }
 
 const CONFIG_PATH_ENV: &str = "REMOTER_AGENT_CONFIG";
@@ -202,6 +261,8 @@ pub struct DriverConfig {
     /// `opencode-acp`…
     /// Container mode: reduced to a bare name at startup — the binary is
     /// spawned inside the run container and resolves against the image PATH.
+    /// Nspawn mode: resolved against the daemon PATH and canonicalized to an
+    /// executable under `/nix/store` at startup.
     #[serde(default = "default_agent_program")]
     pub agent_program: String,
     /// …invoked with these args (default `["acp"]`).
@@ -212,7 +273,8 @@ pub struct DriverConfig {
     /// daemon's own PATH into an absolute path at startup (spec §5.6) — the
     /// MCP client spawns it from inside the project worktree shell, where a
     /// bare name would hit the *project's* PATH instead of the host's.
-    /// An explicit path (any value containing `/`) is used as-is.
+    /// An explicit path (any value containing `/`) is used as-is except in
+    /// nspawn mode, which canonicalizes it and requires `/nix/store`.
     #[serde(default = "default_remoter_mcp_command")]
     pub remoter_mcp_command: String,
     /// Per-kind ACP `session/set_config_option` values. `None` leaves the
@@ -439,17 +501,26 @@ impl Config {
             driver.agent_program = "opencode".to_string();
         }
         let container_mode = file.execution.mode == ExecutionMode::Container;
+        let nspawn_mode = file.execution.mode == ExecutionMode::Nspawn;
         // The stub driver never touches MCP — skip resolution so dry-run
         // setups don't need the binary on the host. Container mode reduces
         // both program values to bare names instead: the agent and
         // `remoter-mcp` are spawned *inside* the run container and resolve
         // against the image's PATH — a host-absolute path (e.g. a NixOS
         // `/run/current-system/sw/bin/kimi`) does not exist there.
+        // Nspawn resolves both programs on the host and canonicalizes them
+        // into /nix/store, the only host path visible inside the machine.
         if container_mode {
             driver.agent_program = bare_program_name(&driver.agent_program, "agent_program");
             driver.remoter_mcp_command = bare_program_name(&driver.remoter_mcp_command, "remoter_mcp_command");
         } else if driver.kind != "stub" {
-            driver.remoter_mcp_command = resolve_mcp_command(&driver.remoter_mcp_command)?;
+            if nspawn_mode {
+                driver.agent_program = resolve_nspawn_program(&driver.agent_program, "agent_program")?;
+                driver.remoter_mcp_command =
+                    resolve_nspawn_program(&driver.remoter_mcp_command, "remoter_mcp_command")?;
+            } else {
+                driver.remoter_mcp_command = resolve_program(&driver.remoter_mcp_command, "remoter_mcp_command")?;
+            }
         }
         let workspace_root = expand_tilde(&file.workspace_root);
         let execution = ExecutionConfig {
@@ -465,7 +536,10 @@ impl Config {
                     .as_deref()
                     .map(expand_tilde_path)
                     .unwrap_or_else(|| {
-                        if container_mode {
+                        // Isolated modes mount the agent home at /root inside
+                        // the runtime — the wire files land there, not in the
+                        // host user's home.
+                        if execution.is_isolated() {
                             agent_home.join(".kimi-code/sessions")
                         } else {
                             default_sessions_dir()
@@ -506,14 +580,29 @@ impl Config {
         })
     }
 
-    /// Startup validation for container mode (spec: `docker info` must succeed
-    /// — a daemon that cannot reach docker cannot honor `mode = "container"`,
-    /// and silently degrading to host mode would strip the requested
-    /// isolation). Cheap and synchronous; called once from `main`.
+    /// Startup validation for the isolated execution modes (spec: `docker
+    /// info` must succeed for `container` — a daemon that cannot reach docker
+    /// cannot honor `mode = "container"`, and silently degrading to host mode
+    /// would strip the requested isolation; nspawn checks its own toolchain
+    /// likewise). Cheap and synchronous; called once from `main`.
     pub fn validate_execution(&self) -> anyhow::Result<()> {
-        if !self.execution.is_container() {
-            return Ok(());
+        match self.execution.mode {
+            ExecutionMode::Host => return Ok(()),
+            ExecutionMode::Container => self.validate_container_runtime()?,
+            ExecutionMode::Nspawn => {
+                std::fs::create_dir_all(&self.workspace_root).map_err(|e| {
+                    anyhow::anyhow!("cannot create workspace root {}: {e}", self.workspace_root.display())
+                })?;
+                let agent_home = self.execution.agent_home(&self.workspace_root);
+                std::fs::create_dir_all(&agent_home)
+                    .map_err(|e| anyhow::anyhow!("cannot create agent home {}: {e}", agent_home.display()))?;
+                self.validate_nspawn_runtime()?;
+            }
         }
+        self.validate_agent_home()
+    }
+
+    fn validate_container_runtime(&self) -> anyhow::Result<()> {
         let docker = &self.execution.docker_binary;
         let out = std::process::Command::new(docker)
             .arg("info")
@@ -525,6 +614,27 @@ impl Config {
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
+        Ok(())
+    }
+
+    /// Nspawn mode (NixOS hosts only): required host tools, systemd ≥ 256,
+    /// and the policy-validating helper reachable via non-interactive sudo.
+    fn validate_nspawn_runtime(&self) -> anyhow::Result<()> {
+        let paths: Vec<PathBuf> = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+        check_nspawn_binaries(paths.iter().cloned())?;
+        // Presence was just checked; the resolved path pins the binary the
+        // version check runs (a bare name would re-resolve identically).
+        let systemd_run = resolve_in_paths("systemd-run", paths).unwrap_or_else(|| "systemd-run".to_string());
+        check_systemd_version(&systemd_run)?;
+        check_nspawn_helper(&self.execution.sudo_binary)
+    }
+
+    /// Shared isolated-mode tail: the agent home is mounted at `/root` inside
+    /// the runtime, so the kimi sessions dir is created up-front and a missing
+    /// rendered config warns (the project's `.remoter/kimi-config.toml` is
+    /// rendered at runtime start with KIMI_API_KEY from the daemon's
+    /// environment).
+    fn validate_agent_home(&self) -> anyhow::Result<()> {
         let agent_home = self.execution.agent_home(&self.workspace_root);
         if self.driver.kind == "kimi-acp" {
             std::fs::create_dir_all(agent_home.join(".kimi-code/sessions"))
@@ -532,14 +642,70 @@ impl Config {
         }
         if self.driver.kind == "kimi-acp" && !agent_home.join(".kimi-code/config.toml").is_file() {
             tracing::warn!(
-                "container mode: {} does not exist — the agent's auth will fail unless the project's \
-                 .remoter/kimi-config.toml is in place (rendered at container start with KIMI_API_KEY \
+                "{} mode: {} does not exist — the agent's auth will fail unless the project's \
+                 .remoter/kimi-config.toml is in place (rendered at start with KIMI_API_KEY \
                  from the daemon's environment)",
+                self.execution.mode.as_str(),
                 agent_home.join(".kimi-code/config.toml").display()
             );
         }
         Ok(())
     }
+}
+
+/// Nspawn validation, split for tests: the nspawn toolchain on the daemon's
+/// PATH (nspawn mode requires a systemd host — NixOS).
+fn check_nspawn_binaries(paths: impl IntoIterator<Item = PathBuf> + Clone) -> anyhow::Result<()> {
+    for bin in ["systemd-nspawn", "machinectl", "systemd-run", "nix", "nix-store"] {
+        if resolve_in_paths(bin, paths.clone()).is_none() {
+            anyhow::bail!(
+                "execution.mode = \"nspawn\" but `{bin}` is not on the daemon's PATH \
+                 (nspawn mode requires a systemd host — NixOS)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Nspawn validation: `systemd-run -M --pipe` (the per-turn exec path) needs
+/// systemd ≥ 256.
+fn check_systemd_version(systemd_run: &str) -> anyhow::Result<()> {
+    let out = std::process::Command::new(systemd_run)
+        .arg("--version")
+        .output()
+        .map_err(|e| anyhow::anyhow!("execution.mode = \"nspawn\" but `systemd-run --version` could not run: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    match crate::nspawn::parse_systemd_version(&text) {
+        Some(v) if v >= crate::nspawn::MIN_SYSTEMD_VERSION => Ok(()),
+        Some(v) => anyhow::bail!(
+            "execution.mode = \"nspawn\" requires systemd >= {} (`systemd-run -M --pipe`), found {v}",
+            crate::nspawn::MIN_SYSTEMD_VERSION
+        ),
+        None => anyhow::bail!(
+            "execution.mode = \"nspawn\": could not parse `systemd-run --version` output: {}",
+            text.lines().next().unwrap_or("").trim()
+        ),
+    }
+}
+
+/// Nspawn validation: the privileged helper must be reachable via
+/// non-interactive sudo (the sudoers rule the operator docs ship).
+fn check_nspawn_helper(sudo: &str) -> anyhow::Result<()> {
+    let helper = crate::nspawn::HELPER_BINARY;
+    let out = std::process::Command::new(sudo)
+        .args(["-n", helper, "check"])
+        .output()
+        .map_err(|e| {
+            anyhow::anyhow!("execution.mode = \"nspawn\" but `{sudo} -n {helper} check` could not run: {e}")
+        })?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "execution.mode = \"nspawn\" but `{sudo} -n {helper} check` failed: {} — \
+             install the helper root-owned and whitelist it in sudoers (see README)",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// The token is a secret: a config file carrying it must be owner-only.
@@ -579,19 +745,48 @@ fn bare_program_name(cmd: &str, key: &str) -> String {
     bare
 }
 
-/// Resolves a bare MCP server command name against the daemon's own PATH into
-/// an absolute path (spec §5.6). Explicit paths pass through unchanged.
-fn resolve_mcp_command(cmd: &str) -> anyhow::Result<String> {
+/// Resolves a bare program name against the daemon's own PATH into an
+/// absolute path. Explicit paths pass through unchanged.
+fn resolve_program(cmd: &str, key: &str) -> anyhow::Result<String> {
+    let paths = std::env::var_os("PATH").unwrap_or_default();
+    resolve_program_in_paths(cmd, key, std::env::split_paths(&paths))
+}
+
+fn resolve_program_in_paths(cmd: &str, key: &str, paths: impl IntoIterator<Item = PathBuf>) -> anyhow::Result<String> {
     if cmd.contains('/') {
         return Ok(cmd.to_string());
     }
-    let paths = std::env::var_os("PATH").unwrap_or_default();
-    resolve_in_paths(cmd, std::env::split_paths(&paths)).ok_or_else(|| {
+    resolve_in_paths(cmd, paths).ok_or_else(|| {
         anyhow::anyhow!(
-            "`{cmd}` not found in the daemon's PATH — install the remoter flake packages on the host \
-             or set driver.remoter_mcp_command to an absolute path (spec §5.6)"
+            "`{cmd}` not found in the daemon's PATH — install the program on the host \
+             or set driver.{key} to an absolute path"
         )
     })
+}
+
+fn resolve_nspawn_program(cmd: &str, key: &str) -> anyhow::Result<String> {
+    let paths = std::env::var_os("PATH").unwrap_or_default();
+    resolve_nspawn_program_in_paths(cmd, key, std::env::split_paths(&paths), Path::new("/nix/store"))
+}
+
+fn resolve_nspawn_program_in_paths(
+    cmd: &str,
+    key: &str,
+    paths: impl IntoIterator<Item = PathBuf>,
+    store_root: &Path,
+) -> anyhow::Result<String> {
+    let program = resolve_program_in_paths(cmd, key, paths)?;
+    let canonical = std::fs::canonicalize(&program).map_err(|e| {
+        anyhow::anyhow!("execution.mode = \"nspawn\": cannot canonicalize driver.{key} = {program:?}: {e}")
+    })?;
+    if !canonical.starts_with(store_root) || !is_executable(&canonical) {
+        anyhow::bail!(
+            "execution.mode = \"nspawn\" requires driver.{key} to resolve to an executable under {}, got {}",
+            store_root.display(),
+            canonical.display()
+        );
+    }
+    Ok(canonical.to_string_lossy().into_owned())
 }
 
 fn resolve_in_paths(cmd: &str, paths: impl IntoIterator<Item = PathBuf>) -> Option<String> {
@@ -732,6 +927,167 @@ mode = "container""#,
         unsafe { std::env::remove_var(API_URL_ENV) };
         let toml = TOML.replace("[driver]", "[execution]\nmode = \"sidecar\"\n\n[driver]");
         assert!(Config::from_toml_str(&toml, Some("tok".to_string())).is_err());
+    }
+
+    #[test]
+    fn nspawn_mode_parses_with_defaults() {
+        // SAFETY: single-threaded test process env tweak; removed immediately.
+        unsafe { std::env::remove_var(API_URL_ENV) };
+        let toml = TOML.replace("[driver]", "[execution]\nmode = \"nspawn\"\n\n[driver]");
+        let cfg = Config::from_toml_str(&toml, Some("tok".to_string())).unwrap();
+        assert_eq!(cfg.execution.mode, ExecutionMode::Nspawn);
+        assert!(cfg.execution.is_nspawn());
+        assert!(cfg.execution.is_isolated());
+        assert!(!cfg.execution.is_container());
+        assert_eq!(
+            cfg.execution.nspawn_closure_ref,
+            "path:/etc/remoter-agent#agentContainer"
+        );
+        assert_eq!(cfg.execution.nspawn_net_pool_base, "10.231");
+        assert_eq!(cfg.execution.sudo_binary, "sudo");
+    }
+
+    #[test]
+    fn nspawn_mode_parses_custom_values() {
+        // SAFETY: single-threaded test process env tweak; removed immediately.
+        unsafe { std::env::remove_var(API_URL_ENV) };
+        let toml = TOML.replace(
+            "[driver]",
+            "[execution]\nmode = \"nspawn\"\nnspawn_closure_ref = \"/nix/store/abc-agent-container\"\n\
+             nspawn_net_pool_base = \"10.99\"\nsudo_binary = \"/usr/bin/sudo\"\n\n[driver]",
+        );
+        let cfg = Config::from_toml_str(&toml, Some("tok".to_string())).unwrap();
+        assert_eq!(cfg.execution.nspawn_closure_ref, "/nix/store/abc-agent-container");
+        assert_eq!(cfg.execution.nspawn_net_pool_base, "10.99");
+        assert_eq!(cfg.execution.sudo_binary, "/usr/bin/sudo");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nspawn_programs_canonicalize_explicit_symlinks_into_store() {
+        let dir = std::env::temp_dir().join(format!("remoter-nspawn-explicit-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = dir.join("nix/store");
+        let agent = store.join("abc123-kimi/bin/kimi");
+        let mcp = store.join("abc123-remoter-mcp/bin/remoter-mcp");
+        std::fs::create_dir_all(agent.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(mcp.parent().unwrap()).unwrap();
+        crate::testutil::write_executable_script(&agent, "#!/bin/sh\nexit 0\n");
+        crate::testutil::write_executable_script(&mcp, "#!/bin/sh\nexit 0\n");
+        let profile_bin = dir.join("profile/bin");
+        std::fs::create_dir_all(&profile_bin).unwrap();
+        let agent_link = profile_bin.join("kimi");
+        let mcp_link = profile_bin.join("remoter-mcp");
+        std::os::unix::fs::symlink(&agent, &agent_link).unwrap();
+        std::os::unix::fs::symlink(&mcp, &mcp_link).unwrap();
+
+        let resolved_agent =
+            resolve_nspawn_program_in_paths(agent_link.to_str().unwrap(), "agent_program", Vec::new(), &store).unwrap();
+        let resolved_mcp =
+            resolve_nspawn_program_in_paths(mcp_link.to_str().unwrap(), "remoter_mcp_command", Vec::new(), &store)
+                .unwrap();
+        assert_eq!(resolved_agent, agent.to_string_lossy());
+        assert_eq!(resolved_mcp, mcp.to_string_lossy());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn nspawn_programs_resolve_bare_names_against_daemon_path() {
+        let dir = std::env::temp_dir().join(format!("remoter-nspawn-bare-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = dir.join("nix/store");
+        let bin = store.join("abc123-tools/bin");
+        let agent = bin.join("kimi");
+        let mcp = bin.join("remoter-mcp");
+        std::fs::create_dir_all(agent.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(mcp.parent().unwrap()).unwrap();
+        crate::testutil::write_executable_script(&agent, "#!/bin/sh\nexit 0\n");
+        crate::testutil::write_executable_script(&mcp, "#!/bin/sh\nexit 0\n");
+
+        let resolved_agent =
+            resolve_nspawn_program_in_paths("kimi", "agent_program", vec![bin.clone()], &store).unwrap();
+        let resolved_mcp =
+            resolve_nspawn_program_in_paths("remoter-mcp", "remoter_mcp_command", vec![bin], &store).unwrap();
+        assert_eq!(resolved_agent, agent.to_string_lossy());
+        assert_eq!(resolved_mcp, mcp.to_string_lossy());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn nspawn_programs_reject_executables_outside_store() {
+        let dir = std::env::temp_dir().join(format!("remoter-nspawn-outside-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("nix/store");
+        let agent = dir.join("kimi");
+        let mcp = dir.join("remoter-mcp");
+        std::fs::create_dir_all(agent.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(mcp.parent().unwrap()).unwrap();
+        crate::testutil::write_executable_script(&agent, "#!/bin/sh\nexit 0\n");
+        crate::testutil::write_executable_script(&mcp, "#!/bin/sh\nexit 0\n");
+
+        for (program, key) in [(&agent, "agent_program"), (&mcp, "remoter_mcp_command")] {
+            let err = resolve_nspawn_program_in_paths(program.to_str().unwrap(), key, Vec::new(), &store)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(&format!("driver.{key}")), "{err}");
+            assert!(err.contains("executable under"), "{err}");
+            assert!(err.contains(&program.to_string_lossy().to_string()), "{err}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Nspawn validation, piecewise (no PATH mutation — parallel test threads
+    /// share the process environment): toolchain presence against a stub dir,
+    /// the systemd ≥ 256 version gate against a stub `systemd-run`, and the
+    /// helper check against a stub `sudo`.
+    #[test]
+    fn nspawn_validation_checks_toolchain_version_and_helper() {
+        let dir = std::env::temp_dir().join(format!("remoter-nspawn-cfg-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for bin in [
+            "systemd-nspawn",
+            "machinectl",
+            "systemd-run",
+            "nix",
+            "nix-store",
+            "sudo",
+        ] {
+            crate::testutil::write_executable_script(&dir.join(bin), "#!/bin/sh\nexit 0\n");
+        }
+
+        // Toolchain present in the stub dir, missing from an empty one.
+        check_nspawn_binaries(vec![dir.clone()]).unwrap();
+        let err = check_nspawn_binaries(vec![dir.join("empty")]).unwrap_err().to_string();
+        assert!(err.contains("systemd-nspawn"), "{err}");
+
+        // systemd 257 passes the version gate; 254 fails closed.
+        crate::testutil::write_executable_script(
+            &dir.join("systemd-run"),
+            "#!/bin/sh\necho 'systemd 257 (257.9)'\nexit 0\n",
+        );
+        check_systemd_version(dir.join("systemd-run").to_str().unwrap()).unwrap();
+        crate::testutil::write_executable_script(
+            &dir.join("systemd-run"),
+            "#!/bin/sh\necho 'systemd 254 (254.22)'\nexit 0\n",
+        );
+        let err = check_systemd_version(dir.join("systemd-run").to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("systemd >= 256"), "{err}");
+
+        // `sudo -n remoter-nspawnctl check` succeeding/failing gates startup.
+        check_nspawn_helper(dir.join("sudo").to_str().unwrap()).unwrap();
+        crate::testutil::write_executable_script(
+            &dir.join("sudo"),
+            "#!/bin/sh\necho 'sudo: a password is required' >&2\nexit 1\n",
+        );
+        let err = check_nspawn_helper(dir.join("sudo").to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("remoter-nspawnctl check"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1007,11 +1363,15 @@ review_model = "kimi-code/k3-reasoning""#,
     }
 
     #[test]
-    fn mcp_command_explicit_path_passes_through() {
+    fn program_explicit_path_passes_through_outside_nspawn() {
         assert_eq!(
-            resolve_mcp_command("/opt/remoter/remoter-mcp").unwrap(),
+            resolve_program("/opt/remoter/remoter-mcp", "remoter_mcp_command").unwrap(),
             "/opt/remoter/remoter-mcp"
         );
+        let err = resolve_program_in_paths("missing-agent", "agent_program", Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("driver.agent_program"), "{err}");
     }
 
     #[test]

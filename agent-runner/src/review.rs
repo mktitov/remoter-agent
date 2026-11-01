@@ -367,11 +367,16 @@ async fn ticket_branch(rc: &ReviewContext) -> Option<String> {
     )
 }
 
-/// The env every review turn (and its services/sidecars) gets — the same
-/// contract as claim runs (spec §5.8 + containers spec §3.4).
+/// The env every review turn (and its services) gets — the same contract as
+/// claim runs (spec §5.8 + containers spec §3.4): host mode exports the port
+/// block, container mode exports `REMOTER_CONTAINER=1` and loopback DB URLs,
+/// nspawn mode exports only `REMOTER_EXECUTION=nspawn`.
 fn review_env(rc: &ReviewContext) -> Vec<(String, String)> {
     if rc.config.execution.is_container() {
         return crate::container::container_env(rc.task.id);
+    }
+    if rc.config.execution.is_nspawn() {
+        return crate::nspawn::nspawn_env(rc.task.id);
     }
     let mut env = vec![
         ("CI".to_string(), "1".to_string()),

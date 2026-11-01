@@ -38,8 +38,16 @@ async fn main() -> anyhow::Result<()> {
         "remoter-agent starting"
     );
 
-    let config = Arc::new(Config::load()?);
+    let mut config = Config::load()?;
     config.validate_execution()?;
+    let _nspawn_identity = if config.execution.is_nspawn() {
+        let identity = remoter_agent::nspawn::lock_instance(&config.workspace_root)?;
+        config.execution.nspawn_instance_id = Some(identity.id().to_string());
+        Some(identity)
+    } else {
+        None
+    };
+    let config = Arc::new(config);
     tracing::info!(
         api_url = %config.api_url,
         workspace_root = %config.workspace_root.display(),
