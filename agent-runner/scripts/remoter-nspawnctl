@@ -1,0 +1,114 @@
+#!/bin/sh
+# remoter-nspawnctl — privileged helper for remoter-agent's nspawn execution
+# mode (`execution.mode = "nspawn"`, ticket #237). The daemon stays an
+# unprivileged user and reaches the few root operations it needs through this
+# script, invoked non-interactively:
+#
+#   sudo -n remoter-nspawnctl <subcommand> [args]
+#
+# Install root-owned (e.g. via the NixOS snippet in remoter-agent.toml's
+# [execution] comments) and grant the daemon user NOPASSWD for exactly this
+# file in sudoers — plus systemd-nspawn / systemd-run / machinectl, which the
+# daemon invokes directly.
+#
+# Subcommands:
+#   check
+#       Exit 0 if the host can run nspawn mode (systemd-nspawn, machinectl,
+#       systemd-run and the networking tools are present). The daemon runs
+#       this at startup and refuses to boot otherwise.
+#   net-up <ifname> <host_ip> <prefix_len>
+#       Idempotent host-side setup for one run's veth interface: assign
+#       <host_ip>/<prefix_len> to <ifname>, ensure the pool-wide masquerade
+#       rule exists, enable IPv4 forwarding. The pool subnet is derived from
+#       <host_ip>'s first two octets as a /16 (matches the daemon's
+#       nspawn_net_pool_base convention, e.g. 10.231 -> 10.231.0.0/16).
+#   net-down <ifname> <host_ip>
+#       Remove the run's address from <ifname> (already-gone is fine). The
+#       pool masquerade rule is deliberately left in place — it is one-time,
+#       pool-wide state, not per-run.
+set -eu
+
+prog=$(basename "$0")
+
+usage() {
+    cat >&2 <<EOF
+usage: $prog check
+       $prog net-up <ifname> <host_ip> <prefix_len>
+       $prog net-down <ifname> <host_ip>
+EOF
+    exit 64 # EX_USAGE
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+die() {
+    echo "$prog: $*" >&2
+    exit 1
+}
+
+[ $# -ge 1 ] || usage
+cmd=$1
+shift
+
+case "$cmd" in
+check)
+    [ $# -eq 0 ] || usage
+    missing=""
+    for tool in systemd-nspawn machinectl systemd-run ip iptables; do
+        if ! have "$tool"; then
+            missing="$missing $tool"
+        fi
+    done
+    if [ -n "$missing" ]; then
+        echo "$prog: missing required tools:$missing" >&2
+        exit 1
+    fi
+    ;;
+
+net-up)
+    [ $# -eq 3 ] || usage
+    ifname=$1
+    host_ip=$2
+    prefix_len=$3
+
+    # Interface address (idempotent).
+    if ! ip addr show dev "$ifname" | grep -q "inet ${host_ip}/"; then
+        ip addr add "${host_ip}/${prefix_len}" dev "$ifname"
+    fi
+    ip link set dev "$ifname" up
+
+    # One-time masquerade for the whole pool subnet (/16 derived from the
+    # pool base), so machines reach the host's network (e.g. the Remoter API
+    # proxied via the gateway, or outbound fetches).
+    pool_prefix=$(echo "$host_ip" | cut -d. -f1-2)
+    pool_subnet="${pool_prefix}.0.0/16"
+    if ! iptables -t nat -C POSTROUTING -s "$pool_subnet" -j MASQUERADE 2>/dev/null; then
+        iptables -t nat -A POSTROUTING -s "$pool_subnet" -j MASQUERADE
+    fi
+
+    # Forwarding is required for the NAT path. This flips the runtime value
+    # only; NixOS hosts should also set boot.kernel.sysctl
+    #."net.ipv4.ip_forward" = true so it survives reboots.
+    if [ "$(cat /proc/sys/net/ipv4/ip_forward)" != "1" ]; then
+        sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    fi
+    ;;
+
+net-down)
+    [ $# -eq 2 ] || usage
+    ifname=$1
+    host_ip=$2
+
+    # The prefix length is not passed in; recover it from the interface.
+    # Already-gone (interface destroyed with the machine) is fine.
+    current=$(ip -o -4 addr show dev "$ifname" 2>/dev/null \
+        | awk '{print $4}' | grep "^${host_ip}/" || true)
+    if [ -n "$current" ]; then
+        ip addr del "$current" dev "$ifname"
+    fi
+    ;;
+
+*)
+    usage
+    ;;
+esac

@@ -17,6 +17,7 @@ use crate::{
     forge, image,
     image::ImageLocks,
     logstore::LogStore,
+    nspawn,
     ports::PortBlock,
     session_log::SessionLogger,
     workspace::{self, ExecEnv},
@@ -1034,13 +1035,18 @@ fn sum_tokens(a: Option<i64>, b: Option<i64>) -> Option<i64> {
     }
 }
 
-/// The env every run (and its services/sidecars) gets (spec §5.8 + containers
-/// spec §3.4). Host mode exports the run's port block; container mode exports
+/// The env every run (and its services) gets (spec §5.8 + containers spec
+/// §3.4). Host mode exports the run's port block; container mode exports
 /// `REMOTER_CONTAINER=1` and loopback DB URLs instead (the postgres sidecar
-/// shares the run container's network namespace).
+/// shares the run container's network namespace); nspawn mode exports only
+/// `REMOTER_EXECUTION=nspawn` — services are the project's own devenv
+/// processes and the machine's private netns makes default ports safe.
 fn run_env(rc: &RunContext) -> Vec<(String, String)> {
     if rc.config.execution.is_container() {
         return container::container_env(rc.task.id);
+    }
+    if rc.config.execution.is_nspawn() {
+        return nspawn::nspawn_env(rc.task.id);
     }
     let mut env = vec![
         ("CI".to_string(), "1".to_string()),
@@ -1052,18 +1058,12 @@ fn run_env(rc: &RunContext) -> Vec<(String, String)> {
     env
 }
 
-/// The `RunSpec.exec` for a driver turn: host (optionally devenv-wrapped) or
-/// `docker exec` into the run container.
+/// The `RunSpec.exec` for a driver turn: host (optionally devenv-wrapped),
+/// `docker exec` into the run container, or `sudo systemd-run -M --pipe` into
+/// the run machine.
 pub(crate) fn exec_env(config: &Config, run_id: i32, devenv: bool) -> ExecEnv {
-    if !config.execution.is_container() {
-        return ExecEnv::host(devenv);
-    }
-    ExecEnv::Container(workspace::ContainerExec {
-        docker: config.execution.docker_binary.clone(),
-        container: container::run_container_name(run_id),
-        work_dir: std::path::PathBuf::from(container::WORK_DIR),
-        devenv,
-        sessions_dir: config.driver.sessions_dir.clone().unwrap_or_else(|| {
+    let sessions_dir = || {
+        config.driver.sessions_dir.clone().unwrap_or_else(|| {
             config
                 .execution
                 .agent_home(&config.workspace_root)
@@ -1072,20 +1072,52 @@ pub(crate) fn exec_env(config: &Config, run_id: i32, devenv: bool) -> ExecEnv {
                 } else {
                     "sessions"
                 })
-        }),
-        api_url: container::container_api_url(&config.api_url),
-    })
+        })
+    };
+    if config.execution.is_container() {
+        return ExecEnv::Container(workspace::ContainerExec {
+            docker: config.execution.docker_binary.clone(),
+            container: container::run_container_name(run_id),
+            work_dir: std::path::PathBuf::from(container::WORK_DIR),
+            devenv,
+            sessions_dir: sessions_dir(),
+            api_url: container::container_api_url(&config.api_url),
+        });
+    }
+    if config.execution.is_nspawn() {
+        return ExecEnv::Nspawn(workspace::NspawnExec {
+            sudo: config.execution.sudo_binary.clone(),
+            machine: nspawn::run_machine_name(run_id),
+            work_dir: std::path::PathBuf::from(nspawn::WORK_DIR),
+            devenv,
+            sessions_dir: sessions_dir(),
+            api_url: nspawn::nspawn_api_url_for(&config.api_url, run_id),
+        });
+    }
+    ExecEnv::host(devenv)
 }
 
-/// Container-mode runtime for one driver turn (shared by `attempt_run`, the
-/// rebase-nudge loop, and `supervise::run_attempt`): ensure the project's
-/// agent image, start the run container + sidecars, and — when the worktree
-/// carries a justfile — run the project's `just db-up` inside the container
-/// (its `REMOTER_CONTAINER=1` branch only waits for the sidecars; projects
-/// without a justfile have no services to wait for and skip the step). Host
-/// mode returns `None` and the caller falls back to
-/// `workspace::services_up`/`services_down`. No silent fallback: a
-/// container-mode failure propagates as a run failure, never a host run.
+/// The per-run isolated runtime one driver turn holds: containers in
+/// container mode, a booted machine in nspawn mode. Callers never read the
+/// payload — holding the guard *is* the point; its drop is the teardown on
+/// every exit path, including cancellation.
+#[allow(dead_code)]
+pub(crate) enum RunRuntime {
+    Containers(container::RunContainers),
+    Nspawn(Box<nspawn::NspawnMachine>),
+}
+
+/// Isolated-mode runtime for one driver turn (shared by `attempt_run`, the
+/// rebase-nudge loop, `supervise::run_attempt`, and `review::run_attempt`).
+/// Container mode: ensure the project's agent image, start the run container
+/// and its sidecars, then — when the worktree carries a justfile — run the
+/// project's `just db-up` inside (its `REMOTER_CONTAINER=1` branch only waits
+/// for the sidecars). Nspawn mode: resolve the shared NixOS closure
+/// (content-cached — no image bake), boot the run machine, then bring up the
+/// project's own devenv services inside it (`nspawn_services_up`). Host mode
+/// returns `None` and the caller falls back to
+/// `workspace::services_up`/`services_down`. No silent fallback: an
+/// isolated-mode failure propagates as a run failure, never a host run.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_container_runtime(
     config: &Config,
@@ -1097,34 +1129,56 @@ pub(crate) async fn start_container_runtime(
     devenv: bool,
     env: &[(String, String)],
     refs: &[workspace::RefMount],
-) -> Result<Option<container::RunContainers>, RunFailure> {
-    if !config.execution.is_container() {
+) -> Result<Option<RunRuntime>, RunFailure> {
+    if !config.execution.is_isolated() {
         return Ok(None);
     }
     let repo = workspace::repo_dir(&config.workspace_root, project.project_id);
-    let image = image::ensure_project_image(&config.execution, image_locks, &repo, project, task_id)
+    if config.execution.is_container() {
+        let image = image::ensure_project_image(&config.execution, image_locks, &repo, project, task_id)
+            .await
+            .map_err(|e| RunFailure::new(e, None))?;
+        let containers = container::start(container::ContainerSpec {
+            cfg: &config.execution,
+            driver_kind: &config.driver.kind,
+            run_id,
+            project_id: project.project_id,
+            image: &image,
+            worktree,
+            repo: &repo,
+            agent_home: &config.execution.agent_home(&config.workspace_root),
+            env,
+            refs,
+        })
         .await
         .map_err(|e| RunFailure::new(e, None))?;
-    let containers = container::start(container::ContainerSpec {
+        if devenv && worktree_has_justfile(worktree) {
+            container_services_up(config, run_id, env).await?;
+        } else if devenv {
+            tracing::info!(run_id, "no justfile in worktree — skipping db-up (no sidecar wait)");
+        }
+        return Ok(Some(RunRuntime::Containers(containers)));
+    }
+    let closure = nspawn::resolve_closure(&config.execution)
+        .await
+        .map_err(|e| RunFailure::new(e, None))?;
+    let machine = nspawn::start(nspawn::NspawnSpec {
         cfg: &config.execution,
         driver_kind: &config.driver.kind,
         run_id,
-        project_id: project.project_id,
-        image: &image,
+        closure: &closure,
         worktree,
         repo: &repo,
         agent_home: &config.execution.agent_home(&config.workspace_root),
-        env,
         refs,
     })
     .await
     .map_err(|e| RunFailure::new(e, None))?;
-    if devenv && worktree_has_justfile(worktree) {
-        container_services_up(config, run_id, env).await?;
-    } else if devenv {
-        tracing::info!(run_id, "no justfile in worktree — skipping db-up (no sidecar wait)");
+    if devenv {
+        // On failure `machine` drops here — its Drop terminates the machine.
+        nspawn_services_up(config, run_id, worktree, env).await?;
     }
-    Ok(Some(containers))
+    Ok(Some(RunRuntime::Nspawn(Box::new(machine))))
 }
 
 /// Whether the worktree carries a justfile — the `db-up` contract below is
@@ -1139,9 +1193,11 @@ fn worktree_has_justfile(worktree: &Path) -> bool {
 
 /// `just db-up` inside the run container — under `REMOTER_CONTAINER=1` the
 /// justfile only waits for the already-running sidecars (no devenv services).
-/// Called only when the worktree carries a justfile (see
-/// `worktree_has_justfile`); a justfile without a `db-up` recipe stays a hard
-/// error — that signals a broken project contract, not a missing one.
+/// Container mode only; nspawn mode uses the project's own devenv services
+/// instead (`nspawn_services_up`). Called only when the worktree carries a
+/// justfile (see `worktree_has_justfile`); a justfile without a `db-up`
+/// recipe stays a hard error — that signals a broken project contract, not a
+/// missing one.
 async fn container_services_up(config: &Config, run_id: i32, env: &[(String, String)]) -> Result<(), RunFailure> {
     let exec = exec_env(config, run_id, true);
     let cmd = workspace::wrap_command(Path::new("/"), &exec, "just", &["db-up"], env);
@@ -1157,6 +1213,100 @@ async fn container_services_up(config: &Config, run_id: i32, env: &[(String, Str
         return Err(RunFailure::new(
             DriverError::Transient(format!(
                 "container services up (just db-up, {}): {}{}",
+                out.status,
+                stderr.trim(),
+                if stderr.trim().is_empty() { stdout.trim() } else { "" }
+            )),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// Nspawn-mode services: the project's own (its devenv.nix), never the
+/// daemon's — the daemon provides no databases or buckets in this mode. The
+/// machine's /nix/store is the host store bind-mounted read-only, so builds
+/// inside the machine are impossible by design: the worktree's devenv
+/// environment (shell + process packages) is first realized on the host with
+/// `devenv build` — the same warm image.rs pays into the container image —
+/// then `devenv up -d` + `devenv processes wait` run *inside* the machine
+/// (mirroring host mode's `workspace::services_up`, including the best-effort
+/// `processes down` before and on failure). No `services_down` at run end:
+/// the machine is terminated wholesale.
+async fn nspawn_services_up(
+    config: &Config,
+    run_id: i32,
+    worktree: &Path,
+    env: &[(String, String)],
+) -> Result<(), RunFailure> {
+    // Host pre-warm: realize the shell and process packages into the host
+    // store, where the machine's read-only /nix/store bind sees them.
+    let mut warm = std::process::Command::new("devenv");
+    warm.args(["--no-eval-cache", "build"])
+        .current_dir(worktree)
+        .env("CI", "1")
+        .env("DEVENV_NO_AI_AGENT", "1")
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    let out = tokio::process::Command::from(warm)
+        .output()
+        .await
+        .map_err(|e| RunFailure::new(DriverError::Transient(format!("nspawn devenv pre-warm: {e}")), None))?;
+    if !out.status.success() {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(RunFailure::new(
+            DriverError::Transient(format!(
+                "nspawn devenv pre-warm (host devenv build, {}): {}{}",
+                out.status,
+                stderr.trim(),
+                if stderr.trim().is_empty() { stdout.trim() } else { "" }
+            )),
+            None,
+        ));
+    }
+
+    let result = async {
+        nspawn_devenv(config, run_id, env, &["up", "-d"]).await?;
+        nspawn_devenv(config, run_id, env, &["processes", "wait", "--timeout", "120"]).await
+    }
+    .await;
+    if result.is_err() {
+        // Best-effort, must not mask the real error (same rule as host mode).
+        let _ = nspawn_devenv(config, run_id, env, &["processes", "down"]).await;
+    }
+    result
+}
+
+/// `devenv --no-eval-cache <args>` inside the run machine (at `/work`) via
+/// the nspawn exec env. `devenv: false` on the exec env: this invokes the
+/// devenv CLI directly, not wrapped in `devenv shell --`.
+async fn nspawn_devenv(
+    config: &Config,
+    run_id: i32,
+    env: &[(String, String)],
+    args: &[&str],
+) -> Result<(), RunFailure> {
+    let exec = exec_env(config, run_id, false);
+    let mut env = env.to_vec();
+    env.push(("DEVENV_NO_AI_AGENT".to_string(), "1".to_string()));
+    let mut argv = vec!["--no-eval-cache"];
+    argv.extend_from_slice(args);
+    let cmd = workspace::wrap_command(Path::new("/"), &exec, "devenv", &argv, &env);
+    let out = tokio::process::Command::from(cmd).output().await.map_err(|e| {
+        RunFailure::new(
+            DriverError::Transient(format!("nspawn devenv {}: {e}", args.join(" "))),
+            None,
+        )
+    })?;
+    if !out.status.success() {
+        // Same stderr/stdout trap as container_services_up (run #944): an
+        // error built from stderr alone can come out empty.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(RunFailure::new(
+            DriverError::Transient(format!(
+                "nspawn devenv {} ({}): {}{}",
+                args.join(" "),
                 out.status,
                 stderr.trim(),
                 if stderr.trim().is_empty() { stdout.trim() } else { "" }

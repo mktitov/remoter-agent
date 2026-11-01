@@ -38,6 +38,7 @@ pub fn merged_mcp_servers(
 ) -> Vec<McpServer> {
     let expand_as = match exec {
         crate::workspace::ExecEnv::Container(c) => c.work_dir.clone(),
+        crate::workspace::ExecEnv::Nspawn(n) => n.work_dir.clone(),
         crate::workspace::ExecEnv::Host { .. } => worktree.to_path_buf(),
     };
     let mut servers = repo_mcp_servers(worktree, &expand_as);
