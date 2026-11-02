@@ -38,7 +38,7 @@ pub fn merged_mcp_servers(
 ) -> Vec<McpServer> {
     let expand_as = match exec {
         crate::workspace::ExecEnv::Container(c) => c.work_dir.clone(),
-        crate::workspace::ExecEnv::Host { .. } => worktree.to_path_buf(),
+        crate::workspace::ExecEnv::Bwrap(_) | crate::workspace::ExecEnv::Host { .. } => worktree.to_path_buf(),
     };
     let mut servers = repo_mcp_servers(worktree, &expand_as);
     servers.retain(|s| server_name(s) != REMOTER_MCP_NAME);
@@ -294,6 +294,45 @@ mod tests {
             &crate::workspace::ExecEnv::host(false),
         );
         assert_eq!(stdio(&servers[0]).args, ["--role", "dev-agent-review"]);
+    }
+
+    #[test]
+    fn bwrap_expands_worktree_to_the_original_absolute_path() {
+        let dir = std::env::temp_dir().join(format!("remoter-mcp-bwrap-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".mcp.json"),
+            r#"{ "mcpServers": { "docs": { "url": "http://localhost:6006/mcp", "headers": { "X-Path": "${WORKTREE}" } } } }"#,
+        )
+        .unwrap();
+        let exec = crate::workspace::ExecEnv::Bwrap(crate::workspace::BwrapExec {
+            launcher: Path::new("/run/current-system/sw/bin/remoter-agent").to_path_buf(),
+            bwrap: "bwrap".to_string(),
+            slirp4netns: "slirp4netns".to_string(),
+            agent_home: Path::new("/agent-home").to_path_buf(),
+            state_root: Path::new("/state").to_path_buf(),
+            devenv: false,
+            retained_commands: Vec::new(),
+            sessions_dir: Path::new("/agent-home/.kimi-code/sessions").to_path_buf(),
+            api_url: "http://10.0.2.2:8181".to_string(),
+        });
+        let servers = merged_mcp_servers(
+            &dir,
+            "remoter-mcp",
+            "http://10.0.2.2:8181",
+            "tok",
+            None,
+            RunKind::Review,
+            249,
+            &exec,
+        );
+        let McpServer::Http(docs) = &servers[0] else {
+            panic!("expected http")
+        };
+        assert_eq!(docs.headers[0].value, dir.to_string_lossy());
+        assert_ne!(docs.headers[0].value, "/work");
+        assert_eq!(stdio(&servers[1]).env[0].value, "http://10.0.2.2:8181");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

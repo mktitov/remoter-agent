@@ -28,7 +28,8 @@
 #   - `kimi` or `opencode` CLI on PATH — the ACP agent the daemon shells out to;
 #   - `git` and `devenv` — the daemon clones repos and brings project devenv
 #     services up/down during runs;
-#   - `docker` — only for the daemon's container execution mode.
+#   - `docker` — only for the daemon's container execution mode;
+#   - `bubblewrap` and `slirp4netns` — only for rootless bwrap mode on NixOS.
 {
   description = "Remoter agent tooling — MCP server and the remoter-agent daemon";
 

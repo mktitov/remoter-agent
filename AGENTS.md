@@ -44,6 +44,28 @@ mode:
 - Git operations that touch origin (fetch/push) are done by the daemon on the
   host after your turn — never push yourself unless told to.
 
+### Running inside a remoter-agent Bubblewrap sandbox
+
+Bubblewrap mode (`execution.mode = "bwrap"`, NixOS only) is rootless and does
+not use Docker, images, sidecars, or systemd-nspawn:
+
+- `REMOTER_EXECUTION=bwrap` is set; `REMOTER_CONTAINER` and
+  `REMOTER_AGENT_PORT_BASE` are absent. Each run has an independent localhost,
+  so project devenv services use their normal ports.
+- Your cwd is the ticket worktree at its original absolute host path; `/work`
+  is only a compatibility symlink. Git metadata works normally, references are
+  read-only, and `/nix/store` is read-only.
+- The daemon pre-warms devenv on the host. Do not run Nix builds/substitution
+  in the guest; missing store paths mean the host pre-warm must be fixed.
+- The daemon's loopback API is reachable as `10.0.2.2`; `REMOTER_API_URL` for
+  remoter-mcp already points there. Git operations that touch origin are done
+  by the daemon on the host after your turn — never push yourself unless told.
+
+The opt-in real NixOS suite is
+`devenv shell --no-tui --no-eval-cache -- nix shell nixpkgs#bubblewrap nixpkgs#slirp4netns -c cargo test --test bwrap_live -- --ignored --nocapture --test-threads=1`.
+Run it when changing the bwrap launcher, mounts, network, Nix snapshot, or
+lifecycle. See `agent-runner/README.md` for the full operator contract.
+
 ## Agent container image (`.remoter/`)
 
 `.remoter/` is the build context of this project's own agent image — what

@@ -118,6 +118,7 @@ impl AgentDriver for AcpDriver {
             // loopback API URL is rewritten to host.docker.internal.
             match &spec.exec {
                 workspace::ExecEnv::Container(c) => &c.api_url,
+                workspace::ExecEnv::Bwrap(c) => &c.api_url,
                 workspace::ExecEnv::Host { .. } => &self.api_url,
             },
             &self.token,
@@ -129,20 +130,20 @@ impl AgentDriver for AcpDriver {
         let transport = ByteStreams::new(stdin, stdout);
 
         let updates = capture.clone();
-        // Container mode: the ACP session's cwd is the in-container mount
-        // point (`/work`); on the host it's the worktree itself.
+        // Container mode uses `/work`; bwrap deliberately preserves the real
+        // worktree path so host and guest devenv derivations match.
         let cwd = match &spec.exec {
             workspace::ExecEnv::Container(c) => c.work_dir.clone(),
-            workspace::ExecEnv::Host { .. } => spec.cwd.clone(),
+            workspace::ExecEnv::Bwrap(_) | workspace::ExecEnv::Host { .. } => spec.cwd.clone(),
         };
         let prompt = spec.prompt.clone();
         let resume = spec.resume_session.clone();
         let logger = spec.logger.clone();
         let config_options = spec.config_options.clone();
-        // Container mode: the wire files land in the host-side agent home
-        // (mounted at /root in the container), not the host user's home.
+        // Isolated modes persist wire files in the shared agent home.
         let sessions_dir = match &spec.exec {
             workspace::ExecEnv::Container(c) => Some(c.sessions_dir.clone()),
+            workspace::ExecEnv::Bwrap(c) => Some(c.sessions_dir.clone()),
             workspace::ExecEnv::Host { .. } => self.sessions_dir.clone(),
         };
         let kimi_usage_enabled = self.program == "kimi" || self.program.ends_with("/kimi");

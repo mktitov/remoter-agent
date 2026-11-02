@@ -116,6 +116,22 @@ mode the postgres/minio sidecars share the run container's network namespace
 apply inside containers and `REMOTER_AGENT_PORT_BASE` is never exported
 there.
 
+### 2.5 Bubblewrap mode
+
+With `[execution] mode = "bwrap"` on NixOS, no `.remoter/agent.Dockerfile`,
+Docker image, or container sidecars are needed. The daemon pre-warms the
+project's devenv shell on the host and starts its processes inside a rootless
+sandbox with a read-only `/nix/store`. Keep `devenv.nix`/`devenv.yaml` complete
+and reproducible; a closure missing after pre-warm is a hard error, not a guest
+build request.
+
+Every sandbox has an independent localhost, so §2.2 port parameterization is
+not needed inside bwrap and `REMOTER_AGENT_PORT_BASE` is absent. Use normal
+service ports and `REMOTER_EXECUTION=bwrap` for detection, not
+`REMOTER_CONTAINER`. The optional secret-free `.remoter/kimi-config.toml` is
+also used in this mode. See `agent-runner/README.md` for host prerequisites and
+the live verification command.
+
 ## 3. Final checklist
 
 Before finishing the ticket:

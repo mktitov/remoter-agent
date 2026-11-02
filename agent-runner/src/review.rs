@@ -373,6 +373,9 @@ fn review_env(rc: &ReviewContext) -> Vec<(String, String)> {
     if rc.config.execution.is_container() {
         return crate::container::container_env(rc.task.id);
     }
+    if rc.config.execution.is_bwrap() {
+        return crate::bwrap::run_env(rc.task.id);
+    }
     let mut env = vec![
         ("CI".to_string(), "1".to_string()),
         ("REMOTER_AGENT_TASK_ID".to_string(), rc.task.id.to_string()),
@@ -392,6 +395,12 @@ async fn run_attempt(
     prompt: &str,
     env: &AttemptEnv<'_>,
 ) -> Option<Result<RunOutcome, RunFailure>> {
+    if rc.config.execution.is_bwrap() && rc.project.is_none() {
+        return Some(Err(RunFailure::new(
+            DriverError::Permanent("bwrap review requires an agent-managed project repository".to_string()),
+            None,
+        )));
+    }
     let env_vars = review_env(rc);
     // Container mode: the review turn runs in a container like any other run —
     // no silent fallback to host. A ticket whose project is not agent-managed
@@ -450,9 +459,8 @@ async fn run_attempt(
         }
         None => None,
     };
-    if containers.is_none() {
-        // Host mode surfaces the mounts as symlinks; container mode
-        // bind-mounts them (container.rs).
+    if containers.as_ref().is_none_or(run::RunRuntime::links_refs) {
+        // Host and bwrap use symlinks; Docker bind-mounts references.
         for (mount, error) in workspace::link_refs_into(env.cwd, &child_refs).await {
             note(
                 &rc.client,

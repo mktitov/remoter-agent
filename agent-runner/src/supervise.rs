@@ -841,6 +841,9 @@ fn supervise_env(rc: &SuperviseContext) -> Vec<(String, String)> {
     if rc.config.execution.is_container() {
         return crate::container::container_env(rc.parent.id);
     }
+    if rc.config.execution.is_bwrap() {
+        return crate::bwrap::run_env(rc.parent.id);
+    }
     let mut env = vec![
         ("CI".to_string(), "1".to_string()),
         ("REMOTER_AGENT_TASK_ID".to_string(), rc.parent.id.to_string()),
@@ -861,6 +864,12 @@ async fn run_attempt(
     resume_session: Option<String>,
     env: &AttemptEnv<'_>,
 ) -> Option<Result<RunOutcome, RunFailure>> {
+    if rc.config.execution.is_bwrap() && rc.project.is_none() {
+        return Some(Err(RunFailure::new(
+            DriverError::Permanent("bwrap supervise requires an agent-managed project repository".to_string()),
+            None,
+        )));
+    }
     let env_vars = supervise_env(rc);
     // Container mode: the supervise turn runs in a container like any other
     // run — no silent fallback to host (a container-start failure is a normal
@@ -904,9 +913,8 @@ async fn run_attempt(
         }
         None => None,
     };
-    if containers.is_none() {
-        // Host mode surfaces the mounts as symlinks (container mode
-        // bind-mounts them — see container.rs, no change needed there).
+    if containers.as_ref().is_none_or(run::RunRuntime::links_refs) {
+        // Host and bwrap use symlinks; Docker bind-mounts references.
         for (mount, error) in workspace::link_refs_into(env.cwd, &child_refs).await {
             note(
                 &rc.client,
@@ -1116,7 +1124,7 @@ async fn build_prompt(rc: &SuperviseContext) -> Result<String, crate::client::Cl
         &parent_detail,
         &children,
         git.as_ref(),
-        rc.config.execution.is_container(),
+        rc.config.execution.is_isolated(),
     ))
 }
 

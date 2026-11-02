@@ -15,7 +15,15 @@ use tracing_subscriber::prelude::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    if std::env::args().any(|arg| arg == "--version") {
+    let args: Vec<String> = std::env::args().collect();
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == remoter_agent::bwrap::INTERNAL_LAUNCH_ARG)
+    {
+        let code = remoter_agent::bwrap::launch_from_args(&args[1..])?;
+        std::process::exit(code);
+    }
+    if args.iter().any(|arg| arg == "--version") {
         println!("{}", remoter_agent::version::line("remoter-agent"));
         return Ok(());
     }

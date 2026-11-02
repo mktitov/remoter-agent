@@ -20,15 +20,13 @@ max_attempts        = 3
 stall_idle_secs     = 300
 stall_grace_secs    = 30
 
-# Execution environment (docs/specs/remoter-agent-containers.md). Default is
-# host mode — the agent runs on this host via `devenv shell --`. In container
-# mode every attempt runs inside a per-run docker container with postgres/minio
-# sidecars sharing its network namespace (127.0.0.1:5432 / 127.0.0.1:9000 — no
-# REMOTER_AGENT_PORT_BASE inside); the daemon checks `docker info` at startup
-# and fails to boot without it.
+# Execution environment. Default is host mode — the agent runs on this host via
+# `devenv shell --`. Isolated modes never silently fall back to host execution.
 # [execution]
-# mode = "container"               # "host" | "container"
-# docker_binary = "docker"
+# mode = "bwrap"                   # "host" | "container" | "bwrap"
+# bwrap_binary = "bwrap"           # bwrap only: rootless sandbox launcher
+# slirp4netns_binary = "slirp4netns" # bwrap only: per-run user-mode network
+# docker_binary = "docker"         # container only; checked with `docker info`
 # image_tag_prefix = "remoter-agent"   # tags: <prefix>:p<project_id>-<sha256-16>
 #                                      # over the project's .remoter/agent.Dockerfile
 #                                      # (+ agent-init.sh); the daemon prunes
@@ -39,9 +37,10 @@ stall_grace_secs    = 30
 # minio_image    = "minio/minio:RELEASE.2025-09-07T16-13-09Z"
 # mc_image       = "minio/mc:RELEASE.2025-08-13T08-35-41Z"
 # agent_home = "~/.local/share/remoter-agent/agent-home"
-#                                      # mounted as the container user's $HOME
-#                                      # (/root): agent config/credentials and
-#                                      # ~/.kimi-code/sessions survive runs here
+#                                      # isolated-mode persistent $HOME (/root in
+#                                      # Docker, unchanged absolute path in bwrap):
+#                                      # agent config/credentials, Nix fetcher cache
+#                                      # and ~/.kimi-code/sessions survive runs here
 # nix_binary_cache_dir = "~/.local/share/remoter-agent/nix-cache"
 #                                      # shared nix binary cache (file:// substituter)
 #                                      # on this host; image-init containers of
@@ -55,10 +54,14 @@ stall_grace_secs    = 30
 #                                      # daemon also generates a signing key next
 #                                      # to the dir and seeds the cache via the
 #                                      # project's .remoter/seed-nix-cache.sh hook.
-# Container mode: kimi auth comes from the project's .remoter/kimi-config.toml,
-# rendered into <agent_home>/.kimi-code/config.toml at every container start —
-# ${KIMI_API_KEY} is substituted from the daemon's own environment, so export
-# the key in the systemd unit (Environment=/EnvironmentFile=).
+# Container and bwrap modes: kimi auth comes from the project's
+# .remoter/kimi-config.toml, rendered into <agent_home>/.kimi-code/config.toml
+# at every runtime start — ${KIMI_API_KEY} is substituted from the daemon's own
+# environment, so export the key in the systemd unit (Environment=/EnvironmentFile=).
+# Bwrap requires NixOS, rootless user namespaces, bwrap and slirp4netns. It uses
+# no Docker image/sidecars and no REMOTER_AGENT_PORT_BASE: each sandbox has an
+# independent localhost, and the project's own devenv services use default ports.
+# Loopback api_url values are rewritten to 10.0.2.2 for the agent/MCP process.
 
 [driver]
 kind = "kimi-acp"    # dry-run = "stub"; real ACP agents = "kimi-acp" or "opencode-acp"

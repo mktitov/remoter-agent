@@ -35,29 +35,35 @@ fn default_retention_days() -> u64 {
     7
 }
 
-/// How run attempts are executed (docs/specs/remoter-agent-containers.md):
-/// bare on the host (`devenv shell --`) or inside a per-run OCI container.
+/// How run attempts are executed: bare on the host, inside a per-run OCI
+/// container, or in a rootless Bubblewrap sandbox with its own network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionMode {
     #[default]
     Host,
     Container,
+    Bwrap,
 }
 
-/// Container-mode settings (`[execution]`). All of it is irrelevant in host
-/// mode — the defaults keep a host-mode config file free of docker keys.
+/// Execution-mode settings (`[execution]`). Docker and Bubblewrap defaults
+/// keep a host-mode config free of isolation-specific keys.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ExecutionConfig {
-    /// `host` (default) runs the agent on the daemon host; `container` runs
-    /// every attempt inside a per-run docker container with postgres/minio
-    /// sidecars. There is no silent fallback from `container` to `host`.
+    /// `host` (default), `container` (Docker with sidecars), or `bwrap`
+    /// (rootless namespaces, project-owned devenv services, isolated network).
+    /// An isolated-mode failure never falls back to host execution.
     #[serde(default)]
     pub mode: ExecutionMode,
     /// The docker CLI binary (default `docker`).
     #[serde(default = "default_docker_binary")]
     pub docker_binary: String,
+    /// Bubblewrap and slirp4netns executables used by `mode = "bwrap"`.
+    #[serde(default = "default_bwrap_binary")]
+    pub bwrap_binary: String,
+    #[serde(default = "default_slirp4netns_binary")]
+    pub slirp4netns_binary: String,
     /// Tag prefix for the per-project agent images: `<prefix>:p<id>-<hash>`.
     #[serde(default = "default_image_tag_prefix")]
     pub image_tag_prefix: String,
@@ -90,6 +96,8 @@ impl Default for ExecutionConfig {
         Self {
             mode: ExecutionMode::Host,
             docker_binary: default_docker_binary(),
+            bwrap_binary: default_bwrap_binary(),
+            slirp4netns_binary: default_slirp4netns_binary(),
             image_tag_prefix: default_image_tag_prefix(),
             postgres_image: default_postgres_image(),
             minio_image: default_minio_image(),
@@ -105,6 +113,16 @@ impl ExecutionConfig {
         self.mode == ExecutionMode::Container
     }
 
+    pub fn is_bwrap(&self) -> bool {
+        self.mode == ExecutionMode::Bwrap
+    }
+
+    /// Isolated modes have independent loopback interfaces and need no host
+    /// port block.
+    pub fn is_isolated(&self) -> bool {
+        self.mode != ExecutionMode::Host
+    }
+
     /// The effective agent home (default `<workspace_root>/agent-home`).
     pub fn agent_home(&self, workspace_root: &Path) -> PathBuf {
         self.agent_home
@@ -115,6 +133,12 @@ impl ExecutionConfig {
 
 fn default_docker_binary() -> String {
     "docker".to_string()
+}
+fn default_bwrap_binary() -> String {
+    "bwrap".to_string()
+}
+fn default_slirp4netns_binary() -> String {
+    "slirp4netns".to_string()
 }
 fn default_image_tag_prefix() -> String {
     "remoter-agent".to_string()
@@ -439,6 +463,7 @@ impl Config {
             driver.agent_program = "opencode".to_string();
         }
         let container_mode = file.execution.mode == ExecutionMode::Container;
+        let isolated_home = file.execution.mode != ExecutionMode::Host;
         // The stub driver never touches MCP — skip resolution so dry-run
         // setups don't need the binary on the host. Container mode reduces
         // both program values to bare names instead: the agent and
@@ -465,7 +490,7 @@ impl Config {
                     .as_deref()
                     .map(expand_tilde_path)
                     .unwrap_or_else(|| {
-                        if container_mode {
+                        if isolated_home {
                             agent_home.join(".kimi-code/sessions")
                         } else {
                             default_sessions_dir()
@@ -506,24 +531,38 @@ impl Config {
         })
     }
 
-    /// Startup validation for container mode (spec: `docker info` must succeed
-    /// — a daemon that cannot reach docker cannot honor `mode = "container"`,
-    /// and silently degrading to host mode would strip the requested
-    /// isolation). Cheap and synchronous; called once from `main`.
+    /// Startup validation for isolated modes. A daemon that cannot honor the
+    /// configured sandbox fails to boot instead of silently using the host.
     pub fn validate_execution(&self) -> anyhow::Result<()> {
-        if !self.execution.is_container() {
-            return Ok(());
-        }
-        let docker = &self.execution.docker_binary;
-        let out = std::process::Command::new(docker)
-            .arg("info")
-            .output()
-            .map_err(|e| anyhow::anyhow!("execution.mode = \"container\" but `{docker} info` could not run: {e}"))?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "execution.mode = \"container\" but `{docker} info` failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+        match self.execution.mode {
+            ExecutionMode::Host => return Ok(()),
+            ExecutionMode::Container => {
+                let docker = &self.execution.docker_binary;
+                let out = std::process::Command::new(docker).arg("info").output().map_err(|e| {
+                    anyhow::anyhow!("execution.mode = \"container\" but `{docker} info` could not run: {e}")
+                })?;
+                if !out.status.success() {
+                    anyhow::bail!(
+                        "execution.mode = \"container\" but `{docker} info` failed: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    );
+                }
+            }
+            ExecutionMode::Bwrap => {
+                crate::bwrap::validate_prerequisites(&self.execution.bwrap_binary, &self.execution.slirp4netns_binary)?;
+                if self.driver.kind != "stub" {
+                    for (key, program) in [
+                        ("agent_program", &self.driver.agent_program),
+                        ("remoter_mcp_command", &self.driver.remoter_mcp_command),
+                    ] {
+                        if !program_available(program) {
+                            anyhow::bail!(
+                                "execution.mode = \"bwrap\" but {key} `{program}` is not an executable on the daemon PATH"
+                            );
+                        }
+                    }
+                }
+            }
         }
         let agent_home = self.execution.agent_home(&self.workspace_root);
         if self.driver.kind == "kimi-acp" {
@@ -532,8 +571,9 @@ impl Config {
         }
         if self.driver.kind == "kimi-acp" && !agent_home.join(".kimi-code/config.toml").is_file() {
             tracing::warn!(
-                "container mode: {} does not exist — the agent's auth will fail unless the project's \
-                 .remoter/kimi-config.toml is in place (rendered at container start with KIMI_API_KEY \
+                mode = ?self.execution.mode,
+                "{} does not exist — the agent's auth will fail unless the project's \
+                 .remoter/kimi-config.toml is in place (rendered at sandbox start with KIMI_API_KEY \
                  from the daemon's environment)",
                 agent_home.join(".kimi-code/config.toml").display()
             );
@@ -558,6 +598,14 @@ fn warn_if_token_file_insecure(path: &str) {
 
 #[cfg(not(unix))]
 fn warn_if_token_file_insecure(_path: &str) {}
+
+fn program_available(program: &str) -> bool {
+    if program.contains('/') {
+        return is_executable(Path::new(program));
+    }
+    let paths = std::env::var_os("PATH").unwrap_or_default();
+    resolve_in_paths(program, std::env::split_paths(&paths)).is_some()
+}
 
 /// Container mode: programs run *inside* the container and must resolve
 /// against the image's PATH, so only a bare name works there. A configured
@@ -702,6 +750,43 @@ postgres_image = "postgres:17.6-alpine3.22""#,
         // Pinned defaults for the rest.
         assert!(cfg.execution.minio_image.starts_with("minio/minio:RELEASE."));
         assert!(cfg.execution.mc_image.starts_with("minio/mc:RELEASE."));
+    }
+
+    #[test]
+    fn bwrap_mode_preserves_host_programs_and_uses_persistent_agent_home() {
+        // SAFETY: single-threaded test process env tweak; removed immediately.
+        unsafe { std::env::remove_var(API_URL_ENV) };
+        let toml = TOML.replace(
+            "[driver]\nkind = \"stub\"",
+            r#"[driver]
+kind = "kimi-acp"
+agent_program = "/run/current-system/sw/bin/kimi"
+remoter_mcp_command = "/nix/store/abc123-remoter-mcp/bin/remoter-mcp"
+
+[execution]
+mode = "bwrap"
+bwrap_binary = "/run/current-system/sw/bin/bwrap"
+slirp4netns_binary = "/run/current-system/sw/bin/slirp4netns""#,
+        );
+        let cfg = Config::from_toml_str(&toml, Some("tok".to_string())).unwrap();
+        assert!(cfg.execution.is_bwrap());
+        assert!(cfg.execution.is_isolated());
+        assert!(!cfg.execution.is_container());
+        assert_eq!(cfg.driver.agent_program, "/run/current-system/sw/bin/kimi");
+        assert_eq!(
+            cfg.driver.remoter_mcp_command,
+            "/nix/store/abc123-remoter-mcp/bin/remoter-mcp"
+        );
+        assert_eq!(cfg.execution.bwrap_binary, "/run/current-system/sw/bin/bwrap");
+        assert_eq!(
+            cfg.driver.sessions_dir.as_deref(),
+            Some(
+                cfg.execution
+                    .agent_home(&cfg.workspace_root)
+                    .join(".kimi-code/sessions")
+                    .as_path()
+            )
+        );
     }
 
     #[test]

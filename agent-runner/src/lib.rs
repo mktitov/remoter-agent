@@ -7,6 +7,7 @@
 //! the backend API, so the human-acceptance gates and claim guards are always
 //! enforced (spec §2.2).
 
+pub mod bwrap;
 pub mod claim;
 pub mod client;
 pub mod config;
