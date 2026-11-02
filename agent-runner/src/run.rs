@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     client::{AttachmentDto, FinishRunBody, LinkDto, ProjectRepoConfig, RemoterClient, TaskDetail, TaskSummary},
-    config::Config,
+    config::{Config, ExecutionMode},
     container,
     driver::{AgentDriver, DriverError, DriverPhase, RunFailure, RunOutcome, RunSpec},
     forge, image,
@@ -765,8 +765,8 @@ async fn attempt_run(
         &refs.mounted,
     )
     .await?;
-    if containers.is_none() {
-        // Host mode surfaces refs as symlinks; container mode bind-mounts them.
+    if containers.as_ref().is_none_or(RunRuntime::links_refs) {
+        // Host and bwrap surface refs as symlinks; Docker bind-mounts them.
         for (mount, error) in workspace::link_refs_into(&prepared.dir, &refs.mounted).await {
             note(
                 &rc.client,
@@ -1034,58 +1034,99 @@ fn sum_tokens(a: Option<i64>, b: Option<i64>) -> Option<i64> {
     }
 }
 
-/// The env every run (and its services/sidecars) gets (spec §5.8 + containers
-/// spec §3.4). Host mode exports the run's port block; container mode exports
-/// `REMOTER_CONTAINER=1` and loopback DB URLs instead (the postgres sidecar
-/// shares the run container's network namespace).
+/// Host mode exports a port block. Both isolated modes own their loopback;
+/// only Docker injects sidecar database URLs.
 fn run_env(rc: &RunContext) -> Vec<(String, String)> {
-    if rc.config.execution.is_container() {
-        return container::container_env(rc.task.id);
+    match rc.config.execution.mode {
+        ExecutionMode::Container => container::container_env(rc.task.id),
+        ExecutionMode::Bwrap => crate::bwrap::run_env(rc.task.id),
+        ExecutionMode::Host => {
+            let mut env = vec![
+                ("CI".to_string(), "1".to_string()),
+                ("REMOTER_AGENT_TASK_ID".to_string(), rc.task.id.to_string()),
+            ];
+            if let Some(block) = &rc.port_block {
+                env.push(("REMOTER_AGENT_PORT_BASE".to_string(), block.base().to_string()));
+            }
+            env
+        }
     }
-    let mut env = vec![
-        ("CI".to_string(), "1".to_string()),
-        ("REMOTER_AGENT_TASK_ID".to_string(), rc.task.id.to_string()),
-    ];
-    if let Some(block) = &rc.port_block {
-        env.push(("REMOTER_AGENT_PORT_BASE".to_string(), block.base().to_string()));
-    }
-    env
 }
 
-/// The `RunSpec.exec` for a driver turn: host (optionally devenv-wrapped) or
-/// `docker exec` into the run container.
-pub(crate) fn exec_env(config: &Config, run_id: i32, devenv: bool) -> ExecEnv {
-    if !config.execution.is_container() {
-        return ExecEnv::host(devenv);
-    }
-    ExecEnv::Container(workspace::ContainerExec {
-        docker: config.execution.docker_binary.clone(),
-        container: container::run_container_name(run_id),
-        work_dir: std::path::PathBuf::from(container::WORK_DIR),
-        devenv,
-        sessions_dir: config.driver.sessions_dir.clone().unwrap_or_else(|| {
-            config
-                .execution
-                .agent_home(&config.workspace_root)
-                .join(if config.driver.kind == "kimi-acp" {
-                    ".kimi-code/sessions"
-                } else {
-                    "sessions"
-                })
-        }),
-        api_url: container::container_api_url(&config.api_url),
+fn sessions_dir(config: &Config) -> std::path::PathBuf {
+    config.driver.sessions_dir.clone().unwrap_or_else(|| {
+        config
+            .execution
+            .agent_home(&config.workspace_root)
+            .join(if config.driver.kind == "kimi-acp" {
+                ".kimi-code/sessions"
+            } else {
+                "sessions"
+            })
     })
 }
 
-/// Container-mode runtime for one driver turn (shared by `attempt_run`, the
-/// rebase-nudge loop, and `supervise::run_attempt`): ensure the project's
-/// agent image, start the run container + sidecars, and — when the worktree
-/// carries a justfile — run the project's `just db-up` inside the container
-/// (its `REMOTER_CONTAINER=1` branch only waits for the sidecars; projects
-/// without a justfile have no services to wait for and skip the step). Host
-/// mode returns `None` and the caller falls back to
-/// `workspace::services_up`/`services_down`. No silent fallback: a
-/// container-mode failure propagates as a run failure, never a host run.
+/// The `RunSpec.exec` for a driver turn in the configured execution mode.
+pub(crate) fn exec_env(config: &Config, run_id: i32, devenv: bool) -> ExecEnv {
+    match config.execution.mode {
+        ExecutionMode::Host => ExecEnv::host(devenv),
+        ExecutionMode::Bwrap => ExecEnv::Bwrap(workspace::BwrapExec {
+            launcher: std::env::current_exe().unwrap_or_else(|_| "remoter-agent".into()),
+            bwrap: config.execution.bwrap_binary.clone(),
+            slirp4netns: config.execution.slirp4netns_binary.clone(),
+            agent_home: config.execution.agent_home(&config.workspace_root),
+            state_root: config.workspace_root.join("bwrap"),
+            devenv,
+            retained_commands: (config.driver.kind != "stub")
+                .then(|| config.driver.remoter_mcp_command.clone())
+                .into_iter()
+                .collect(),
+            sessions_dir: sessions_dir(config),
+            api_url: crate::bwrap::api_url(&config.api_url),
+        }),
+        ExecutionMode::Container => ExecEnv::Container(workspace::ContainerExec {
+            docker: config.execution.docker_binary.clone(),
+            container: container::run_container_name(run_id),
+            work_dir: std::path::PathBuf::from(container::WORK_DIR),
+            devenv,
+            sessions_dir: sessions_dir(config),
+            api_url: container::container_api_url(&config.api_url),
+        }),
+    }
+}
+
+#[allow(dead_code)] // Fields are RAII guards; dropping the runtime tears it down.
+pub(crate) enum RunRuntime {
+    Container(container::RunContainers),
+    Bwrap(BwrapRuntime),
+}
+
+impl RunRuntime {
+    pub(crate) fn links_refs(&self) -> bool {
+        matches!(self, RunRuntime::Bwrap(_))
+    }
+}
+
+pub(crate) struct BwrapRuntime {
+    worktree: std::path::PathBuf,
+    repo: std::path::PathBuf,
+}
+
+impl Drop for BwrapRuntime {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.repo)
+            .args(["worktree", "unlock"])
+            .arg(&self.worktree)
+            .output();
+    }
+}
+
+/// Starts the isolated runtime for one attempt/nudge loop. Bwrap performs the
+/// real host devenv pre-warm here; each subsequent driver turn gets one fresh
+/// launcher and network namespace. Host mode returns `None`. No failure falls
+/// back to another execution mode.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_container_runtime(
     config: &Config,
@@ -1097,11 +1138,40 @@ pub(crate) async fn start_container_runtime(
     devenv: bool,
     env: &[(String, String)],
     refs: &[workspace::RefMount],
-) -> Result<Option<container::RunContainers>, RunFailure> {
-    if !config.execution.is_container() {
+) -> Result<Option<RunRuntime>, RunFailure> {
+    if config.execution.mode == ExecutionMode::Host {
         return Ok(None);
     }
     let repo = workspace::repo_dir(&config.workspace_root, project.project_id);
+    let agent_home = config.execution.agent_home(&config.workspace_root);
+    if config.execution.is_bwrap() {
+        let lock = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "lock"])
+            .arg(worktree)
+            .output()
+            .await;
+        if let Ok(output) = lock
+            && !output.status.success()
+        {
+            tracing::debug!(worktree = %worktree.display(), "bwrap worktree lock: {}", String::from_utf8_lossy(&output.stderr).trim());
+        }
+        let runtime = BwrapRuntime {
+            worktree: worktree.to_path_buf(),
+            repo: repo.clone(),
+        };
+        if config.driver.kind == "kimi-acp" {
+            container::provision_kimi_config(&repo, &agent_home)
+                .map_err(|e| RunFailure::new(DriverError::Permanent(e), None))?;
+        }
+        if devenv {
+            crate::bwrap::prewarm(worktree, &agent_home, env)
+                .await
+                .map_err(|e| RunFailure::new(e, None))?;
+        }
+        return Ok(Some(RunRuntime::Bwrap(runtime)));
+    }
     let image = image::ensure_project_image(&config.execution, image_locks, &repo, project, task_id)
         .await
         .map_err(|e| RunFailure::new(e, None))?;
@@ -1113,7 +1183,7 @@ pub(crate) async fn start_container_runtime(
         image: &image,
         worktree,
         repo: &repo,
-        agent_home: &config.execution.agent_home(&config.workspace_root),
+        agent_home: &agent_home,
         env,
         refs,
     })
@@ -1124,7 +1194,7 @@ pub(crate) async fn start_container_runtime(
     } else if devenv {
         tracing::info!(run_id, "no justfile in worktree — skipping db-up (no sidecar wait)");
     }
-    Ok(Some(containers))
+    Ok(Some(RunRuntime::Container(containers)))
 }
 
 /// Whether the worktree carries a justfile — the `db-up` contract below is

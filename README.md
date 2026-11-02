@@ -7,7 +7,8 @@ binaries that connect a dev-agent to a Remoter backend:
 - **`remoter-agent`** ([`agent-runner/`](agent-runner/)) — the headless daemon
   that polls the Remoter backend, claims tickets assigned to its agent user,
   and executes them with a dev-agent (kimi or opencode over ACP) in per-ticket
-  git worktrees — on the host or inside per-run docker containers.
+  git worktrees — on the host, in per-run Docker containers, or in rootless
+  Bubblewrap sandboxes on NixOS.
 - **`remoter-mcp`** ([`mcp-server/`](mcp-server/)) — the MCP server (stdio)
   that exposes the Remoter board to agents and to human-driven MCP clients
   (Claude Code, Cursor, …): list/claim tickets, manage actions, comment,
@@ -55,7 +56,8 @@ Full user guides (in Russian) are published at
 [aiborda.ru/docs/](https://aiborda.ru/docs/):
 
 - setting up a project for `remoter-agent` in host and container modes;
-- installing and configuring the `remoter-agent` daemon;
+- installing and configuring the `remoter-agent` daemon (the rootless NixOS
+  Bubblewrap mode is documented in [`agent-runner/README.md`](agent-runner/README.md#bubblewrap-mode-rootless-nixos-isolation));
 - using `remoter-mcp` standalone with human-driven MCP clients.
 
 The guides are maintained in the Remoter monorepo (`docs/user/`) and
@@ -83,7 +85,10 @@ tools at run time (install them yourself, they are not bundled):
 - **`devenv`** — project services (Postgres, …) are brought up/down per run
   via `devenv up`;
 - **`docker`** — only for `[execution] mode = "container"`, where every run
-  executes inside a per-run container with postgres/minio sidecars.
+  executes inside a per-run container with postgres/minio sidecars;
+- **`bubblewrap` + `slirp4netns`** — only for `[execution] mode = "bwrap"` on
+  NixOS: rootless process/filesystem/network isolation without Docker images or
+  sidecars; see the [configuration and architecture guide](agent-runner/README.md#bubblewrap-mode-rootless-nixos-isolation).
 
 `remoter-mcp` needs nothing but a reachable Remoter HTTP API and a token.
 

@@ -885,6 +885,8 @@ pub enum ExecEnv {
     },
     /// Inside the run container via `docker exec` (container mode).
     Container(ContainerExec),
+    /// Inside a per-turn rootless Bubblewrap launcher.
+    Bwrap(BwrapExec),
 }
 
 /// Container-mode execution details threaded from the daemon to the driver.
@@ -908,6 +910,21 @@ pub struct ContainerExec {
     pub api_url: String,
 }
 
+/// Bubblewrap execution details. The launcher keeps the real worktree path so
+/// devenv evaluates exactly the same derivations as the host pre-warm.
+#[derive(Debug, Clone)]
+pub struct BwrapExec {
+    pub launcher: PathBuf,
+    pub bwrap: String,
+    pub slirp4netns: String,
+    pub agent_home: PathBuf,
+    pub state_root: PathBuf,
+    pub devenv: bool,
+    pub retained_commands: Vec<String>,
+    pub sessions_dir: PathBuf,
+    pub api_url: String,
+}
+
 impl ExecEnv {
     pub fn host(devenv: bool) -> Self {
         ExecEnv::Host { devenv }
@@ -918,6 +935,7 @@ impl ExecEnv {
         match self {
             ExecEnv::Host { devenv } => *devenv,
             ExecEnv::Container(c) => c.devenv,
+            ExecEnv::Bwrap(c) => c.devenv,
         }
     }
 }
@@ -960,6 +978,34 @@ pub fn wrap_command(
             cmd.arg(program).args(args);
             // `docker exec` runs on the host; `current_dir` is meaningless
             // for the in-container process but harmless for the CLI itself.
+            cmd
+        }
+        ExecEnv::Bwrap(c) => {
+            let mut cmd = std::process::Command::new(&c.launcher);
+            cmd.arg(crate::bwrap::INTERNAL_LAUNCH_ARG)
+                .arg("--bwrap")
+                .arg(&c.bwrap)
+                .arg("--slirp4netns")
+                .arg(&c.slirp4netns)
+                .arg("--agent-home")
+                .arg(&c.agent_home)
+                .arg("--state-root")
+                .arg(&c.state_root)
+                .arg("--worktree")
+                .arg(dir)
+                .arg("--devenv")
+                .arg(if c.devenv { "1" } else { "0" });
+            for command in &c.retained_commands {
+                cmd.arg("--retain").arg(command);
+            }
+            if c.devenv {
+                cmd.arg("--env").arg("DEVENV_NO_AI_AGENT=1");
+            }
+            for (key, value) in env {
+                cmd.arg("--env").arg(format!("{key}={value}"));
+            }
+            cmd.arg("--").arg(program).args(args);
+            cmd.current_dir(dir).env_remove("REMOTER_TOKEN");
             cmd
         }
         ExecEnv::Host { devenv } => {
@@ -2522,6 +2568,63 @@ mod tests {
         assert!(args.iter().any(|a| a == "GREETING=hello world"));
         assert!(args.iter().any(|a| a == "PAYLOAD=$(rm -rf /); `id`"));
         assert!(!args.iter().any(|a| a == "sh" || a == "-c"));
+    }
+
+    #[test]
+    fn wrap_command_bwrap_preserves_paths_and_passes_env_as_argv() {
+        let exec = ExecEnv::Bwrap(BwrapExec {
+            launcher: PathBuf::from("/nix/store/remoter-agent/bin/remoter-agent"),
+            bwrap: "bwrap".to_string(),
+            slirp4netns: "slirp4netns".to_string(),
+            agent_home: PathBuf::from("/state/agent-home"),
+            state_root: PathBuf::from("/state/bwrap"),
+            devenv: true,
+            retained_commands: vec!["/nix/store/remoter-mcp/bin/remoter-mcp".to_string()],
+            sessions_dir: PathBuf::from("/state/agent-home/.kimi-code/sessions"),
+            api_url: "http://10.0.2.2:8181".to_string(),
+        });
+        let env = vec![
+            ("REMOTER_AGENT_TASK_ID".to_string(), "249".to_string()),
+            ("PAYLOAD".to_string(), "hello world; $(id)".to_string()),
+        ];
+        let cmd = wrap_command(Path::new("/host/wt"), &exec, "kimi", &["acp", "--yolo"], &env);
+        assert_eq!(cmd.get_program(), "/nix/store/remoter-agent/bin/remoter-agent");
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            args,
+            [
+                "__bwrap-launch",
+                "--bwrap",
+                "bwrap",
+                "--slirp4netns",
+                "slirp4netns",
+                "--agent-home",
+                "/state/agent-home",
+                "--state-root",
+                "/state/bwrap",
+                "--worktree",
+                "/host/wt",
+                "--devenv",
+                "1",
+                "--retain",
+                "/nix/store/remoter-mcp/bin/remoter-mcp",
+                "--env",
+                "DEVENV_NO_AI_AGENT=1",
+                "--env",
+                "REMOTER_AGENT_TASK_ID=249",
+                "--env",
+                "PAYLOAD=hello world; $(id)",
+                "--",
+                "kimi",
+                "acp",
+                "--yolo",
+            ]
+        );
+        assert!(exec.devenv());
+        assert!(
+            cmd.get_envs()
+                .any(|(key, value)| key == "REMOTER_TOKEN" && value.is_none())
+        );
     }
 
     // ── devenv up/down via a PATH-stubbed fake `devenv` ──────────────────────

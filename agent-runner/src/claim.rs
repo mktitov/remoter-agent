@@ -198,11 +198,15 @@ impl Daemon {
         // Startup sweep (spec §5.8): stop devenv processes leaked into ticket
         // worktrees by a crash or an older daemon version. Best-effort — a
         // sweep failure must never block reconciliation.
-        workspace::down_all_worktrees(&self.config.workspace_root).await;
-        // Container mode: reap run/sidecar containers a crashed daemon leaked
-        // (labeled remoter.run_id; containers spec §4).
+        if self.config.execution.mode == crate::config::ExecutionMode::Host {
+            workspace::down_all_worktrees(&self.config.workspace_root).await;
+        }
+        // Reap isolated runtime state left by a crashed daemon.
         if self.config.execution.is_container() {
             crate::container::sweep(&self.config.execution).await;
+        }
+        if self.config.execution.is_bwrap() {
+            crate::bwrap::sweep(&self.config.workspace_root.join("bwrap"));
         }
         let mine = match self.client.my_tasks(None).await {
             Ok(t) => t,
@@ -578,7 +582,7 @@ impl Daemon {
             // Allocate the run's port block *before* claiming: if the range is
             // exhausted the ticket stays claimable for a later poll (spec §5.8).
             // Container mode needs no ports — sidecars replace the contract.
-            let port_block = if self.config.execution.is_container() {
+            let port_block = if self.config.execution.is_isolated() {
                 None
             } else {
                 let Some(block) = self.ports.allocate() else {
@@ -662,7 +666,7 @@ impl Daemon {
                 return;
             }
         };
-        let port_block = if self.config.execution.is_container() {
+        let port_block = if self.config.execution.is_isolated() {
             None
         } else {
             let Some(block) = self.ports.allocate() else {
@@ -728,7 +732,7 @@ impl Daemon {
                 return;
             }
         };
-        let port_block = if self.config.execution.is_container() {
+        let port_block = if self.config.execution.is_isolated() {
             None
         } else {
             let Some(block) = self.ports.allocate() else {

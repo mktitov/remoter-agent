@@ -168,6 +168,117 @@ docker container instead of on the host:
   automatically after every run (a startup sweep reaps leftovers from a
   crashed daemon).
 
+## Bubblewrap mode (rootless NixOS isolation)
+
+`[execution] mode = "bwrap"` isolates each ACP turn with Linux namespaces. It
+needs neither Docker, a per-project image, systemd-nspawn, root, nor sudo. The
+project keeps its own `devenv.nix` services; no Postgres/MinIO sidecars are
+created.
+
+### Prerequisites and configuration
+
+Use NixOS with unprivileged user namespaces enabled (the normal NixOS default)
+and put the tools on the daemon's PATH:
+
+```nix
+# NixOS host configuration
+environment.systemPackages = with pkgs; [
+  bubblewrap
+  slirp4netns
+  git
+  devenv
+];
+```
+
+```toml
+# remoter-agent.toml
+api_url = "http://127.0.0.1:8181"
+workspace_root = "~/.local/share/remoter-agent"
+
+[execution]
+mode = "bwrap"
+# bwrap_binary = "bwrap"                  # default
+# slirp4netns_binary = "slirp4netns"      # default
+# agent_home = "~/.local/share/remoter-agent/agent-home"
+
+[driver]
+kind = "kimi-acp"
+```
+
+Startup fails closed if the binaries, Nix store/database, CA bundle, agent/MCP
+programs, or a real namespace smoke test are unavailable. Install `kimi` and
+`remoter-mcp` on the daemon host as usual; absolute Nix store paths and NixOS
+PATH profile entries remain visible inside the sandbox. As in container mode,
+`.remoter/kimi-config.toml` is rendered into the persistent `agent_home` with
+`KIMI_API_KEY` from the daemon environment.
+
+### What happens on a run
+
+1. The daemon prepares the same ticket worktree and performs a real host
+   `devenv --no-eval-cache shell --no-tui -- true`. This fetches inputs and
+   realizes the shell/process closures. It deliberately does **not** use bare
+   `devenv build`, which does not warm the required environment in devenv 2.1.2.
+2. One Rust launcher per ACP turn takes a consistent SQLite online-backup
+   snapshot of the Nix DB, creates GC roots for the launcher, agent, and
+   late-started `remoter-mcp` executable, and starts `bwrap` plus `slirp4netns`.
+3. Inside the sandbox it runs best-effort `devenv processes down`, then
+   `devenv up -d` and `devenv processes wait --timeout 120`, and finally `exec`s
+   the agent with the original ACP stdio. Services stop on exit; cancellation,
+   timeout, SIGTERM and SIGKILL are bounded by `--die-with-parent` and the
+   network helper's exit fd. A launcher parent-death signal extends the same
+   cleanup to daemon crashes, including SIGKILL. Stale state is reconciled using
+   PID plus process start time, so active or unrelated runs are not removed.
+
+The sandbox has separate user/PID/IPC/UTS/network namespaces and independent
+localhost. Parallel tickets can therefore both use `127.0.0.1:5432` without a
+host listener or port allocation. `REMOTER_AGENT_PORT_BASE`,
+`REMOTER_CONTAINER`, and Docker's `*_DATABASE_URL` values are not exported;
+instead the agent gets `CI=1`, `REMOTER_EXECUTION=bwrap`, and
+`REMOTER_AGENT_TASK_ID`.
+
+A loopback `api_url` such as `http://127.0.0.1:8181` is rewritten for the
+agent/MCP to `http://10.0.2.2:8181` (slirp4netns's host gateway). Non-loopback
+URLs are unchanged. The backend must listen on the corresponding host loopback
+address; no firewall or host-wide network configuration is changed.
+
+### Filesystem, Nix, and security boundaries
+
+- `/nix/store` is read-only. The guest uses `NIX_REMOTE=local?read-only=true`
+  and devenv's `read-only-local-store` option against the per-turn DB snapshot.
+  Missing closures are an error: pre-warm or fix the project on the host; the
+  guest must not build or substitute packages.
+- The worktree and `agent_home` are read-write at their **original absolute
+  paths**; `/work` is only a compatibility symlink. Keeping the real path is
+  required because it participates in devenv derivations. Main Git metadata is
+  read-write so the agent can commit; reference worktrees and their Git metadata
+  are read-only. Commits use the deterministic sandbox identity
+  `remoter-agent <remoter-agent@localhost>` rather than depending on host Git
+  configuration.
+- Only explicit runtime paths, CA certificates, generated DNS/user config, and
+  host PATH profile directories are added. The host filesystem is not mounted
+  wholesale. `HOME` and the Nix fetcher cache live in `agent_home`, and
+  `XDG_RUNTIME_DIR=/tmp` on both sides keeps derivations identical.
+- This is process/filesystem/network isolation, not a VM or a defense against a
+  malicious kernel. The agent runs with the daemon's UID and can change anything
+  in the writable worktree, Git metadata, and persistent agent home. The agent
+  also receives its intended Remoter MCP token and outbound network access.
+
+If startup reports missing store paths, rerun after a successful host pre-warm
+and check that `HOME`, `XDG_RUNTIME_DIR`, and the project path were not
+overridden by a wrapper. Network failures should be diagnosed with the live
+suite below and the daemon's slirp4netns stderr. A pre-warm, network, or service
+failure fails the attempt; it never silently runs the agent on the host.
+
+On the development NixOS host, the live suite measured about **2.4 s** for a
+warm simple-command launch and **6.4–7.3 s** for warm launch-to-SQL with
+Postgres. Each active launch's Nix DB snapshot was **125,775,874 bytes (~120
+MiB)**. A separate GNU `time -v` simple launch reported **279,144 kB peak RSS**
+for the timed launcher, including waited-child high-water marks. Cold startup
+is dominated by the project's host-side fetch/build and is therefore
+project-dependent. Bwrap creates no per-project image; compare the Docker mode
+budget above (~8–16 GB per image, plus build time). These are diagnostic
+measurements, not performance guarantees; rerun the suite on the target host.
+
 ## Tests
 
 ```sh
@@ -177,4 +288,10 @@ cargo test -p remoter-agent --test acp_kimi -- --ignored --nocapture
 #   ↑ live conformance against the pinned kimi version (spec §5.5); the test
 #     refuses to run against any other version — bump PINNED_KIMI_VERSION
 #     deliberately after re-validating.
+
+# Real NixOS bwrap/network/devenv/Postgres/lifecycle suite (no LLM):
+devenv shell --no-tui --no-eval-cache -- \
+  nix shell nixpkgs#bubblewrap nixpkgs#slirp4netns -c \
+  cargo test --test bwrap_live -- --ignored --nocapture --test-threads=1
+# The tests print warm launch timings and actual Nix DB snapshot sizes.
 ```
