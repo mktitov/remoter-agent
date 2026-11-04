@@ -112,9 +112,6 @@ tickets in container mode:
   bake, it exports the agent-profile closure at the pinned rev and the
   devshell closure from the host's warm store into the cache, so the init
   container substitutes instead of rebuilding;
-- `kimi-config.toml` — kimi provider/model template rendered into the
-  container's agent home at every start (`${KIMI_API_KEY}` is substituted
-  from the daemon's environment — never commit a real key).
 
 The image tag is content-keyed over every file in `.remoter/`, so any edit
 there rebuilds the image automatically on the next run.

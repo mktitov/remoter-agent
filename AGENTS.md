@@ -78,8 +78,6 @@ run:
   `.remoter/agent-configuration.nix` — the Dockerfile is only the nix+devenv
   bootstrap. Do not add openssh: it collides with the base image's own ssh
   element on `libexec/ssh-keysign`.
-- `.remoter/kimi-config.toml` must stay secret-free — `${KIMI_API_KEY}` is
-  substituted from the daemon's environment at container start.
 - `.remoter/check-image.sh` keeps the documented exit-code contract
   (0 fresh / 42 stale / other = failed check, cache kept).
 - `.remoter/seed-nix-cache.sh` is the optional host-side seeding hook for the

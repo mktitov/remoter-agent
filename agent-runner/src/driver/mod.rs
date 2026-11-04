@@ -10,6 +10,7 @@
 //!   is the only driver protocol; there is no CLI print-mode fallback.
 
 pub mod acp;
+pub mod kimi_config;
 pub mod kimi_usage;
 pub mod mcp;
 pub mod stub;

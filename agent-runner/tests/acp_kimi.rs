@@ -70,6 +70,7 @@ async fn kimi_acp_conformance() {
         simulate_uncommitted_changes: false,
         agent_program: "kimi".to_string(),
         agent_args: vec!["acp".to_string()],
+        kimi_config: PathBuf::from("unused-kimi-config.toml"),
         remoter_mcp_command: "remoter-mcp".to_string(),
         plan_model: Some("kimi-code/k3".to_string()),
         plan_thinking: Some("max".to_string()),

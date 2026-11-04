@@ -69,55 +69,9 @@ pub fn container_env(task_id: i32) -> Vec<(String, String)> {
     ]
 }
 
-/// kimi auth for run containers (spec §3.1): the project's
-/// `.remoter/kimi-config.toml` is rendered into
-/// `<agent_home>/.kimi-code/config.toml` (the container's `$HOME`) at every
-/// container start. `${KIMI_API_KEY}` in the template is substituted from the
-/// daemon's own environment — the secret never touches the image. Overwriting
-/// every start keeps key rotation in sync and undoes kimi's own rewrites.
-/// No template → no-op (projects without one are unaffected).
-pub fn provision_kimi_config(repo: &Path, agent_home: &Path) -> Result<(), String> {
-    let key = std::env::var("KIMI_API_KEY").ok().filter(|k| !k.is_empty());
-    provision_kimi_config_with(repo, agent_home, key.as_deref())
-}
-
-fn provision_kimi_config_with(repo: &Path, agent_home: &Path, api_key: Option<&str>) -> Result<(), String> {
-    const PLACEHOLDER: &str = "${KIMI_API_KEY}";
-    let template = repo.join(".remoter/kimi-config.toml");
-    let Ok(text) = std::fs::read_to_string(&template) else {
-        return Ok(());
-    };
-    let rendered = if text.contains(PLACEHOLDER) {
-        let key = api_key.ok_or_else(|| {
-            format!(
-                "{} contains {PLACEHOLDER} but KIMI_API_KEY is not set in the daemon's environment",
-                template.display()
-            )
-        })?;
-        text.replace(PLACEHOLDER, key)
-    } else {
-        text
-    };
-    let dir = agent_home.join(".kimi-code");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    let target = dir.join("config.toml");
-    let tmp = dir.join(".config.toml.tmp");
-    std::fs::write(&tmp, rendered).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("cannot chmod {}: {e}", tmp.display()))?;
-    }
-    std::fs::rename(&tmp, &target).map_err(|e| format!("cannot install {}: {e}", target.display()))?;
-    Ok(())
-}
-
 /// Everything [`start`] needs to bring up one run's containers.
 pub struct ContainerSpec<'a> {
     pub cfg: &'a ExecutionConfig,
-    /// Configured ACP driver kind; only Kimi needs config-file provisioning.
-    pub driver_kind: &'a str,
     /// The backend `agent_runs` row id — names and labels every container.
     pub run_id: i32,
     pub project_id: i32,
@@ -259,10 +213,6 @@ pub async fn start(spec: ContainerSpec<'_>) -> Result<RunContainers, DriverError
             String::from_utf8_lossy(&o.stderr).trim()
         ),
         Err(e) => tracing::debug!(error = %e, "git worktree lock failed to spawn"),
-    }
-
-    if spec.driver_kind == "kimi-acp" {
-        provision_kimi_config(spec.repo, spec.agent_home).map_err(DriverError::Permanent)?;
     }
 
     let result = start_inner(&spec, &run_name, &pg_name, &minio_name).await;
@@ -742,59 +692,6 @@ mod tests {
         // Sidecars share the run container's network namespace, so the §5.8
         // port-block contract does not apply inside a container.
         assert!(env.iter().all(|(k, _)| k != "REMOTER_AGENT_PORT_BASE"));
-    }
-
-    #[test]
-    fn provision_kimi_config_substitutes_the_api_key() {
-        let dir = std::env::temp_dir().join(format!("remoter-kimi-prov-{}", std::process::id()));
-        let repo = dir.join("repo");
-        let home = dir.join("agent-home");
-        std::fs::create_dir_all(repo.join(".remoter")).unwrap();
-        std::fs::write(
-            repo.join(".remoter/kimi-config.toml"),
-            "api_key = \"${KIMI_API_KEY}\"\n",
-        )
-        .unwrap();
-        provision_kimi_config_with(&repo, &home, Some("sk-test")).unwrap();
-        let rendered = std::fs::read_to_string(home.join(".kimi-code/config.toml")).unwrap();
-        assert_eq!(rendered, "api_key = \"sk-test\"\n");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(home.join(".kimi-code/config.toml"))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o600
-            );
-        }
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn provision_kimi_config_missing_key_is_an_error() {
-        let dir = std::env::temp_dir().join(format!("remoter-kimi-prov-err-{}", std::process::id()));
-        let repo = dir.join("repo");
-        std::fs::create_dir_all(repo.join(".remoter")).unwrap();
-        std::fs::write(
-            repo.join(".remoter/kimi-config.toml"),
-            "api_key = \"${KIMI_API_KEY}\"\n",
-        )
-        .unwrap();
-        let err = provision_kimi_config_with(&repo, &dir.join("agent-home"), None).unwrap_err();
-        assert!(err.contains("KIMI_API_KEY"), "{err}");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn provision_kimi_config_without_template_is_a_noop() {
-        let dir = std::env::temp_dir().join(format!("remoter-kimi-prov-none-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        provision_kimi_config_with(&dir.join("repo"), &dir.join("agent-home"), None).unwrap();
-        assert!(!dir.join("agent-home/.kimi-code/config.toml").exists());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

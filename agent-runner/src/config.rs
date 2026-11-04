@@ -74,8 +74,9 @@ pub struct ExecutionConfig {
     pub minio_image: String,
     #[serde(default = "default_mc_image")]
     pub mc_image: String,
-    /// Shared home for agents inside containers (mounted at `/root`): kimi
-    /// config/credentials and session state survive runs here.
+    /// Shared agent state in every execution mode: rendered Kimi
+    /// config/credentials and session state survive runs here. Containers
+    /// mount it at `/root`; host mode exposes it as `KIMI_CODE_HOME`.
     /// Default: `<workspace_root>/agent-home`.
     #[serde(default)]
     pub agent_home: Option<PathBuf>,
@@ -231,6 +232,10 @@ pub struct DriverConfig {
     /// …invoked with these args (default `["acp"]`).
     #[serde(default = "default_agent_args")]
     pub agent_args: Vec<String>,
+    /// Kimi only: daemon-owned provider/model configuration rendered into the
+    /// agent home for every execution mode.
+    #[serde(default = "default_kimi_config")]
+    pub kimi_config: PathBuf,
     /// ACP drivers: the remoter MCP server binary injected into every
     /// session (default `remoter-mcp`). A bare name is resolved against the
     /// daemon's own PATH into an absolute path at startup (spec §5.6) — the
@@ -265,8 +270,8 @@ pub struct DriverConfig {
     #[serde(default)]
     pub review_thinking: Option<String>,
     /// Kimi only: directory where kimi stores session state
-    /// (`~/.kimi-code/sessions` by default). The driver reads per-session
-    /// `wire.jsonl` from here when ACP does not report token usage directly.
+    /// (`<agent_home>/.kimi-code/sessions` by default). The driver reads
+    /// per-session `wire.jsonl` here when ACP does not report token usage.
     #[serde(default)]
     pub sessions_dir: Option<PathBuf>,
 }
@@ -385,11 +390,8 @@ fn default_agent_args() -> Vec<String> {
 fn default_remoter_mcp_command() -> String {
     "remoter-mcp".to_string()
 }
-fn default_sessions_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".kimi-code/sessions")
+fn default_kimi_config() -> PathBuf {
+    PathBuf::from("~/.config/remoter-agent/kimi-config.toml")
 }
 
 impl Config {
@@ -463,7 +465,6 @@ impl Config {
             driver.agent_program = "opencode".to_string();
         }
         let container_mode = file.execution.mode == ExecutionMode::Container;
-        let isolated_home = file.execution.mode != ExecutionMode::Host;
         // The stub driver never touches MCP — skip resolution so dry-run
         // setups don't need the binary on the host. Container mode reduces
         // both program values to bare names instead: the agent and
@@ -476,6 +477,7 @@ impl Config {
         } else if driver.kind != "stub" {
             driver.remoter_mcp_command = resolve_mcp_command(&driver.remoter_mcp_command)?;
         }
+        driver.kimi_config = expand_tilde_path(&driver.kimi_config);
         let workspace_root = expand_tilde(&file.workspace_root);
         let execution = ExecutionConfig {
             agent_home: file.execution.agent_home.as_deref().map(expand_tilde_path),
@@ -489,13 +491,7 @@ impl Config {
                     .sessions_dir
                     .as_deref()
                     .map(expand_tilde_path)
-                    .unwrap_or_else(|| {
-                        if isolated_home {
-                            agent_home.join(".kimi-code/sessions")
-                        } else {
-                            default_sessions_dir()
-                        }
-                    }),
+                    .unwrap_or_else(|| agent_home.join(".kimi-code/sessions")),
             );
         } else {
             driver.sessions_dir = None;
@@ -531,9 +527,20 @@ impl Config {
         })
     }
 
-    /// Startup validation for isolated modes. A daemon that cannot honor the
-    /// configured sandbox fails to boot instead of silently using the host.
+    /// Validate daemon-owned agent configuration and the selected execution
+    /// mode before accepting work.
     pub fn validate_execution(&self) -> anyhow::Result<()> {
+        let agent_home = self.execution.agent_home(&self.workspace_root);
+        if self.driver.kind == "kimi-acp" {
+            std::fs::read_to_string(&self.driver.kimi_config).map_err(|e| {
+                anyhow::anyhow!(
+                    "cannot read driver.kimi_config {}: {e}",
+                    self.driver.kimi_config.display()
+                )
+            })?;
+            std::fs::create_dir_all(agent_home.join(".kimi-code/sessions"))
+                .map_err(|e| anyhow::anyhow!("cannot create agent home {}: {e}", agent_home.display()))?;
+        }
         match self.execution.mode {
             ExecutionMode::Host => return Ok(()),
             ExecutionMode::Container => {
@@ -563,20 +570,6 @@ impl Config {
                     }
                 }
             }
-        }
-        let agent_home = self.execution.agent_home(&self.workspace_root);
-        if self.driver.kind == "kimi-acp" {
-            std::fs::create_dir_all(agent_home.join(".kimi-code/sessions"))
-                .map_err(|e| anyhow::anyhow!("cannot create agent home {}: {e}", agent_home.display()))?;
-        }
-        if self.driver.kind == "kimi-acp" && !agent_home.join(".kimi-code/config.toml").is_file() {
-            tracing::warn!(
-                mode = ?self.execution.mode,
-                "{} does not exist — the agent's auth will fail unless the project's \
-                 .remoter/kimi-config.toml is in place (rendered at sandbox start with KIMI_API_KEY \
-                 from the daemon's environment)",
-                agent_home.join(".kimi-code/config.toml").display()
-            );
         }
         Ok(())
     }
@@ -898,6 +891,12 @@ agent_home = "/var/lib/remoter-agent-home"
         assert_eq!(cfg.stall_grace_secs, 30);
         assert!(cfg.workspace_root.ends_with(".local/share/remoter-agent"));
         assert!(!cfg.workspace_root.starts_with("~"));
+        assert!(
+            cfg.driver
+                .kimi_config
+                .ends_with(".config/remoter-agent/kimi-config.toml")
+        );
+        assert!(!cfg.driver.kimi_config.starts_with("~"));
         assert_eq!(cfg.workspace_id, None);
     }
 
@@ -910,6 +909,7 @@ agent_home = "/var/lib/remoter-agent-home"
             r#"[driver]
 kind = "kimi-acp"
 remoter_mcp_command = "/opt/remoter/remoter-mcp"
+kimi_config = "~/kimi-test.toml"
 plan_model = "kimi-code/k3"
 plan_thinking = "max"
 implement_model = "kimi-code/kimi-for-coding"
@@ -928,6 +928,17 @@ review_thinking = "max""#,
         assert_eq!(cfg.driver.supervise_thinking.as_deref(), Some("max"));
         assert_eq!(cfg.driver.review_model.as_deref(), Some("kimi-code/k3-reasoning"));
         assert_eq!(cfg.driver.review_thinking.as_deref(), Some("max"));
+        assert!(cfg.driver.kimi_config.ends_with("kimi-test.toml"));
+        assert!(!cfg.driver.kimi_config.starts_with("~"));
+        assert_eq!(
+            cfg.driver.sessions_dir.as_deref(),
+            Some(
+                cfg.execution
+                    .agent_home(&cfg.workspace_root)
+                    .join(".kimi-code/sessions")
+                    .as_path()
+            )
+        );
 
         assert_eq!(
             cfg.driver.config_options_for("plan"),
@@ -1135,6 +1146,40 @@ review_model = "kimi-code/k3-reasoning""#,
             cfg.driver.config_options_for("plan"),
             vec![("effort".to_string(), "high".to_string())]
         );
+    }
+
+    #[test]
+    fn host_validation_requires_kimi_config_and_creates_agent_sessions() {
+        // SAFETY: single-threaded test process env tweak; removed immediately.
+        unsafe { std::env::remove_var(API_URL_ENV) };
+        let dir = std::env::temp_dir().join(format!("remoter-config-validate-{}", std::process::id()));
+        let source = dir.join("kimi-config.toml");
+        let toml = format!(
+            r#"
+api_url = "http://localhost:8181"
+workspace_root = "{}"
+
+[driver]
+kind = "kimi-acp"
+remoter_mcp_command = "/opt/remoter/remoter-mcp"
+kimi_config = "{}"
+"#,
+            dir.join("workspace").display(),
+            source.display()
+        );
+        let cfg = Config::from_toml_str(&toml, Some("tok".to_string())).unwrap();
+        let err = cfg.validate_execution().unwrap_err().to_string();
+        assert!(err.contains("driver.kimi_config"), "{err}");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&source, "default_model = \"kimi-code/k3\"\n").unwrap();
+        cfg.validate_execution().unwrap();
+        assert!(
+            cfg.execution
+                .agent_home(&cfg.workspace_root)
+                .join(".kimi-code/sessions")
+                .is_dir()
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

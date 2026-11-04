@@ -100,6 +100,30 @@ The config file is searched in order: `REMOTER_AGENT_CONFIG` →
 `~/.config/remoter-agent.toml`. So with the file at
 `~/.config/remoter-agent.toml` the daemon just runs as `remoter-agent`.
 
+### Kimi agent configuration
+
+With `driver.kind = "kimi-acp"`, provider, model, and thinking defaults come
+from one daemon-owned file in every execution mode:
+
+```toml
+# remoter-agent.toml
+[driver]
+kind = "kimi-acp"
+kimi_config = "~/.config/remoter-agent/kimi-config.toml" # default
+```
+
+The file is required at startup. Use `${KIMI_API_KEY}` as the provider key
+placeholder and export the real key in the daemon's environment (for example,
+through the systemd unit). At each run the daemon renders the source into
+`<agent_home>/.kimi-code/config.toml` with owner-only permissions. Host mode
+sets `KIMI_CODE_HOME` to that runtime directory; container and bwrap modes use
+their isolated `agent_home` as Kimi's home. Edit only the daemon-owned source,
+not the generated copy.
+
+Projects need no Kimi configuration. To migrate an old project
+`.remoter/kimi-config.toml`, move its contents to `driver.kimi_config`; the
+project template is no longer read.
+
 At startup the daemon validates the token (`GET /auth/me`) and resolves
 `remoter-mcp` against its own PATH — it exits with a clear error if either
 fails. Then it polls the backend and claims tickets assigned to its agent
@@ -208,9 +232,9 @@ kind = "kimi-acp"
 Startup fails closed if the binaries, Nix store/database, CA bundle, agent/MCP
 programs, or a real namespace smoke test are unavailable. Install `kimi` and
 `remoter-mcp` on the daemon host as usual; absolute Nix store paths and NixOS
-PATH profile entries remain visible inside the sandbox. As in container mode,
-`.remoter/kimi-config.toml` is rendered into the persistent `agent_home` with
-`KIMI_API_KEY` from the daemon environment.
+PATH profile entries remain visible inside the sandbox. Kimi uses the same
+daemon-owned `driver.kimi_config` as host and container modes, rendered into
+the persistent `agent_home` at each run.
 
 ### What happens on a run
 

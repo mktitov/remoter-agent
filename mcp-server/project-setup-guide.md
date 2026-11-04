@@ -102,10 +102,6 @@ docker container built from the project's own image context, `.remoter/`:
   failed check (the cached image is kept — fail-open);
 - `seed-nix-cache.sh` — optional host-side hook that seeds the daemon's
   shared nix binary cache before a bake; fail-open like `check-image.sh`;
-- `kimi-config.toml` — optional agent CLI config template rendered into the
-  container's agent home at every start. It must stay **secret-free**:
-  `${KIMI_API_KEY}` is substituted from the daemon's environment at container
-  start — never commit a real key;
 - `staging.toml` — optional staging-environment definition (validated when
   present; an enabled one requires a start command and at least one route).
 
@@ -128,9 +124,9 @@ build request.
 Every sandbox has an independent localhost, so §2.2 port parameterization is
 not needed inside bwrap and `REMOTER_AGENT_PORT_BASE` is absent. Use normal
 service ports and `REMOTER_EXECUTION=bwrap` for detection, not
-`REMOTER_CONTAINER`. The optional secret-free `.remoter/kimi-config.toml` is
-also used in this mode. See `agent-runner/README.md` for host prerequisites and
-the live verification command.
+`REMOTER_CONTAINER`. Kimi provider/model configuration is daemon-owned through
+`driver.kimi_config`; the project needs no Kimi config template. See
+`agent-runner/README.md` for host prerequisites and the live verification command.
 
 ## 3. Final checklist
 

@@ -1048,6 +1048,17 @@ fn run_env(rc: &RunContext) -> Vec<(String, String)> {
             if let Some(block) = &rc.port_block {
                 env.push(("REMOTER_AGENT_PORT_BASE".to_string(), block.base().to_string()));
             }
+            if rc.config.driver.kind == "kimi-acp" {
+                env.push((
+                    "KIMI_CODE_HOME".to_string(),
+                    rc.config
+                        .execution
+                        .agent_home(&rc.config.workspace_root)
+                        .join(".kimi-code")
+                        .to_string_lossy()
+                        .into_owned(),
+                ));
+            }
             env
         }
     }
@@ -1139,11 +1150,15 @@ pub(crate) async fn start_container_runtime(
     env: &[(String, String)],
     refs: &[workspace::RefMount],
 ) -> Result<Option<RunRuntime>, RunFailure> {
+    let agent_home = config.execution.agent_home(&config.workspace_root);
+    if config.driver.kind == "kimi-acp" {
+        crate::driver::kimi_config::provision(&config.driver.kimi_config, &agent_home, run_id)
+            .map_err(|e| RunFailure::new(DriverError::Permanent(e), None))?;
+    }
     if config.execution.mode == ExecutionMode::Host {
         return Ok(None);
     }
     let repo = workspace::repo_dir(&config.workspace_root, project.project_id);
-    let agent_home = config.execution.agent_home(&config.workspace_root);
     if config.execution.is_bwrap() {
         let lock = tokio::process::Command::new("git")
             .arg("-C")
@@ -1161,10 +1176,6 @@ pub(crate) async fn start_container_runtime(
             worktree: worktree.to_path_buf(),
             repo: repo.clone(),
         };
-        if config.driver.kind == "kimi-acp" {
-            container::provision_kimi_config(&repo, &agent_home)
-                .map_err(|e| RunFailure::new(DriverError::Permanent(e), None))?;
-        }
         if devenv {
             crate::bwrap::prewarm(worktree, &agent_home, env)
                 .await
@@ -1177,7 +1188,6 @@ pub(crate) async fn start_container_runtime(
         .map_err(|e| RunFailure::new(e, None))?;
     let containers = container::start(container::ContainerSpec {
         cfg: &config.execution,
-        driver_kind: &config.driver.kind,
         run_id,
         project_id: project.project_id,
         image: &image,
@@ -3409,6 +3419,48 @@ kind = "stub"
             cancel: CancellationToken::new(),
             log_store,
         }
+    }
+
+    #[tokio::test]
+    async fn host_mode_provisions_kimi_config_and_sets_kimi_code_home() {
+        let dir = std::env::temp_dir().join(format!("remoter-host-kimi-config-{}", std::process::id()));
+        let source = dir.join("kimi-config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&source, "default_model = \"kimi-code/k3\"\n").unwrap();
+        let mut rc = test_run_context("http://localhost:8181");
+        let mut config = (*rc.config).clone();
+        config.workspace_root = dir.join("workspace");
+        config.driver.kind = "kimi-acp".to_string();
+        config.driver.kimi_config = source;
+        rc.config = Arc::new(config);
+
+        let runtime = start_container_runtime(
+            &rc.config,
+            &rc.image_locks,
+            &rc.project,
+            rc.task.id,
+            99,
+            Path::new("/unused"),
+            false,
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        assert!(runtime.is_none());
+        let agent_home = rc.config.execution.agent_home(&rc.config.workspace_root);
+        assert_eq!(
+            std::fs::read_to_string(agent_home.join(".kimi-code/config.toml")).unwrap(),
+            "default_model = \"kimi-code/k3\"\n"
+        );
+        let env = run_env(&rc);
+        assert_eq!(
+            env.iter()
+                .find(|(key, _)| key == "KIMI_CODE_HOME")
+                .map(|(_, value)| std::path::PathBuf::from(value)),
+            Some(agent_home.join(".kimi-code"))
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A child whose parent has `supervisionEnabled = false` is not
