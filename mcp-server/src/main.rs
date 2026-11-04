@@ -541,8 +541,8 @@ impl ServerHandler for RemoterMcp {
             Role::Full => "Remoter task management over MCP, for AI agents and humans alike. \
                  Discover IDs first: list_projects, then list_features for a project; search_tasks finds tasks by #id or title, \
                  list_board shows the kanban, and list_my_tasks shows work assigned to you. \
-                 current_project returns the project bound via REMOTER_PROJECT_ID (id, name, goal); the binding is the \
-                 default projectId for list_features, list_board, list_goals, create_task, and list_my_tasks. \
+                 current_project returns the project bound via REMOTER_PROJECT_ID (id, name, goal); in standalone mode the binding is the \
+                 default projectId for list_features, list_board, list_goals, create_task, and list_my_tasks; daemon mode ignores it as a default. \
                  get_task gives full details; start_task/advance_task/complete_task move a task along the board. \
                  Use add_action to create steps, update_action to edit them, delete_action to remove stale ones, \
                  and start_action/complete_action to track progress. reject_action with a reason when a step is no longer needed. \

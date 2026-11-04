@@ -7,7 +7,7 @@
 use rmcp::handler::server::wrapper::Parameters;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
-    matchers::{body_json, method, path, query_param},
+    matchers::{body_json, method, path, query_param, query_param_is_missing},
 };
 
 use crate::{
@@ -1700,6 +1700,87 @@ async fn list_my_tasks_uses_the_bound_project_as_default() {
 
     let mcp = test_mcp_with_project(server.uri(), Role::Full, None, Some(bound_project(7)));
     let p: ListMyTasksParams = serde_json::from_value(serde_json::json!({})).unwrap();
+    let result = mcp.list_my_tasks(Parameters(p)).await.unwrap();
+    assert!(result_text(result).contains("No tasks assigned to you"));
+}
+
+#[tokio::test]
+async fn list_features_daemon_mode_ignores_binding_but_honors_explicit_project_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/features"))
+        .and(query_param("project_id", "3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp_with_project(server.uri(), Role::DevAgentImplement, Some(70), Some(bound_project(7)));
+    let p: ListFeaturesParams = serde_json::from_value(serde_json::json!({})).unwrap();
+    let err = mcp.list_features(Parameters(p)).await.unwrap_err();
+    assert!(err.message.contains("projectId is required"), "{err:?}");
+
+    let p: ListFeaturesParams = serde_json::from_value(serde_json::json!({"projectId": 3})).unwrap();
+    let result = mcp.list_features(Parameters(p)).await.unwrap();
+    assert!(result_text(result).contains("No features"));
+}
+
+#[tokio::test]
+async fn list_board_daemon_mode_ignores_binding_but_honors_explicit_project_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/boards"))
+        .and(query_param_is_missing("scope"))
+        .and(query_param_is_missing("projectId"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/boards"))
+        .and(query_param("scope", "project"))
+        .and(query_param("projectId", "3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp_with_project(server.uri(), Role::DevAgentImplement, Some(70), Some(bound_project(7)));
+    let p: ListBoardParams = serde_json::from_value(serde_json::json!({})).unwrap();
+    let result = mcp.list_board(Parameters(p)).await.unwrap();
+    assert!(result_text(result).contains("No tasks on the board"));
+
+    let p: ListBoardParams = serde_json::from_value(serde_json::json!({"projectId": 3})).unwrap();
+    let result = mcp.list_board(Parameters(p)).await.unwrap();
+    assert!(result_text(result).contains("No tasks on the board"));
+}
+
+#[tokio::test]
+async fn list_my_tasks_daemon_mode_ignores_binding_but_honors_explicit_project_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks"))
+        .and(query_param("assignee", "me"))
+        .and(query_param_is_missing("projectId"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks"))
+        .and(query_param("assignee", "me"))
+        .and(query_param("projectId", "3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mcp = test_mcp_with_project(server.uri(), Role::DevAgentImplement, Some(70), Some(bound_project(7)));
+    let p: ListMyTasksParams = serde_json::from_value(serde_json::json!({})).unwrap();
+    let result = mcp.list_my_tasks(Parameters(p)).await.unwrap();
+    assert!(result_text(result).contains("No tasks assigned to you"));
+
+    let p: ListMyTasksParams = serde_json::from_value(serde_json::json!({"projectId": 3})).unwrap();
     let result = mcp.list_my_tasks(Parameters(p)).await.unwrap();
     assert!(result_text(result).contains("No tasks assigned to you"));
 }

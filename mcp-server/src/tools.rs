@@ -39,7 +39,7 @@ pub struct RemoterMcp {
     /// The project the local repository is bound to via `REMOTER_PROJECT_ID`
     /// (validated at startup, spec mcp-server-for-agents.md §2.2). Served by
     /// `current_project` and used as the default `projectId` in standalone
-    /// mode; daemon mode keeps resolving the current ticket's project.
+    /// mode only; daemon mode never applies it as an implicit default.
     pub bound_project: Option<ProjectDto>,
     pub tool_router: ToolRouter<Self>,
 }
@@ -77,11 +77,16 @@ impl RemoterMcp {
 
     /// The effective project for tools with an optional `projectId`: the
     /// explicit parameter wins; otherwise the `REMOTER_PROJECT_ID` binding is
-    /// the default. Daemon-mode tools that derive the project from the current
-    /// ticket (`list_goals`, `create_task`) resolve it before falling back
-    /// here — the ticket context outranks the binding.
+    /// the default in standalone mode only. Daemon-mode tools that derive the
+    /// project from the current ticket (`list_goals`, `create_task`) resolve it
+    /// separately.
     fn effective_project_id(&self, explicit: Option<i32>) -> Option<i32> {
-        explicit.or_else(|| self.bound_project.as_ref().map(|p| p.id))
+        explicit.or_else(|| {
+            self.agent_task_id
+                .is_none()
+                .then(|| self.bound_project.as_ref().map(|p| p.id))
+                .flatten()
+        })
     }
 
     /// Daemon-mode discovery scoping for the supervise role (spec
@@ -150,7 +155,7 @@ pub struct ListMyTasksParams {
     /// Filter by board status: "backlog", "todo", "in_progress", "review", "completed".
     #[serde(rename = "status")]
     pub status: Option<String>,
-    /// Filter to one project. Defaults to the bound project
+    /// Filter to one project. In standalone mode, defaults to the bound project
     /// (`REMOTER_PROJECT_ID`) when omitted.
     #[serde(rename = "projectId")]
     pub project_id: Option<i32>,
@@ -604,7 +609,7 @@ impl<'de> serde::Deserialize<'de> for UpdateTaskParams {
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListFeaturesParams {
-    /// The project ID. Defaults to the bound project (`REMOTER_PROJECT_ID`)
+    /// The project ID. In standalone mode, defaults to the bound project (`REMOTER_PROJECT_ID`)
     /// when omitted.
     #[serde(rename = "projectId")]
     pub project_id: Option<i32>,
@@ -627,7 +632,7 @@ pub struct SearchTasksParams {
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListBoardParams {
-    /// Scope the board to one project. Defaults to the bound project
+    /// Scope the board to one project. In standalone mode, defaults to the bound project
     /// (`REMOTER_PROJECT_ID`) when omitted.
     #[serde(rename = "projectId")]
     pub project_id: Option<i32>,
@@ -811,7 +816,7 @@ impl RemoterMcp {
 
     #[tool(
         name = "list_my_tasks",
-        description = "List tasks assigned to the calling agent, with denormalized project/feature names. This is the primary entry point: call this first to see what work you have. projectId defaults to the bound project (REMOTER_PROJECT_ID) when omitted."
+        description = "List tasks assigned to the calling agent, with denormalized project/feature names. This is the primary entry point: call this first to see what work you have. In standalone mode, projectId defaults to the bound project (REMOTER_PROJECT_ID) when omitted; the binding is ignored in daemon mode."
     )]
     async fn list_my_tasks(
         &self,
@@ -866,7 +871,7 @@ impl RemoterMcp {
 
     #[tool(
         name = "list_features",
-        description = "List features in a project, with task totals and completion counts. Use this to discover feature IDs when creating tasks in standalone mode. projectId defaults to the bound project (REMOTER_PROJECT_ID) when omitted."
+        description = "List features in a project, with task totals and completion counts. Use this to discover feature IDs when creating tasks in standalone mode. In standalone mode, projectId defaults to the bound project (REMOTER_PROJECT_ID) when omitted; the binding is ignored in daemon mode."
     )]
     async fn list_features(
         &self,
@@ -874,7 +879,7 @@ impl RemoterMcp {
     ) -> Result<CallToolResult, McpErrorData> {
         let Some(project_id) = self.effective_project_id(p.project_id) else {
             return Err(McpErrorData::invalid_params(
-                "projectId is required when no project is bound (REMOTER_PROJECT_ID is not set)",
+                "projectId is required in daemon mode or when no project is bound in standalone mode (REMOTER_PROJECT_ID is not set)",
                 None,
             ));
         };
@@ -946,7 +951,7 @@ impl RemoterMcp {
 
     #[tool(
         name = "list_board",
-        description = "List the kanban board: every task as a card with its column (taskStatus), assignee, and action counts. Optionally scope to one project (projectId; defaults to the bound project REMOTER_PROJECT_ID when omitted) and set the Completed column window (completed: today, week, month, or all)."
+        description = "List the kanban board: every task as a card with its column (taskStatus), assignee, and action counts. Optionally scope to one project (projectId; in standalone mode defaults to the bound project REMOTER_PROJECT_ID when omitted, while daemon mode ignores the binding) and set the Completed column window (completed: today, week, month, or all)."
     )]
     async fn list_board(&self, Parameters(p): Parameters<ListBoardParams>) -> Result<CallToolResult, McpErrorData> {
         let mut cards = self
@@ -2471,7 +2476,7 @@ mod tests {
     fn list_features_params_map_project_id() {
         let p: ListFeaturesParams = serde_json::from_value(serde_json::json!({"projectId": 42})).unwrap();
         assert_eq!(p.project_id, Some(42));
-        // projectId is optional: the REMOTER_PROJECT_ID binding is the default.
+        // projectId is optional: standalone mode defaults to the binding.
         let p: ListFeaturesParams = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(p.project_id, None);
         // snake_case project_id is not accepted — the MCP surface is camelCase.
