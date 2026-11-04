@@ -47,6 +47,7 @@ async fn opencode_acp_conformance() {
         simulate_uncommitted_changes: false,
         agent_program: "opencode".to_string(),
         agent_args: vec!["acp".to_string()],
+        kimi_config: PathBuf::from("unused-kimi-config.toml"),
         remoter_mcp_command: "remoter-mcp".to_string(),
         plan_model: None,
         plan_thinking: None,

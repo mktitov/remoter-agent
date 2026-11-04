@@ -59,9 +59,9 @@ RUN ln -s /nix/var/nix/profiles/default/etc/ssl/certs/ca-bundle.crt \
 # /usr/local/bin holds npm globals (kimi, installed by agent-init.sh) — the
 # base image's PATH covers only the nix profiles, so add it explicitly.
 ENV PATH="/usr/local/bin:${PATH}"
-# kimi auth comes from .remoter/kimi-config.toml, rendered into the mounted
-# agent home at container start (container.rs::provision_kimi_config) — the
-# image stays secret-free.
+# The daemon renders its configured driver.kimi_config into the mounted agent
+# home at container start, substituting KIMI_API_KEY from the host environment.
+# The image and project checkout stay secret-free.
 ENV KIMI_DISABLE_TELEMETRY=1
 
 # Optional project init: runs once per image build inside the warmed devenv

@@ -37,10 +37,11 @@ stall_grace_secs    = 30
 # minio_image    = "minio/minio:RELEASE.2025-09-07T16-13-09Z"
 # mc_image       = "minio/mc:RELEASE.2025-08-13T08-35-41Z"
 # agent_home = "~/.local/share/remoter-agent/agent-home"
-#                                      # isolated-mode persistent $HOME (/root in
-#                                      # Docker, unchanged absolute path in bwrap):
-#                                      # agent config/credentials, Nix fetcher cache
-#                                      # and ~/.kimi-code/sessions survive runs here
+#                                      # persistent agent state in every mode:
+#                                      # rendered Kimi config/credentials, sessions,
+#                                      # and (in bwrap) the Nix fetcher cache.
+#                                      # Docker mounts it at /root; host mode exports
+#                                      # its .kimi-code subdirectory as KIMI_CODE_HOME.
 # nix_binary_cache_dir = "~/.local/share/remoter-agent/nix-cache"
 #                                      # shared nix binary cache (file:// substituter)
 #                                      # on this host; image-init containers of
@@ -54,10 +55,6 @@ stall_grace_secs    = 30
 #                                      # daemon also generates a signing key next
 #                                      # to the dir and seeds the cache via the
 #                                      # project's .remoter/seed-nix-cache.sh hook.
-# Container and bwrap modes: kimi auth comes from the project's
-# .remoter/kimi-config.toml, rendered into <agent_home>/.kimi-code/config.toml
-# at every runtime start — ${KIMI_API_KEY} is substituted from the daemon's own
-# environment, so export the key in the systemd unit (Environment=/EnvironmentFile=).
 # Bwrap requires NixOS, rootless user namespaces, bwrap and slirp4netns. It uses
 # no Docker image/sidecars and no REMOTER_AGENT_PORT_BASE: each sandbox has an
 # independent localhost, and the project's own devenv services use default ports.
@@ -69,13 +66,17 @@ kind = "kimi-acp"    # dry-run = "stub"; real ACP agents = "kimi-acp" or "openco
 # ACP drivers (defaults shown for kimi-acp):
 # agent_program = "kimi"        # opencode-acp defaults to "opencode"
 # agent_args = ["acp"]
+# kimi_config = "~/.config/remoter-agent/kimi-config.toml"
+# Daemon-owned Kimi provider/model/thinking config for host, container, and
+# bwrap. It is rendered into <agent_home>/.kimi-code/config.toml at every run;
+# ${KIMI_API_KEY} is substituted from the daemon environment (set it in the
+# systemd unit). Projects need no Kimi config and the rendered copy is not
+# edited directly. Migrate any old project .remoter/kimi-config.toml here.
 # Per-kind model/thinking selection via ACP `session/set_config_option` (spec §5.5).
 # Values must match the ids advertised by the agent CLI (the permanent error
 # names the advertised choices on mismatch); empty or absent keys
-# leave the agent's default in place. With a provisioned config.toml
-# (container mode: the project's .remoter/kimi-config.toml rendered into the
-# agent home, KIMI_API_KEY substituted from the daemon's environment) the ids
-# are the catalog keys from that file. Recommended pairing for cost/speed:
+# leave the agent's default in place. The ids are the catalog keys from
+# kimi_config. Recommended pairing for cost/speed:
 #   plan = K3 + max reasoning, implement = K2.7 Coding.
 # Note: kimi's thinking values are model-dependent — kimi-for-coding accepts
 # only "on" (Thinking On / Off (unsupported) in the console).
@@ -85,7 +86,8 @@ kind = "kimi-acp"    # dry-run = "stub"; real ACP agents = "kimi-acp" or "openco
 # implement_thinking = "on"
 # remoter_mcp_command = "remoter-mcp"   # injected into every session (spec §5.6); a bare name
                                        # is resolved against the daemon's PATH at startup
-# sessions_dir = "~/.kimi-code/sessions"  # where kimi writes session wire.jsonl; default is ~/.kimi-code/sessions
+# sessions_dir = "~/.local/share/remoter-agent/agent-home/.kimi-code/sessions"
+#                                      # optional override; default is <agent_home>/.kimi-code/sessions
 
 # Per-run ACP logs (spec §7.1): structured JSONL files written by the daemon.
 # The backend streams them to humans over WebSocket; nothing is shipped to Postgres.
