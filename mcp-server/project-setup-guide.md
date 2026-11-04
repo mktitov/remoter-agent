@@ -52,8 +52,9 @@ fully autonomous.
 
 The daemon enters the ticket worktree through
 `devenv shell --no-eval-cache` and brings project services up with
-`devenv --no-eval-cache up -d`. So the project needs a working
-[devenv](https://devenv.sh) shell carrying its toolchain and services.
+`devenv --no-eval-cache up -d` when processes are defined. Shell-only projects
+skip service startup. The project needs a working [devenv](https://devenv.sh)
+shell carrying its toolchain and any services it uses.
 
 Parallel tickets of one project collide on hardcoded service ports (two
 Postgreses, one port), so the daemon allocates a unique **port block per

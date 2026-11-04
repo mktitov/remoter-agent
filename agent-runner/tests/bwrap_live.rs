@@ -513,6 +513,32 @@ fn daemon_death_terminates_launcher_and_sandbox_before_reconcile() {
 }
 
 #[tokio::test]
+#[ignore = "real devenv integration; host pre-warm may build or substitute"]
+async fn devenv_shell_without_processes() {
+    let Some(tools) = prerequisites("devenv_shell_without_processes") else {
+        return;
+    };
+    if !has_tools("devenv_shell_without_processes", &["devenv"]) {
+        return;
+    }
+    let dir = TestDir::new("shell-only");
+    let spec = dir.launch_spec("run", true);
+    write_shell_only_devenv_project(&spec.worktree);
+    prewarm(&spec.worktree, &spec.agent_home, &spec.env)
+        .await
+        .unwrap_or_else(|error| panic!("host devenv pre-warm failed: {error}"));
+    let output = run_launch(
+        &tools,
+        &spec,
+        "/bin/sh",
+        strings(&["-c", "printf shell-ok"]),
+        "shell-only",
+    )
+    .wait_success();
+    assert_eq!(output.stdout, "shell-ok");
+}
+
+#[tokio::test]
 #[ignore = "real devenv/PostgreSQL integration; host pre-warm may build or substitute"]
 async fn devenv_postgres_parallel_and_snapshot_metrics() {
     let Some(tools) = prerequisites("devenv_postgres_parallel_and_snapshot_metrics") else {
@@ -882,14 +908,13 @@ fn host_port_5432_open() -> bool {
     TcpStream::connect_timeout(&address.into(), Duration::from_millis(250)).is_ok()
 }
 
+fn write_shell_only_devenv_project(worktree: &Path) {
+    write_devenv_config(worktree, "{ }\n");
+}
+
 fn write_devenv_project(worktree: &Path) {
-    fs::write(
-        worktree.join("devenv.yaml"),
-        "inputs:\n  nixpkgs:\n    url: github:cachix/devenv-nixpkgs/rolling\n",
-    )
-    .unwrap();
-    fs::write(
-        worktree.join("devenv.nix"),
+    write_devenv_config(
+        worktree,
         r#"{ pkgs, ... }:
 {
   packages = [ pkgs.postgresql ];
@@ -901,8 +926,16 @@ fn write_devenv_project(worktree: &Path) {
   };
 }
 "#,
+    );
+}
+
+fn write_devenv_config(worktree: &Path, config: &str) {
+    fs::write(
+        worktree.join("devenv.yaml"),
+        "inputs:\n  nixpkgs:\n    url: github:cachix/devenv-nixpkgs/rolling\n",
     )
     .unwrap();
+    fs::write(worktree.join("devenv.nix"), config).unwrap();
     let lock = project_root().join("devenv.lock");
     if lock.exists() {
         fs::copy(lock, worktree.join("devenv.lock")).unwrap();

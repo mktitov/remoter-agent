@@ -30,10 +30,14 @@ project_dir=$2
 shift 2
 if [ "$devenv_enabled" = "1" ]; then
     cd "$project_dir" || exit
-    trap 'devenv --nix-option extra-experimental-features read-only-local-store --no-eval-cache processes down >&2 2>/dev/null || :' EXIT
-    devenv --nix-option extra-experimental-features read-only-local-store --no-eval-cache processes down >&2 2>/dev/null || :
-    devenv --nix-option extra-experimental-features read-only-local-store --no-eval-cache up -d >&2 || exit
-    devenv --nix-option extra-experimental-features read-only-local-store --no-eval-cache processes wait --timeout 120 >&2 || exit
+    processes=$(devenv --nix-option extra-experimental-features read-only-local-store --no-eval-cache eval processes) || exit
+    processes=$(printf '%s' "$processes" | tr -d '[:space:]')
+    if [ "$processes" != '{"processes":{}}' ]; then
+        trap 'devenv --nix-option extra-experimental-features read-only-local-store --no-eval-cache processes down >&2 2>/dev/null || :' EXIT
+        devenv --nix-option extra-experimental-features read-only-local-store --no-eval-cache processes down >&2 2>/dev/null || :
+        devenv --nix-option extra-experimental-features read-only-local-store --no-eval-cache up -d >&2 || exit
+        devenv --nix-option extra-experimental-features read-only-local-store --no-eval-cache processes wait --timeout 120 >&2 || exit
+    fi
     devenv --nix-option extra-experimental-features read-only-local-store --no-eval-cache shell --no-tui -- "$@"
     status=$?
     exit "$status"

@@ -1037,13 +1037,17 @@ pub fn wrap_command(
 }
 
 /// `devenv --no-eval-cache up -d` + `devenv --no-eval-cache processes wait
-/// --timeout 120` before a run (R§5). Self-healing: a best-effort
-/// `processes down` runs first (a stale supervisor from a crashed previous
-/// attempt would otherwise fail `up -d` with "Processes already running"),
-/// and once more when `up -d`/`wait` fails, so a partially started supervisor
-/// is never leaked into the caller's retry loop.
+/// --timeout 120` before a run (R§5). Shell-only devenv projects skip up and
+/// readiness. Self-healing: a best-effort `processes down` always runs first
+/// (a stale supervisor from a crashed previous attempt would otherwise fail
+/// `up -d` with "Processes already running"), and once more when `up -d`/`wait`
+/// fails, so a partially started supervisor is never leaked into the caller's
+/// retry loop.
 pub async fn services_up(dir: &Path, env: &[(String, String)]) -> Result<(), WorkspaceError> {
     services_down(dir, env).await;
+    if !has_processes(dir, env).await? {
+        return Ok(());
+    }
     let result = async {
         devenv(dir, env, &["up", "-d"]).await?;
         devenv(dir, env, &["processes", "wait", "--timeout", "120"]).await
@@ -1104,7 +1108,7 @@ pub async fn down_all_worktrees(root: &Path) {
     }
 }
 
-async fn devenv(dir: &Path, env: &[(String, String)], args: &[&str]) -> Result<(), WorkspaceError> {
+fn devenv_command(dir: &Path, env: &[(String, String)], args: &[&str]) -> std::process::Command {
     let mut cmd = std::process::Command::new("devenv");
     cmd.arg("--no-eval-cache")
         .args(args)
@@ -1112,7 +1116,37 @@ async fn devenv(dir: &Path, env: &[(String, String)], args: &[&str]) -> Result<(
         .env("CI", "1")
         .env("DEVENV_NO_AI_AGENT", "1")
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-    run(cmd, &format!("devenv --no-eval-cache {}", args.join(" "))).await
+    cmd
+}
+
+async fn devenv(dir: &Path, env: &[(String, String)], args: &[&str]) -> Result<(), WorkspaceError> {
+    run(
+        devenv_command(dir, env, args),
+        &format!("devenv --no-eval-cache {}", args.join(" ")),
+    )
+    .await
+}
+
+async fn has_processes(dir: &Path, env: &[(String, String)]) -> Result<bool, WorkspaceError> {
+    let args = ["eval", "processes"];
+    let what = "devenv --no-eval-cache eval processes";
+    let out = tokio::process::Command::from(devenv_command(dir, env, &args))
+        .output()
+        .await
+        .map_err(|e| WorkspaceError(format!("{what}: {e}")))?;
+    if !out.status.success() {
+        return Err(WorkspaceError(format!(
+            "{what} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    let evaluated: serde_json::Value =
+        serde_json::from_slice(&out.stdout).map_err(|e| WorkspaceError(format!("{what}: invalid JSON output: {e}")))?;
+    let processes = evaluated
+        .get("processes")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| WorkspaceError(format!("{what}: missing processes object")))?;
+    Ok(!processes.is_empty())
 }
 
 // ── git helpers ───────────────────────────────────────────────────────────────
@@ -2629,9 +2663,10 @@ mod tests {
 
     // ── devenv up/down via a PATH-stubbed fake `devenv` ──────────────────────
     //
-    // The stub appends `<args> @ <cwd>` to `$DEVENV_STUB_LOG` and exits 1 when
-    // `$DEVENV_STUB_FAIL` is a substring of its args. The tests mutate the
-    // process-wide PATH, so they serialize on `ENV_LOCK`.
+    // The stub appends `<args> @ <cwd>` to `$DEVENV_STUB_LOG`, emits configured
+    // JSON for `eval processes`, and exits 1 when `$DEVENV_STUB_FAIL` is a
+    // substring of its args. The tests mutate the process-wide PATH, so they
+    // serialize on `ENV_LOCK`.
 
     static ENV_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
@@ -2650,7 +2685,7 @@ mod tests {
             let log = base.join("devenv.log");
             crate::testutil::write_executable_script(
                 &bin.join("devenv"),
-                "#!/bin/sh\necho \"$* @ $(pwd)\" >> \"$DEVENV_STUB_LOG\"\nif [ -n \"$DEVENV_STUB_FAIL\" ]; then\n  case \"$*\" in\n    *\"$DEVENV_STUB_FAIL\"*) exit 1;;\n  esac\nfi\nexit 0\n",
+                "#!/bin/sh\necho \"$* @ $(pwd)\" >> \"$DEVENV_STUB_LOG\"\nif [ -n \"$DEVENV_STUB_FAIL\" ]; then\n  case \"$*\" in\n    *\"$DEVENV_STUB_FAIL\"*) exit 1;;\n  esac\nfi\ncase \"$*\" in\n  *\"eval processes\"*) printf '%s\\n' \"$DEVENV_STUB_PROCESSES\";;\nesac\nexit 0\n",
             );
             let orig_path = std::env::var_os("PATH");
             // SAFETY: serialized on ENV_LOCK; no other thread in this binary
@@ -2665,6 +2700,7 @@ mod tests {
                     ),
                 );
                 std::env::set_var("DEVENV_STUB_LOG", &log);
+                std::env::set_var("DEVENV_STUB_PROCESSES", r#"{"processes":{"test":{}}}"#);
                 std::env::remove_var("DEVENV_STUB_FAIL");
             }
             Self { bin, log, orig_path }
@@ -2673,6 +2709,11 @@ mod tests {
         fn fail_on(&self, pattern: &str) {
             // SAFETY: see install().
             unsafe { std::env::set_var("DEVENV_STUB_FAIL", pattern) };
+        }
+
+        fn processes(&self, json: &str) {
+            // SAFETY: see install().
+            unsafe { std::env::set_var("DEVENV_STUB_PROCESSES", json) };
         }
 
         fn calls(&self) -> Vec<String> {
@@ -2693,6 +2734,7 @@ mod tests {
                     None => std::env::remove_var("PATH"),
                 }
                 std::env::remove_var("DEVENV_STUB_LOG");
+                std::env::remove_var("DEVENV_STUB_PROCESSES");
                 std::env::remove_var("DEVENV_STUB_FAIL");
             }
             let _ = std::fs::remove_dir_all(self.bin.parent().unwrap());
@@ -2733,9 +2775,39 @@ mod tests {
             args_only(&stub.calls()),
             [
                 "--no-eval-cache processes down",
+                "--no-eval-cache eval processes",
                 "--no-eval-cache up -d",
                 "--no-eval-cache processes wait --timeout 120"
             ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn services_up_skips_up_and_wait_without_processes() {
+        let _guard = ENV_LOCK.lock().await;
+        let stub = DevenvStub::install("no-processes");
+        stub.processes(r#"{"processes":{}}"#);
+        let dir = scratch("no-processes-wt");
+        services_up(&dir, &[]).await.unwrap();
+        assert_eq!(
+            args_only(&stub.calls()),
+            ["--no-eval-cache processes down", "--no-eval-cache eval processes"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn services_up_cleans_up_before_process_evaluation_failure() {
+        let _guard = ENV_LOCK.lock().await;
+        let stub = DevenvStub::install("eval-fails");
+        stub.fail_on("eval processes");
+        let dir = scratch("eval-fails-wt");
+        let err = services_up(&dir, &[]).await.unwrap_err();
+        assert!(err.0.contains("eval processes"), "{err}");
+        assert_eq!(
+            args_only(&stub.calls()),
+            ["--no-eval-cache processes down", "--no-eval-cache eval processes"]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2751,6 +2823,7 @@ mod tests {
             args_only(&stub.calls()),
             [
                 "--no-eval-cache processes down",
+                "--no-eval-cache eval processes",
                 "--no-eval-cache up -d",
                 "--no-eval-cache processes wait --timeout 120"
             ]
@@ -2770,6 +2843,7 @@ mod tests {
             args_only(&stub.calls()),
             [
                 "--no-eval-cache processes down",
+                "--no-eval-cache eval processes",
                 "--no-eval-cache up -d",
                 "--no-eval-cache processes wait --timeout 120",
                 "--no-eval-cache processes down"

@@ -136,8 +136,11 @@ Flutter UI) — there is deliberately no project list in the TOML.
 ## The port contract (spec §5.8)
 
 A ticket worktree that uses devenv gets its services via
-`devenv --no-eval-cache up -d`. Parallel tickets of one project would collide
-on hardcoded service ports (two Postgreses, one port), so:
+`devenv --no-eval-cache up -d` when its evaluated configuration defines
+processes. Shell-only projects skip service startup and readiness after the
+usual best-effort cleanup. Parallel tickets of one project would collide on
+hardcoded service ports (two Postgreses, one
+port), so:
 
 1. The daemon allocates a unique **port block per run** (blocks of 50) and
    exports `REMOTER_AGENT_PORT_BASE` (plus `REMOTER_AGENT_TASK_ID` and
@@ -245,10 +248,12 @@ the persistent `agent_home` at each run.
 2. One Rust launcher per ACP turn takes a consistent SQLite online-backup
    snapshot of the Nix DB, creates GC roots for the launcher, agent, and
    late-started `remoter-mcp` executable, and starts `bwrap` plus `slirp4netns`.
-3. Inside the sandbox it runs best-effort `devenv processes down`, then
-   `devenv up -d` and `devenv processes wait --timeout 120`, and finally `exec`s
-   the agent with the original ACP stdio. Services stop on exit; cancellation,
-   timeout, SIGTERM and SIGKILL are bounded by `--die-with-parent` and the
+3. Inside the sandbox it evaluates the configured processes. If any exist, it
+   runs best-effort `devenv processes down`, then `devenv up -d` and
+   `devenv processes wait --timeout 120`; shell-only projects skip this
+   lifecycle. It then `exec`s the agent with the original ACP stdio. Services
+   stop on exit; cancellation, timeout, SIGTERM and SIGKILL are bounded by
+   `--die-with-parent` and the
    network helper's exit fd. A launcher parent-death signal extends the same
    cleanup to daemon crashes, including SIGKILL. Stale state is reconciled using
    PID plus process start time, so active or unrelated runs are not removed.
