@@ -64,7 +64,7 @@ child process by the MCP client) plus one optional flag:
 | `REMOTER_TOKEN` | Bearer token: a personal access token, a login JWT, or an agent's static token (required) | `abC123...` |
 | `REMOTER_AGENT_TOKEN` | Legacy alias for `REMOTER_TOKEN` (what the `remoter-agent` daemon sets); ignored when `REMOTER_TOKEN` is present | `abC123...` |
 | `REMOTER_WORKSPACE_ID` | Workspace id sent as `X-Workspace-Id`. Required when the caller has multiple workspace memberships; optional with a single one | `1` |
-| `REMOTER_PROJECT_ID` | Bind this repository to one project (optional). Validated at startup via `GET /api/v1/projects/{id}`; `current_project` reports the binding and tools with an optional `projectId` default to it. Daemon mode (`REMOTER_AGENT_TASK_ID`) outranks it | `7` |
+| `REMOTER_PROJECT_ID` | Bind this repository to one project (optional). Validated at startup via `GET /api/v1/projects/{id}`; `current_project` reports the binding and tools with an optional `projectId` default to it in standalone mode only. Daemon mode (`REMOTER_AGENT_TASK_ID`) never applies the binding implicitly | `7` |
 | `REMOTER_AGENT_TASK_ID` | Current ticket id when spawned by `remoter-agent` (daemon mode); scopes task creation and supervise-role discovery | `42` |
 | `REMOTER_MCP_NAME` | Server name reported in MCP `initialize` (optional) | `remoter` |
 | `--role <role>` | Runtime role: `full`, `dev-agent-plan`, `dev-agent-implement`, `dev-agent-supervise`, `dev-agent-review` | `--role dev-agent-implement` |
