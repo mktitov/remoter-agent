@@ -236,6 +236,13 @@ PATH profile entries remain visible inside the sandbox. Kimi uses the same
 daemon-owned `driver.kimi_config` as host and container modes, rendered into
 the persistent `agent_home` at each run.
 
+When the daemon runs as a systemd service, `AmbientCapabilities` must be empty
+in bwrap mode. Rootless user namespaces need neither `CAP_DAC_OVERRIDE` nor
+`CAP_FOWNER`; do not carry those container-mode settings over to the bwrap unit,
+and do not make `bwrap` setuid root. See
+[Ambient capabilities from container mode](#ambient-capabilities-from-container-mode)
+if startup fails its namespace smoke test.
+
 ### What happens on a run
 
 1. The daemon prepares the same ticket worktree and performs a real host
@@ -286,6 +293,51 @@ address; no firewall or host-wide network configuration is changed.
   malicious kernel. The agent runs with the daemon's UID and can change anything
   in the writable worktree, Git metadata, and persistent agent home. The agent
   also receives its intended Remoter MCP token and outbound network access.
+
+### Troubleshooting
+
+#### Ambient capabilities from container mode
+
+If startup fails the namespace smoke test with:
+
+```text
+bubblewrap namespace smoke test failed with 1: bwrap: Unexpected capabilities but not setuid, old file caps config?
+```
+
+check whether the daemon's systemd unit still has container-mode capabilities.
+A container-mode unit may use `CAP_DAC_OVERRIDE` and `CAP_FOWNER` so the daemon
+can remove root-owned files left in worktrees by containers. Bwrap runs as the
+ordinary daemon user, and the non-setuid `bwrap` binary rejects inherited
+ambient capabilities instead of creating the namespace. Rootless user
+namespaces do not need these capabilities, so clear the list when switching to
+bwrap mode. On NixOS, override any capability list inherited from another module
+declaratively:
+
+```nix
+{ lib, ... }:
+{
+  systemd.services.remoter-agent.serviceConfig.AmbientCapabilities =
+    lib.mkForce [ ];
+}
+```
+
+Apply the host configuration, restart the daemon, and verify the effective unit:
+
+```sh
+sudo nixos-rebuild switch --flake .
+sudo systemctl restart remoter-agent.service
+systemctl show remoter-agent.service -p AmbientCapabilities
+```
+
+The last command must print `AmbientCapabilities=`, with an empty value after
+`=`. Do not work around the error by making `bwrap` setuid root; that contradicts
+the mode's rootless security design.
+
+After a previous container-mode deployment, root-owned files can remain in the
+workspace. If cleanup reports permission errors, verify that the affected paths
+are inside the intended workspace and have the host administrator correct their
+ownership once (for example, with a carefully scoped `chown` back to the daemon
+user). Do not restore ambient capabilities as a cleanup workaround.
 
 If startup reports missing store paths, rerun after a successful host pre-warm
 and check that `HOME`, `XDG_RUNTIME_DIR`, and the project path were not
