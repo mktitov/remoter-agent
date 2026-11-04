@@ -59,6 +59,8 @@ stall_grace_secs    = 30
 # no Docker image/sidecars and no REMOTER_AGENT_PORT_BASE: each sandbox has an
 # independent localhost, and the project's own devenv services use default ports.
 # Loopback api_url values are rewritten to 10.0.2.2 for the agent/MCP process.
+# Under systemd, keep AmbientCapabilities empty: container-mode CAP_DAC_OVERRIDE
+# and CAP_FOWNER make the non-setuid bwrap binary reject startup.
 
 [driver]
 kind = "kimi-acp"    # dry-run = "stub"; real ACP agents = "kimi-acp" or "opencode-acp"
