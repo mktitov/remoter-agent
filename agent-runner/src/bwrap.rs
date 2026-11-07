@@ -1,5 +1,4 @@
 use anyhow::{Context, bail};
-use rusqlite::{Connection, OpenFlags, backup::Backup};
 use std::collections::BTreeSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -18,27 +17,26 @@ pub const INTERNAL_LAUNCH_ARG: &str = "__bwrap-launch";
 
 const OWNER_FILE: &str = "owner";
 const RUN_PREFIX: &str = "bwrap-run-";
-const NIX_DB: &str = "/nix/var/nix/db/db.sqlite";
-const NIX_SCHEMA: &str = "/nix/var/nix/db/schema";
+const NIX_DAEMON_SOCKET: &str = "/nix/var/nix/daemon-socket/socket";
 const CA_BUNDLE: &str = "/etc/ssl/certs/ca-bundle.crt";
+const DART_CA_BUNDLE: &str = "/etc/pki/tls/certs/ca-bundle.crt";
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(20);
-const NIX_CONFIG: &str =
-    "experimental-features = nix-command flakes\nextra-experimental-features = read-only-local-store";
+const NIX_CONFIG: &str = "experimental-features = nix-command flakes";
 const GUEST_SCRIPT: &str = r#"
 devenv_enabled=$1
 project_dir=$2
 shift 2
 if [ "$devenv_enabled" = "1" ]; then
     cd "$project_dir" || exit
-    processes=$(devenv --nix-option extra-experimental-features read-only-local-store --no-eval-cache eval processes) || exit
+    processes=$(devenv --no-eval-cache eval processes) || exit
     processes=$(printf '%s' "$processes" | tr -d '[:space:]')
     if [ "$processes" != '{"processes":{}}' ]; then
-        trap 'devenv --nix-option extra-experimental-features read-only-local-store --no-eval-cache processes down >&2 2>/dev/null || :' EXIT
-        devenv --nix-option extra-experimental-features read-only-local-store --no-eval-cache processes down >&2 2>/dev/null || :
-        devenv --nix-option extra-experimental-features read-only-local-store --no-eval-cache up -d >&2 || exit
-        devenv --nix-option extra-experimental-features read-only-local-store --no-eval-cache processes wait --timeout 120 >&2 || exit
+        trap 'devenv --no-eval-cache processes down >&2 2>/dev/null || :' EXIT
+        devenv --no-eval-cache processes down >&2 2>/dev/null || :
+        devenv --no-eval-cache up -d >&2 || exit
+        devenv --no-eval-cache processes wait --timeout 120 >&2 || exit
     fi
-    devenv --nix-option extra-experimental-features read-only-local-store --no-eval-cache shell --no-tui -- "$@"
+    devenv --no-eval-cache shell --no-tui -- "$@"
     status=$?
     exit "$status"
 fi
@@ -181,19 +179,28 @@ pub fn validate_prerequisites(bwrap: &str, slirp4netns: &str) -> anyhow::Result<
     }
     check_version(bwrap, "bubblewrap")?;
     check_version(slirp4netns, "slirp4netns")?;
-    for path in [Path::new("/nix/store"), Path::new(NIX_DB), Path::new(NIX_SCHEMA)] {
+    for path in [Path::new("/nix/store"), Path::new(NIX_DAEMON_SOCKET)] {
         if !path.exists() {
             bail!("required Nix path {} is missing", path.display());
         }
     }
-    let db = open_source_db(Path::new(NIX_DB))?;
-    db.query_row("SELECT 1", [], |_| Ok(()))
-        .context("read the host Nix database")?;
-    drop(db);
     ca_bundle()?;
     let shell = resolve_store_shell()?;
     resolve_store_tool("env")?;
-    find_host_tool_on_path("nix-store").context("nix-store must be available on the host PATH")?;
+    let nix_store = find_host_tool_on_path("nix-store").context("nix-store must be available on the host PATH")?;
+    let daemon = Command::new(nix_store)
+        .args(["--query", "--hash"])
+        .arg(&shell)
+        .env("NIX_REMOTE", "daemon")
+        .output()
+        .context("query the host Nix daemon")?;
+    if !daemon.status.success() {
+        bail!(
+            "host Nix daemon query failed with {}: {}",
+            display_status(daemon.status),
+            String::from_utf8_lossy(&daemon.stderr).trim()
+        );
+    }
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
     let output = Command::new(bwrap)
@@ -263,7 +270,6 @@ pub fn launch_from_args(args: &[String]) -> anyhow::Result<i32> {
     let env_tool = resolve_store_tool("env")?;
     let cert = ca_bundle()?;
     retain_store_paths(&options, run_dir.path())?;
-    snapshot_nix_db(Path::new(NIX_DB), Path::new(NIX_SCHEMA), &run_dir.path().join("nix-db"))?;
     write_run_files(&options, run_dir.path())?;
 
     let status = cloexec_pipe().context("create bubblewrap status pipe")?;
@@ -586,7 +592,7 @@ fn sandbox_environment(options: &LaunchOptions, cert: &Path) -> Vec<(String, Str
     let mut base = host_environment(&options.agent_home);
     base.extend([
         ("REMOTER_EXECUTION".to_string(), "bwrap".to_string()),
-        ("NIX_REMOTE".to_string(), "local?read-only=true".to_string()),
+        ("NIX_REMOTE".to_string(), "daemon".to_string()),
         ("NIX_CONFIG".to_string(), NIX_CONFIG.to_string()),
         ("SSL_CERT_FILE".to_string(), cert.to_string_lossy().into_owned()),
         ("NIX_SSL_CERT_FILE".to_string(), cert.to_string_lossy().into_owned()),
@@ -619,6 +625,10 @@ fn write_run_files(options: &LaunchOptions, run_dir: &Path) -> anyhow::Result<()
     let files = [
         ("resolv.conf", "nameserver 10.0.2.3\n".to_string()),
         (
+            "hosts",
+            "127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n".to_string(),
+        ),
+        (
             "passwd",
             format!("{user}:x:{uid}:{gid}:Agent:{}:/bin/sh\n", options.agent_home.display()),
         ),
@@ -631,32 +641,6 @@ fn write_run_files(options: &LaunchOptions, run_dir: &Path) -> anyhow::Result<()
     for (name, content) in files {
         fs::write(run_dir.join(name), content).with_context(|| format!("write sandbox {name}"))?;
     }
-    Ok(())
-}
-
-fn open_source_db(path: &Path) -> anyhow::Result<Connection> {
-    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
-        .with_context(|| format!("open host Nix database {} read-only", path.display()))
-}
-
-fn snapshot_nix_db(source: &Path, schema: &Path, destination: &Path) -> anyhow::Result<()> {
-    fs::create_dir(destination).with_context(|| format!("create {}", destination.display()))?;
-    let source = open_source_db(source)?;
-    let mut target = Connection::open(destination.join("db.sqlite")).context("create per-run Nix database")?;
-    {
-        let backup = Backup::new(&source, &mut target).context("start Nix database online backup")?;
-        backup
-            .run_to_completion(256, Duration::from_millis(10), None)
-            .context("copy Nix database online backup")?;
-    }
-    target
-        .close()
-        .map_err(|(_, error)| error)
-        .context("close per-run Nix database")?;
-    drop(source);
-    fs::copy(schema, destination.join("schema")).context("copy Nix database schema")?;
-    File::create(destination.join("reserved")).context("create Nix database reservation file")?;
-    File::create(destination.join("big-lock")).context("create Nix database lock file")?;
     Ok(())
 }
 
@@ -820,8 +804,13 @@ fn bwrap_arguments(
     ];
     let mut mounts = Mounts::new();
     mounts.bind(&mut args, Path::new("/nix/store"), Path::new("/nix/store"), false);
-    args.extend(["--dir".to_string(), "/nix/var/nix".to_string()]);
-    mounts.bind(&mut args, &run_dir.join("nix-db"), Path::new("/nix/var/nix/db"), true);
+    args.extend(["--dir".to_string(), "/nix/var/nix/daemon-socket".to_string()]);
+    mounts.bind(
+        &mut args,
+        Path::new(NIX_DAEMON_SOCKET),
+        Path::new(NIX_DAEMON_SOCKET),
+        true,
+    );
     mounts.bind(&mut args, &options.worktree, &options.worktree, true);
     args.extend([
         "--symlink".to_string(),
@@ -836,8 +825,11 @@ fn bwrap_arguments(
             "/etc/ssl".to_string(),
         ]);
     }
+    args.extend(["--dir".to_string(), "/etc/pki/tls/certs".to_string()]);
+    mounts.bind(&mut args, cert, Path::new(DART_CA_BUNDLE), false);
     for (name, destination) in [
         ("resolv.conf", "/etc/resolv.conf"),
+        ("hosts", "/etc/hosts"),
         ("passwd", "/etc/passwd"),
         ("group", "/etc/group"),
         ("gitconfig", "/etc/gitconfig"),
@@ -1443,10 +1435,7 @@ mod tests {
         let env = sandbox_environment(&parsed, Path::new("/nix/store/ca-bundle.crt"));
         assert!(env.iter().any(|(key, value)| key == "CUSTOM" && value == "yes"));
         assert!(env.iter().any(|(key, value)| key == "CI" && value == "1"));
-        assert!(
-            env.iter()
-                .any(|(key, value)| key == "NIX_REMOTE" && value == "local?read-only=true")
-        );
+        assert!(env.iter().any(|(key, value)| key == "NIX_REMOTE" && value == "daemon"));
         for forbidden in [
             "REMOTER_TOKEN",
             "REMOTER_CONTAINER",
@@ -1502,33 +1491,13 @@ mod tests {
     }
 
     #[test]
-    fn online_backup_includes_committed_wal_state() {
-        let root = scratch("sqlite");
-        let source_path = root.join("source.sqlite");
-        let schema = root.join("schema");
-        fs::write(&schema, "schema-version").unwrap();
-        let source = Connection::open(&source_path).unwrap();
-        source
-            .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE values_table(value TEXT);")
-            .unwrap();
-        source
-            .execute("INSERT INTO values_table VALUES ('from-wal')", [])
-            .unwrap();
-        let destination = root.join("snapshot");
-        snapshot_nix_db(&source_path, &schema, &destination).unwrap();
-        let snapshot = Connection::open(destination.join("db.sqlite")).unwrap();
-        let value: String = snapshot
-            .query_row("SELECT value FROM values_table", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(value, "from-wal");
+    fn run_files_include_loopback_hosts() {
+        let root = scratch("run-files");
+        write_run_files(&options(), &root).unwrap();
         assert_eq!(
-            fs::read_to_string(destination.join("schema")).unwrap(),
-            "schema-version"
+            fs::read_to_string(root.join("hosts")).unwrap(),
+            "127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n"
         );
-        assert!(destination.join("reserved").exists());
-        assert!(destination.join("big-lock").exists());
-        drop(snapshot);
-        drop(source);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1577,6 +1546,24 @@ mod tests {
         assert!(!has_bind(&args, "--bind", &linked_git, &linked_git));
         assert!(has_bind(&args, "--ro-bind", &reference, &reference));
         assert!(has_bind(&args, "--ro-bind", &reference_common, &reference_common));
+        assert!(has_bind(
+            &args,
+            "--bind",
+            Path::new(NIX_DAEMON_SOCKET),
+            Path::new(NIX_DAEMON_SOCKET)
+        ));
+        assert!(has_bind(
+            &args,
+            "--ro-bind",
+            Path::new("/nix/store/ca"),
+            Path::new(DART_CA_BUNDLE)
+        ));
+        assert!(has_bind(
+            &args,
+            "--ro-bind",
+            &run_dir.join("hosts"),
+            Path::new("/etc/hosts")
+        ));
         assert!(args.windows(2).any(|pair| pair == ["--json-status-fd", "10"]));
         assert!(args.windows(2).any(|pair| pair == ["--block-fd", "11"]));
 

@@ -43,4 +43,3 @@ futures = "0.3"
 libc = "0.2"
 # Content-hash of the project's `.remoter/` image inputs for image tags.
 sha2 = "0.10"
-rusqlite = { version = "0.32", default-features = false, features = ["bundled", "backup"] }
