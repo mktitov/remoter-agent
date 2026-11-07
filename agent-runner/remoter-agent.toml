@@ -55,9 +55,11 @@ stall_grace_secs    = 30
 #                                      # daemon also generates a signing key next
 #                                      # to the dir and seeds the cache via the
 #                                      # project's .remoter/seed-nix-cache.sh hook.
-# Bwrap requires NixOS, rootless user namespaces, bwrap and slirp4netns. It uses
-# no Docker image/sidecars and no REMOTER_AGENT_PORT_BASE: each sandbox has an
-# independent localhost, and the project's own devenv services use default ports.
+# Bwrap requires NixOS with a running Nix daemon, rootless user namespaces,
+# bwrap and slirp4netns. The guest realizes changed derivations through the host
+# daemon while /nix/store stays read-only. It uses no Docker image/sidecars and
+# no REMOTER_AGENT_PORT_BASE: each sandbox has an independent localhost, and the
+# project's own devenv services use default ports.
 # Loopback api_url values are rewritten to 10.0.2.2 for the agent/MCP process.
 # Under systemd, keep AmbientCapabilities empty: container-mode CAP_DAC_OVERRIDE
 # and CAP_FOWNER make the non-setuid bwrap binary reject startup.

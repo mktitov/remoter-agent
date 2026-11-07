@@ -119,8 +119,9 @@ With `[execution] mode = "bwrap"` on NixOS, no `.remoter/agent.Dockerfile`,
 Docker image, or container sidecars are needed. The daemon pre-warms the
 project's devenv shell on the host and starts its processes inside a rootless
 sandbox with a read-only `/nix/store`. Keep `devenv.nix`/`devenv.yaml` complete
-and reproducible; a closure missing after pre-warm is a hard error, not a guest
-build request.
+and reproducible. If the agent changes them during a run, the guest realizes
+new derivations through the host Nix daemon; direct writes to the store remain
+forbidden.
 
 Every sandbox has an independent localhost, so §2.2 port parameterization is
 not needed inside bwrap and `REMOTER_AGENT_PORT_BASE` is absent. Use normal

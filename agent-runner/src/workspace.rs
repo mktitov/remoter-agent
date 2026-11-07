@@ -911,7 +911,7 @@ pub struct ContainerExec {
 }
 
 /// Bubblewrap execution details. The launcher keeps the real worktree path so
-/// devenv evaluates exactly the same derivations as the host pre-warm.
+/// host pre-warm and guest devenv commands evaluate consistent derivations.
 #[derive(Debug, Clone)]
 pub struct BwrapExec {
     pub launcher: PathBuf,

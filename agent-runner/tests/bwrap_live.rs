@@ -7,15 +7,13 @@
 //! ```
 //!
 //! All tests are ignored by default and skip with a diagnostic when their
-//! executables or Nix paths are unavailable. The network test needs outbound
-//! DNS/HTTPS access to GitHub. The PostgreSQL test needs devenv with flakes,
-//! enough host network access/disk to pre-warm two small PostgreSQL closures,
-//! and no existing listener on host `127.0.0.1:5432`. Host pre-warm may build or
-//! substitute; guests use the read-only Nix store and never intentionally build
-//! or substitute anything.
+//! executables or Nix paths are unavailable. The network tests need outbound
+//! DNS/HTTPS access. The PostgreSQL test needs devenv with flakes, enough host
+//! network access/disk to pre-warm two small PostgreSQL closures, and no
+//! existing listener on host `127.0.0.1:5432`. Guests use the read-only Nix
+//! store and delegate builds/substitution to the host Nix daemon.
 
 use remoter_agent::bwrap::{INTERNAL_LAUNCH_ARG, prewarm, run_env};
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::env;
 use std::fs::{self, File};
@@ -26,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -149,13 +147,6 @@ impl Drop for LiveChild {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct DbFingerprint {
-    len: u64,
-    modified: SystemTime,
-    hash: [u8; 32],
-}
-
 #[derive(Clone, Debug)]
 struct ProcessInfo {
     pid: u32,
@@ -166,8 +157,8 @@ struct ProcessInfo {
 
 #[test]
 #[ignore = "real NixOS bwrap/slirp4netns integration — run manually"]
-fn sandbox_filesystem_env_and_nix_db() {
-    let Some(tools) = prerequisites("sandbox_filesystem_env_and_nix_db") else {
+fn sandbox_filesystem_env_and_nix_daemon() {
+    let Some(tools) = prerequisites("sandbox_filesystem_env_and_nix_daemon") else {
         return;
     };
     let dir = TestDir::new("sandbox");
@@ -190,6 +181,7 @@ outside=$3
 printf 'worktree-rw\n' > "$worktree/worktree-file"
 printf 'work-symlink-rw\n' > /work/work-symlink-file
 printf 'home-rw\n' > "$home/home-file"
+test -f /etc/pki/tls/certs/ca-bundle.crt
 if printf 'must-fail\n' > /nix/store/remoter-bwrap-live-forbidden 2>/dev/null; then
     echo '/nix/store was writable' >&2
     exit 1
@@ -198,7 +190,6 @@ printf 'must-not-reach-host\n' > "$outside" 2>/dev/null || :
 /usr/bin/env > "$worktree/environment"
 "#;
     let outside = spec.worktree.parent().unwrap().join("outside-host-write");
-    let db_before = db_fingerprint();
     let started = Instant::now();
     run_launch(
         &tools,
@@ -240,6 +231,10 @@ printf 'must-not-reach-host\n' > "$outside" 2>/dev/null || :
         "{environment}"
     );
     assert!(
+        environment.lines().any(|line| line == "NIX_REMOTE=daemon"),
+        "{environment}"
+    );
+    assert!(
         environment.lines().any(|line| line == "REMOTER_AGENT_TASK_ID=249"),
         "{environment}"
     );
@@ -259,7 +254,6 @@ printf 'must-not-reach-host\n' > "$outside" 2>/dev/null || :
             .all(|line| !line.starts_with("DATABASE_URL=") && !line.contains("_DATABASE_URL=")),
         "{environment}"
     );
-    assert_eq!(db_fingerprint(), db_before, "the host Nix database changed");
     assert!(
         run_dirs(&spec.state_root).is_empty(),
         "normal launch state was not cleaned"
@@ -539,16 +533,84 @@ async fn devenv_shell_without_processes() {
 }
 
 #[tokio::test]
-#[ignore = "real devenv/PostgreSQL integration; host pre-warm may build or substitute"]
-async fn devenv_postgres_parallel_and_snapshot_metrics() {
-    let Some(tools) = prerequisites("devenv_postgres_parallel_and_snapshot_metrics") else {
+#[ignore = "real devenv integration; guest realizes a new derivation through the host Nix daemon"]
+async fn devenv_shell_change_uses_host_nix_daemon() {
+    let Some(tools) = prerequisites("devenv_shell_change_uses_host_nix_daemon") else {
         return;
     };
-    if !has_tools("devenv_postgres_parallel_and_snapshot_metrics", &["devenv"]) {
+    if !has_tools("devenv_shell_change_uses_host_nix_daemon", &["devenv"]) {
+        return;
+    }
+    let dir = TestDir::new("shell-change");
+    let spec = dir.launch_spec("run", true);
+    write_shell_only_devenv_project(&spec.worktree);
+    prewarm(&spec.worktree, &spec.agent_home, &spec.env)
+        .await
+        .unwrap_or_else(|error| panic!("host devenv pre-warm failed: {error}"));
+    write_devenv_config(&spec.worktree, "{ pkgs, ... }:\n{\n  packages = [ pkgs.hello ];\n}\n");
+    let output = run_launch(&tools, &spec, "/bin/sh", strings(&["-c", "hello"]), "shell-change").wait_success();
+    assert_eq!(output.stdout.lines().last(), Some("Hello, world!"));
+}
+
+#[test]
+#[ignore = "real Flutter/pub integration; needs outbound DNS/HTTPS to pub.dev"]
+fn flutter_pub_get_uses_system_ca_bundle() {
+    let Some(tools) = prerequisites("flutter_pub_get_uses_system_ca_bundle") else {
+        return;
+    };
+    if !has_tools("flutter_pub_get_uses_system_ca_bundle", &["flutter"]) {
+        return;
+    }
+    let dir = TestDir::new("flutter-pub");
+    let mut spec = dir.launch_spec("run", false);
+    spec.env.push((
+        "PUB_CACHE".to_string(),
+        spec.worktree.join("pub-cache").to_string_lossy().into_owned(),
+    ));
+    fs::write(
+        spec.worktree.join("pubspec.yaml"),
+        r#"name: bwrap_tls_live
+description: Bubblewrap Dart CA integration test
+publish_to: none
+version: 1.0.0
+environment:
+  sdk: ^3.0.0
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^1.2.0
+flutter:
+  uses-material-design: false
+"#,
+    )
+    .unwrap();
+    run_launch(
+        &tools,
+        &spec,
+        "flutter",
+        strings(&["--suppress-analytics", "pub", "get"]),
+        "flutter-pub",
+    )
+    .wait_success();
+    assert!(spec.worktree.join(".dart_tool/package_config.json").is_file());
+    assert!(
+        fs::read_to_string(spec.worktree.join("pubspec.lock"))
+            .unwrap()
+            .contains("http")
+    );
+}
+
+#[tokio::test]
+#[ignore = "real devenv/PostgreSQL integration; host pre-warm may build or substitute"]
+async fn devenv_postgres_parallel_and_restart() {
+    let Some(tools) = prerequisites("devenv_postgres_parallel_and_restart") else {
+        return;
+    };
+    if !has_tools("devenv_postgres_parallel_and_restart", &["devenv"]) {
         return;
     }
     if host_port_5432_open() {
-        eprintln!("SKIP devenv_postgres_parallel_and_snapshot_metrics: host 127.0.0.1:5432 is already in use");
+        eprintln!("SKIP devenv_postgres_parallel_and_restart: host 127.0.0.1:5432 is already in use");
         return;
     }
     let dir = TestDir::new("postgres-parallel");
@@ -587,14 +649,11 @@ async fn devenv_postgres_parallel_and_snapshot_metrics() {
         !host_port_5432_open(),
         "sandbox PostgreSQL exposed a host listening port"
     );
-    for (index, spec) in [&one, &two].into_iter().enumerate() {
-        let sizes = snapshot_sizes(&spec.state_root);
-        assert_eq!(sizes.len(), 1, "missing active Nix DB snapshot");
+    for (index, _) in [&one, &two].into_iter().enumerate() {
         eprintln!(
-            "bwrap live: sandbox {} warm launch-to-SQL {:?}; Nix DB snapshot {} bytes",
+            "bwrap live: sandbox {} warm launch-to-SQL {:?}",
             index + 1,
-            startup[index],
-            sizes[0]
+            startup[index]
         );
     }
     fs::write(one.worktree.join("stop"), "stop").unwrap();
@@ -619,10 +678,9 @@ fn prerequisites(test: &str) -> Option<Tools> {
         ("nix-store", find_tool("nix-store").is_none()),
         ("/nix/store", !Path::new("/nix/store").is_dir()),
         (
-            "/nix/var/nix/db/db.sqlite",
-            !Path::new("/nix/var/nix/db/db.sqlite").is_file(),
+            "/nix/var/nix/daemon-socket/socket",
+            !Path::new("/nix/var/nix/daemon-socket/socket").exists(),
         ),
-        ("/nix/var/nix/db/schema", !Path::new("/nix/var/nix/db/schema").is_file()),
         (
             "/etc/ssl/certs/ca-bundle.crt",
             !Path::new("/etc/ssl/certs/ca-bundle.crt").is_file(),
@@ -766,26 +824,6 @@ fn wait_ready(child: &mut LiveChild, path: &Path, timeout: Duration) {
             child.logs()
         );
         thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn db_fingerprint() -> DbFingerprint {
-    let path = Path::new("/nix/var/nix/db/db.sqlite");
-    let metadata = fs::metadata(path).unwrap();
-    let mut file = File::open(path).unwrap();
-    let mut hasher = Sha256::new();
-    let mut buffer = [0; 1024 * 1024];
-    loop {
-        let read = file.read(&mut buffer).unwrap();
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    DbFingerprint {
-        len: metadata.len(),
-        modified: metadata.modified().unwrap(),
-        hash: hasher.finalize().into(),
     }
 }
 
@@ -949,8 +987,11 @@ worktree=$1
 create=$2
 insert=$3
 command -v psql >/dev/null
-psql -h 127.0.0.1 -p 5432 -d bwrap_live -v ON_ERROR_STOP=1 -c "$create" -c "$insert"
-psql -h 127.0.0.1 -p 5432 -d bwrap_live -tA -v ON_ERROR_STOP=1 -c 'SELECT value FROM bwrap_marker' > "$worktree/sql-result"
+devenv --no-eval-cache processes down >&2
+devenv --no-eval-cache up -d >&2
+devenv --no-eval-cache processes wait --timeout 120 >&2
+psql -h localhost -p 5432 -d bwrap_live -v ON_ERROR_STOP=1 -c "$create" -c "$insert"
+psql -h localhost -p 5432 -d bwrap_live -tA -v ON_ERROR_STOP=1 -c 'SELECT value FROM bwrap_marker' > "$worktree/sql-result"
 while [ ! -f "$worktree/stop" ]; do sleep 0.1; done
 "#;
     vec![
@@ -961,24 +1002,4 @@ while [ ! -f "$worktree/stop" ]; do sleep 0.1; done
         "CREATE TABLE bwrap_marker(value TEXT NOT NULL)".to_string(),
         format!("INSERT INTO bwrap_marker VALUES ('{marker}')"),
     ]
-}
-
-fn snapshot_sizes(state_root: &Path) -> Vec<u64> {
-    run_dirs(state_root)
-        .into_iter()
-        .map(|run| directory_size(&run.join("nix-db")))
-        .collect()
-}
-
-fn directory_size(path: &Path) -> u64 {
-    let mut total = 0;
-    for entry in fs::read_dir(path).unwrap().flatten() {
-        let metadata = entry.metadata().unwrap();
-        if metadata.is_dir() {
-            total += directory_size(&entry.path());
-        } else {
-            total += metadata.len();
-        }
-    }
-    total
 }
