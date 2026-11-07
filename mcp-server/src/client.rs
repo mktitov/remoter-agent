@@ -365,6 +365,13 @@ impl RemoterClient {
         self.get("/api/v1/projects").await
     }
 
+    /// `GET /projects/{id}` — a single project. Used at startup to validate
+    /// `REMOTER_PROJECT_ID`: a nonexistent id or a project outside the token's
+    /// workspace comes back as a 404 from the backend.
+    pub async fn get_project(&self, project_id: i32) -> Result<ProjectDto, McpError> {
+        self.get(&format!("/api/v1/projects/{project_id}")).await
+    }
+
     /// `GET /projects/{id}/goals` — the project's business goals (archived
     /// goals are excluded by the backend). Forwarded as raw JSON: the goal
     /// read-model is owned by the backend (remoter docs/specs/business-goals.md),
