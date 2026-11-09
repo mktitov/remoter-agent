@@ -7,6 +7,10 @@
 //! the backend API, so the human-acceptance gates and claim guards are always
 //! enforced (spec §2.2).
 
+#[cfg(target_os = "linux")]
+pub mod bwrap;
+#[cfg(not(target_os = "linux"))]
+#[path = "bwrap_unsupported.rs"]
 pub mod bwrap;
 pub mod claim;
 pub mod client;
