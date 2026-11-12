@@ -133,6 +133,17 @@ impl ImageLocks {
     }
 }
 
+/// Synchronizes the central clone and reads image configuration from that revision.
+async fn sync_project_config(
+    repo: &Path,
+    base_branch: Option<&str>,
+) -> Result<crate::project::ProjectConfig, DriverError> {
+    crate::workspace::sync_clone_checkout(repo, base_branch)
+        .await
+        .map_err(|e| DriverError::Transient(format!("sync clone checkout: {e}")))?;
+    crate::project::ProjectConfig::from_file(repo)
+}
+
 /// Ensures the project's agent image exists locally and returns its tag.
 ///
 /// `repo` is the central clone (`p<id>/repo`) — the Dockerfile is read from
@@ -149,14 +160,11 @@ pub async fn ensure_project_image(
     repo: &Path,
     project: &ProjectRepoConfig,
     task_id: i32,
-    project_config: &crate::project::ProjectConfig,
 ) -> Result<String, DriverError> {
     let lock = locks.for_project(project.project_id);
     let _guard = lock.lock().await;
 
-    crate::workspace::sync_clone_checkout(repo, project.base_branch.as_deref())
-        .await
-        .map_err(|e| DriverError::Transient(format!("sync clone checkout: {e}")))?;
+    let project_config = sync_project_config(repo, project.base_branch.as_deref()).await?;
 
     let dockerfile = repo.join(DOCKERFILE_REL);
     if !dockerfile.is_file() {
@@ -201,7 +209,7 @@ pub async fn ensure_project_image(
     let result = build_and_commit(BuildSpec {
         cfg,
         repo,
-        project_config,
+        project_config: &project_config,
         project_id,
         task_id,
         hash: &hash,
@@ -1030,6 +1038,58 @@ mod tests {
         std::fs::write(dir.join(".remoter/agent-flake.nix"), "{ } # changed\n").unwrap();
         assert_ne!(second, content_hash(&dir).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn image_init_is_loaded_from_the_newly_synced_revision() {
+        let root = std::env::temp_dir().join(format!("remoter-image-sync-config-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let seed = root.join("seed");
+        let clone = root.join("clone");
+        std::fs::create_dir_all(seed.join(".remoter")).unwrap();
+        std::fs::write(seed.join(".remoter/agent.Dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::write(
+            seed.join(".remoter/agent.toml"),
+            "[commands]\nimage_init = [\"old-init\"]\n",
+        )
+        .unwrap();
+        git(&seed, &["init", "-b", "main"]);
+        git(&seed, &["config", "user.email", "test@example.com"]);
+        git(&seed, &["config", "user.name", "Test"]);
+        git(&seed, &["add", ".remoter"]);
+        git(&seed, &["commit", "-m", "old init"]);
+        git(&root, &["clone", seed.to_str().unwrap(), clone.to_str().unwrap()]);
+        std::fs::write(
+            seed.join(".remoter/agent.toml"),
+            "[commands]\nimage_init = [\"new-init\"]\n",
+        )
+        .unwrap();
+        git(&seed, &["add", ".remoter/agent.toml"]);
+        git(&seed, &["commit", "-m", "new init"]);
+
+        assert_eq!(
+            crate::project::ProjectConfig::from_file(&clone)
+                .unwrap()
+                .image_init(&clone),
+            vec!["old-init".to_string()]
+        );
+        let config = sync_project_config(&clone, Some("main")).await.unwrap();
+        assert_eq!(config.image_init(&clone), vec!["new-init".to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Home dir with `.ssh/known_hosts`; returns (repo_dir, home).

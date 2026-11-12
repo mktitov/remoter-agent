@@ -391,20 +391,7 @@ async fn ticket_branch(rc: &ReviewContext) -> Option<String> {
 /// The env every review turn (and its services/sidecars) gets — the same
 /// contract as claim runs (spec §5.8 + containers spec §3.4).
 fn review_env(rc: &ReviewContext) -> Vec<(String, String)> {
-    if rc.config.execution.is_container() {
-        return crate::container::container_env(rc.task.id);
-    }
-    if rc.config.execution.is_bwrap() {
-        return crate::bwrap::run_env(rc.task.id);
-    }
-    let mut env = vec![
-        ("CI".to_string(), "1".to_string()),
-        ("REMOTER_AGENT_TASK_ID".to_string(), rc.task.id.to_string()),
-    ];
-    if let Some(block) = &rc.port_block {
-        env.push(("REMOTER_AGENT_PORT_BASE".to_string(), block.base().to_string()));
-    }
-    env
+    run::execution_env(&rc.config, rc.task.id, rc.port_block.as_ref())
 }
 
 /// One driver turn with the cancellation/timeout envelope: project services up
@@ -423,11 +410,12 @@ async fn run_attempt(
         )));
     }
     let env_vars = review_env(rc);
-    let commands = match rc
-        .project_config
-        .commands_for(rc.config.execution.mode, env.cwd, &env_vars)
-        .await
-    {
+    let command_mode = if rc.project.is_none() && rc.config.execution.is_container() {
+        crate::config::ExecutionMode::Host
+    } else {
+        rc.config.execution.mode
+    };
+    let commands = match workspace::resolve_commands(&rc.project_config, command_mode, env.cwd, &env_vars).await {
         Ok(commands) => commands,
         Err(error) => return Some(Err(RunFailure::new(error, None))),
     };
@@ -476,7 +464,6 @@ async fn run_attempt(
                 rc.task.id,
                 run_id,
                 env.cwd,
-                &rc.project_config,
                 &commands,
                 &env_vars,
                 &child_refs,
@@ -508,7 +495,7 @@ async fn run_attempt(
             None,
         )));
     }
-    let exec = run::exec_env(&rc.config, run_id, &commands);
+    let exec = run::exec_env_for_runtime(&rc.config, run_id, &commands, containers.is_some());
     let spec = RunSpec {
         task_id: rc.task.id,
         run_id,
@@ -1325,6 +1312,39 @@ mod tests {
             1,
             "detail only — no writes"
         );
+    }
+
+    #[test]
+    fn container_report_only_review_uses_host_exec() {
+        let client = RemoterClient::new("http://localhost:8181", "tok", None);
+        let mut rc = test_context(client);
+        let mut config = (*rc.config).clone();
+        config.execution.mode = crate::config::ExecutionMode::Container;
+        rc.config = Arc::new(config);
+        let commands = crate::project::ProjectCommands {
+            env_wrap: vec!["project-wrap".to_string()],
+            ..Default::default()
+        };
+        match run::exec_env_for_runtime(&rc.config, 99, &commands, false) {
+            workspace::ExecEnv::Host { env_wrap } => assert_eq!(env_wrap, commands.env_wrap),
+            other => panic!("report-only review must not use docker exec: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn review_env_uses_effective_kimi_home() {
+        let client = RemoterClient::new("http://localhost:8181", "tok", None);
+        let mut rc = test_context(client);
+        let mut config = (*rc.config).clone();
+        config.driver.kind = "kimi-acp".to_string();
+        let expected = config
+            .execution
+            .agent_home(&config.workspace_root)
+            .join(".kimi-code")
+            .to_string_lossy()
+            .into_owned();
+        rc.config = Arc::new(config);
+        assert!(review_env(&rc).contains(&("KIMI_CODE_HOME".to_string(), expected)));
     }
 
     /// A minimal ReviewContext against the mock backend (stub driver, temp

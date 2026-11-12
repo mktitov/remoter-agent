@@ -253,10 +253,7 @@ pub(crate) async fn effective_project(
     let repo = workspace::ensure_repo_clone(&config.workspace_root, project.project_id, &project.repo_url)
         .await
         .map_err(|e| DriverError::Transient(format!("prepare project config clone: {e}")))?;
-    workspace::sync_clone_checkout(&repo, project.base_branch.as_deref())
-        .await
-        .map_err(|e| DriverError::Transient(format!("sync project config clone: {e}")))?;
-    let project_config = crate::project::ProjectConfig::from_file(&repo)?;
+    let project_config = crate::project::ProjectConfig::from_git(&repo, project.base_branch.as_deref()).await?;
     let effective = config
         .with_project_driver(project_config.driver.as_deref())
         .map_err(|e| DriverError::Permanent(format!("invalid project driver configuration: {e}")))?;
@@ -799,9 +796,7 @@ async fn attempt_run(
     }
 
     let env = run_env(rc);
-    let commands = rc
-        .project_config
-        .commands_for(rc.config.execution.mode, &prepared.dir, &env)
+    let commands = workspace::resolve_commands(&rc.project_config, rc.config.execution.mode, &prepared.dir, &env)
         .await
         .map_err(|error| RunFailure::new(error, None))?;
     // Container mode: the guard's drop (`docker rm -f` + worktree unlock) is
@@ -813,7 +808,6 @@ async fn attempt_run(
         task_id,
         run_id,
         &prepared.dir,
-        &rc.project_config,
         &commands,
         &env,
         &refs.mounted,
@@ -1089,26 +1083,26 @@ fn sum_tokens(a: Option<i64>, b: Option<i64>) -> Option<i64> {
     }
 }
 
-/// Host mode exports a port block. Both isolated modes own their loopback;
-/// only Docker injects sidecar database URLs.
-fn run_env(rc: &RunContext) -> Vec<(String, String)> {
-    match rc.config.execution.mode {
-        ExecutionMode::Container => container::container_env(rc.task.id),
-        ExecutionMode::Bwrap => crate::bwrap::run_env(rc.task.id),
+/// Host mode exports a port block and the effective driver's home. Both
+/// isolated modes own their loopback; only Docker injects sidecar database URLs.
+pub(crate) fn execution_env(config: &Config, task_id: i32, port_block: Option<&PortBlock>) -> Vec<(String, String)> {
+    match config.execution.mode {
+        ExecutionMode::Container => container::container_env(task_id),
+        ExecutionMode::Bwrap => crate::bwrap::run_env(task_id),
         ExecutionMode::Host => {
             let mut env = vec![
                 ("CI".to_string(), "1".to_string()),
-                ("REMOTER_AGENT_TASK_ID".to_string(), rc.task.id.to_string()),
+                ("REMOTER_AGENT_TASK_ID".to_string(), task_id.to_string()),
             ];
-            if let Some(block) = &rc.port_block {
+            if let Some(block) = port_block {
                 env.push(("REMOTER_AGENT_PORT_BASE".to_string(), block.base().to_string()));
             }
-            if rc.config.driver.kind == "kimi-acp" {
+            if config.driver.kind == "kimi-acp" {
                 env.push((
                     "KIMI_CODE_HOME".to_string(),
-                    rc.config
+                    config
                         .execution
-                        .agent_home(&rc.config.workspace_root)
+                        .agent_home(&config.workspace_root)
                         .join(".kimi-code")
                         .to_string_lossy()
                         .into_owned(),
@@ -1117,6 +1111,10 @@ fn run_env(rc: &RunContext) -> Vec<(String, String)> {
             env
         }
     }
+}
+
+fn run_env(rc: &RunContext) -> Vec<(String, String)> {
+    execution_env(&rc.config, rc.task.id, rc.port_block.as_ref())
 }
 
 fn sessions_dir(config: &Config) -> std::path::PathBuf {
@@ -1164,6 +1162,21 @@ pub(crate) fn exec_env(config: &Config, run_id: i32, commands: &crate::project::
     }
 }
 
+/// Report-only review/supervise runs without an agent-managed project have no
+/// isolated runtime and keep their legacy host execution even in container mode.
+pub(crate) fn exec_env_for_runtime(
+    config: &Config,
+    run_id: i32,
+    commands: &crate::project::ProjectCommands,
+    has_runtime: bool,
+) -> ExecEnv {
+    if has_runtime {
+        exec_env(config, run_id, commands)
+    } else {
+        ExecEnv::host(commands.env_wrap.clone())
+    }
+}
+
 #[allow(dead_code)] // Fields are RAII guards; dropping the runtime tears it down.
 pub(crate) enum RunRuntime {
     Container(container::RunContainers),
@@ -1203,7 +1216,6 @@ pub(crate) async fn start_container_runtime(
     task_id: i32,
     run_id: i32,
     worktree: &Path,
-    project_config: &crate::project::ProjectConfig,
     commands: &crate::project::ProjectCommands,
     env: &[(String, String)],
     refs: &[workspace::RefMount],
@@ -1239,7 +1251,7 @@ pub(crate) async fn start_container_runtime(
             .map_err(|e| RunFailure::new(e, None))?;
         return Ok(Some(RunRuntime::Bwrap(runtime)));
     }
-    let image = image::ensure_project_image(&config.execution, image_locks, &repo, project, task_id, project_config)
+    let image = image::ensure_project_image(&config.execution, image_locks, &repo, project, task_id)
         .await
         .map_err(|e| RunFailure::new(e, None))?;
     let containers = container::start(container::ContainerSpec {
@@ -2203,11 +2215,7 @@ async fn ensure_pr_mergeable(
     // up once for the whole nudge loop and down once after every exit path.
     let wt = workspace::worktree_dir(&rc.config.workspace_root, rc.project.project_id, rc.task.id);
     let env = run_env(rc);
-    let commands = match rc
-        .project_config
-        .commands_for(rc.config.execution.mode, &wt, &env)
-        .await
-    {
+    let commands = match workspace::resolve_commands(&rc.project_config, rc.config.execution.mode, &wt, &env).await {
         Ok(commands) => commands,
         Err(error) => {
             note(
@@ -2226,7 +2234,6 @@ async fn ensure_pr_mergeable(
         task_id,
         run_id,
         &wt,
-        &rc.project_config,
         &commands,
         &env,
         &[],
@@ -3553,7 +3560,6 @@ kind = "stub"
             rc.task.id,
             99,
             Path::new("/unused"),
-            &rc.project_config,
             &crate::project::ProjectCommands::default(),
             &[],
             &[],

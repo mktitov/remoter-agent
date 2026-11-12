@@ -858,20 +858,7 @@ async fn parent_branch(rc: &SuperviseContext) -> Option<String> {
 /// exports the port block, container mode exports `REMOTER_CONTAINER=1` and
 /// loopback DB URLs.
 fn supervise_env(rc: &SuperviseContext) -> Vec<(String, String)> {
-    if rc.config.execution.is_container() {
-        return crate::container::container_env(rc.parent.id);
-    }
-    if rc.config.execution.is_bwrap() {
-        return crate::bwrap::run_env(rc.parent.id);
-    }
-    let mut env = vec![
-        ("CI".to_string(), "1".to_string()),
-        ("REMOTER_AGENT_TASK_ID".to_string(), rc.parent.id.to_string()),
-    ];
-    if let Some(block) = &rc.port_block {
-        env.push(("REMOTER_AGENT_PORT_BASE".to_string(), block.base().to_string()));
-    }
-    env
+    run::execution_env(&rc.config, rc.parent.id, rc.port_block.as_ref())
 }
 
 /// One driver turn with the cancellation/timeout envelope: project services up
@@ -891,11 +878,12 @@ async fn run_attempt(
         )));
     }
     let env_vars = supervise_env(rc);
-    let commands = match rc
-        .project_config
-        .commands_for(rc.config.execution.mode, env.cwd, &env_vars)
-        .await
-    {
+    let command_mode = if rc.project.is_none() && rc.config.execution.is_container() {
+        crate::config::ExecutionMode::Host
+    } else {
+        rc.config.execution.mode
+    };
+    let commands = match workspace::resolve_commands(&rc.project_config, command_mode, env.cwd, &env_vars).await {
         Ok(commands) => commands,
         Err(error) => return Some(Err(RunFailure::new(error, None))),
     };
@@ -929,7 +917,6 @@ async fn run_attempt(
                 rc.parent.id,
                 run_id,
                 env.cwd,
-                &rc.project_config,
                 &commands,
                 &env_vars,
                 &child_refs,
@@ -961,7 +948,7 @@ async fn run_attempt(
             None,
         )));
     }
-    let exec = run::exec_env(&rc.config, run_id, &commands);
+    let exec = run::exec_env_for_runtime(&rc.config, run_id, &commands, containers.is_some());
     let spec = RunSpec {
         task_id: rc.parent.id,
         run_id,
@@ -2472,6 +2459,49 @@ fn sum_tokens(a: Option<i64>, b: Option<i64>) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn execution_config() -> Config {
+        Config::from_toml_str(
+            r#"
+api_url = "http://localhost:8181"
+workspace_root = "/tmp/remoter-agent-supervise-test"
+[execution]
+mode = "container"
+[driver]
+kind = "stub"
+"#,
+            Some("tok".to_string()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn container_report_only_supervise_uses_host_exec() {
+        let config = execution_config();
+        let commands = crate::project::ProjectCommands {
+            env_wrap: vec!["project-wrap".to_string()],
+            ..Default::default()
+        };
+        match run::exec_env_for_runtime(&config, 99, &commands, false) {
+            workspace::ExecEnv::Host { env_wrap } => assert_eq!(env_wrap, commands.env_wrap),
+            other => panic!("report-only supervise must not use docker exec: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn supervise_env_contract_uses_effective_kimi_home() {
+        let mut config = execution_config();
+        config.execution.mode = crate::config::ExecutionMode::Host;
+        config.driver.kind = "kimi-acp".to_string();
+        let expected = config
+            .execution
+            .agent_home(&config.workspace_root)
+            .join(".kimi-code")
+            .to_string_lossy()
+            .into_owned();
+        let env = run::execution_env(&config, 42, None);
+        assert!(env.contains(&("KIMI_CODE_HOME".to_string(), expected)));
+    }
 
     fn child(id: i32, status: &str, blocked: bool, priority: Option<&str>, assignee_id: Option<i32>) -> TaskDetail {
         TaskDetail {

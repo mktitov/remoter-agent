@@ -67,6 +67,40 @@ impl ProjectConfig {
         }
     }
 
+    /// Reads the configuration from a freshly fetched remote ref, never from
+    /// the central clone's shared checkout (which other runs may advance).
+    pub async fn from_git(repo: &Path, base_branch: Option<&str>) -> Result<Self, DriverError> {
+        let base = match base_branch {
+            Some(base) => base.to_string(),
+            None => crate::workspace::remote_default_branch(repo)
+                .await
+                .map_err(|e| DriverError::Transient(format!("resolve project config base: {e}")))?,
+        };
+        crate::workspace::fetch_branch(repo, &base)
+            .await
+            .map_err(|e| DriverError::Transient(format!("fetch project config base {base}: {e}")))?;
+        let spec = format!("origin/{base}:{CONFIG_REL}");
+        let output = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["show", &spec])
+            .output()
+            .await
+            .map_err(|e| DriverError::Transient(format!("read project config from {spec}: {e}")))?;
+        if !output.status.success() {
+            if output.status.code() == Some(128) {
+                return Ok(Self::default());
+            }
+            return Err(DriverError::Permanent(format!(
+                "cannot read {spec}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        let text = String::from_utf8(output.stdout)
+            .map_err(|e| DriverError::Permanent(format!("invalid UTF-8 in {spec}: {e}")))?;
+        Self::parse(&text)
+    }
+
     pub async fn commands_for(
         &self,
         mode: ExecutionMode,
@@ -246,6 +280,46 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn from_git_reads_fetched_ref_without_touching_shared_checkout() {
+        let dir = TestDir::new();
+        let seed = dir.path().join("seed");
+        let clone = dir.path().join("clone");
+        std::fs::create_dir_all(seed.join(".remoter")).unwrap();
+        git(&seed, &["init", "-b", "main"]);
+        git(&seed, &["config", "user.email", "test@example.com"]);
+        git(&seed, &["config", "user.name", "Test"]);
+        std::fs::write(seed.join(CONFIG_REL), "driver = \"kimi-acp\"").unwrap();
+        git(&seed, &["add", ".remoter/agent.toml"]);
+        git(&seed, &["commit", "-m", "old config"]);
+        git(dir.path(), &["clone", seed.to_str().unwrap(), clone.to_str().unwrap()]);
+        std::fs::write(seed.join(CONFIG_REL), "driver = \"opencode-acp\"").unwrap();
+        git(&seed, &["add", ".remoter/agent.toml"]);
+        git(&seed, &["commit", "-m", "new config"]);
+
+        let config = ProjectConfig::from_git(&clone, Some("main")).await.unwrap();
+        assert_eq!(config.driver.as_deref(), Some("opencode-acp"));
+        assert_eq!(
+            std::fs::read_to_string(clone.join(CONFIG_REL)).unwrap(),
+            "driver = \"kimi-acp\"",
+            "the shared checkout must not be advanced by run configuration loading"
+        );
     }
 
     #[test]

@@ -1012,14 +1012,26 @@ pub fn wrap_command(
     }
 }
 
-/// Best-effort startup cleanup, then the project's service and readiness argv.
-/// A failed up/wait triggers the same best-effort down so retries start clean.
+/// Runs best-effort cleanup before resolving legacy process detection, so even
+/// a failed `devenv eval processes` cannot leave a stale supervisor behind.
+pub async fn resolve_commands(
+    config: &crate::project::ProjectConfig,
+    mode: crate::config::ExecutionMode,
+    dir: &Path,
+    env: &[(String, String)],
+) -> Result<crate::project::ProjectCommands, crate::driver::DriverError> {
+    let down = config.legacy_services_down(mode, dir);
+    services_down(dir, env, &down).await;
+    config.commands_for(mode, dir, env).await
+}
+
+/// Runs the project's service and readiness argv. A failed up/wait triggers the
+/// same best-effort down so retries start clean.
 pub async fn services_up(
     dir: &Path,
     env: &[(String, String)],
     commands: &crate::project::ProjectCommands,
 ) -> Result<(), WorkspaceError> {
-    services_down(dir, env, &commands.services_down).await;
     let result = async {
         run_argv(dir, env, &commands.services_up).await?;
         run_argv(dir, env, &commands.services_wait).await
@@ -2720,9 +2732,13 @@ mod tests {
 
     async fn legacy_commands(dir: &Path) -> Result<crate::project::ProjectCommands, crate::driver::DriverError> {
         std::fs::write(dir.join("devenv.nix"), "{}").unwrap();
-        crate::project::ProjectConfig::default()
-            .commands_for(crate::config::ExecutionMode::Host, dir, &[])
-            .await
+        resolve_commands(
+            &crate::project::ProjectConfig::default(),
+            crate::config::ExecutionMode::Host,
+            dir,
+            &[],
+        )
+        .await
     }
 
     /// Two-level directory listing of a sweep root, for failure diagnostics.
@@ -2752,8 +2768,8 @@ mod tests {
         assert_eq!(
             args_only(&stub.calls()),
             [
-                "--no-eval-cache eval processes",
                 "--no-eval-cache processes down",
+                "--no-eval-cache eval processes",
                 "--no-eval-cache up -d",
                 "--no-eval-cache processes wait --timeout 120"
             ]
@@ -2772,20 +2788,23 @@ mod tests {
             .unwrap();
         assert_eq!(
             args_only(&stub.calls()),
-            ["--no-eval-cache eval processes", "--no-eval-cache processes down"]
+            ["--no-eval-cache processes down", "--no-eval-cache eval processes"]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
-    async fn legacy_process_evaluation_failure_is_transient() {
+    async fn legacy_process_evaluation_failure_still_cleans_up_first() {
         let _guard = ENV_LOCK.lock().await;
         let stub = DevenvStub::install("eval-fails");
         stub.fail_on("eval processes");
         let dir = scratch("eval-fails-wt");
         let err = legacy_commands(&dir).await.unwrap_err();
         assert!(err.to_string().contains("eval processes"), "{err}");
-        assert_eq!(args_only(&stub.calls()), ["--no-eval-cache eval processes"]);
+        assert_eq!(
+            args_only(&stub.calls()),
+            ["--no-eval-cache processes down", "--no-eval-cache eval processes"]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2801,8 +2820,8 @@ mod tests {
         assert_eq!(
             args_only(&stub.calls()),
             [
-                "--no-eval-cache eval processes",
                 "--no-eval-cache processes down",
+                "--no-eval-cache eval processes",
                 "--no-eval-cache up -d",
                 "--no-eval-cache processes wait --timeout 120"
             ]
@@ -2822,8 +2841,8 @@ mod tests {
         assert_eq!(
             args_only(&stub.calls()),
             [
-                "--no-eval-cache eval processes",
                 "--no-eval-cache processes down",
+                "--no-eval-cache eval processes",
                 "--no-eval-cache up -d",
                 "--no-eval-cache processes wait --timeout 120",
                 "--no-eval-cache processes down"
@@ -2854,10 +2873,12 @@ mod tests {
             image_init: vec![],
         };
         for _ in 0..2 {
+            services_down(&dir, &[], &commands.services_down).await;
             services_up(&dir, &[], &commands).await.unwrap();
             services_down(&dir, &[], &commands.services_down).await;
         }
         commands.services_wait = service("wait", 17);
+        services_down(&dir, &[], &commands.services_down).await;
         let error = services_up(&dir, &[], &commands).await.unwrap_err();
         assert!(error.0.contains("project command"), "{error}");
         assert_eq!(
