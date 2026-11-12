@@ -183,7 +183,7 @@ mod tests {
             None,
             RunKind::Implement,
             task_id,
-            &crate::workspace::ExecEnv::host(false),
+            &crate::workspace::ExecEnv::host(Vec::new()),
         );
         assert_eq!(servers.len(), 1);
         let s = stdio(&servers[0]);
@@ -223,7 +223,7 @@ mod tests {
             None,
             RunKind::Implement,
             task_id,
-            &crate::workspace::ExecEnv::host(false),
+            &crate::workspace::ExecEnv::host(Vec::new()),
         );
         assert_eq!(servers.len(), 3);
 
@@ -265,7 +265,7 @@ mod tests {
             None,
             RunKind::Plan,
             task_id,
-            &crate::workspace::ExecEnv::host(false),
+            &crate::workspace::ExecEnv::host(Vec::new()),
         );
         assert_eq!(servers.len(), 1);
         let s = stdio(&servers[0]);
@@ -291,7 +291,7 @@ mod tests {
             None,
             RunKind::Review,
             42,
-            &crate::workspace::ExecEnv::host(false),
+            &crate::workspace::ExecEnv::host(Vec::new()),
         );
         assert_eq!(stdio(&servers[0]).args, ["--role", "dev-agent-review"]);
     }
@@ -311,7 +311,10 @@ mod tests {
             slirp4netns: "slirp4netns".to_string(),
             agent_home: Path::new("/agent-home").to_path_buf(),
             state_root: Path::new("/state").to_path_buf(),
-            devenv: false,
+            env_wrap: Vec::new(),
+            services_up: Vec::new(),
+            services_wait: Vec::new(),
+            services_down: Vec::new(),
             retained_commands: Vec::new(),
             sessions_dir: Path::new("/agent-home/.kimi-code/sessions").to_path_buf(),
             api_url: "http://10.0.2.2:8181".to_string(),
@@ -353,7 +356,7 @@ mod tests {
             Some(7),
             RunKind::Implement,
             task_id,
-            &crate::workspace::ExecEnv::host(false),
+            &crate::workspace::ExecEnv::host(Vec::new()),
         );
         let s = stdio(&servers[0]);
         assert!(s.env.iter().any(|e| e.name == "REMOTER_WORKSPACE_ID" && e.value == "7"));

@@ -313,9 +313,17 @@ impl StagingManager {
         if !stage.enabled {
             return Err("staging is disabled".to_string());
         }
-        let image = image::ensure_project_image(&self.config.execution, &self.image_locks, &repo, project, task_id)
-            .await
-            .map_err(|e| format!("ensure staging image: {e}"))?;
+        let project_config = crate::project::ProjectConfig::from_file(&repo).map_err(|e| e.to_string())?;
+        let image = image::ensure_project_image(
+            &self.config.execution,
+            &self.image_locks,
+            &repo,
+            project,
+            task_id,
+            &project_config,
+        )
+        .await
+        .map_err(|e| format!("ensure staging image: {e}"))?;
         let name = format!("remoter-stage-task-{task_id}");
         let postgres_name = format!("{name}-pg");
         let minio_name = format!("{name}-minio");

@@ -32,12 +32,10 @@
 //!
 //! On a cache miss: `docker build` the Dockerfile, then run an **init
 //! container** with the repo mounted read-only at `/repo` (a throwaway tmpfs
-//! over `/repo/.devenv` — `devenv shell` must write its state somewhere) —
-//! inside, the project's devenv shell is entered once (warming the nix store
-//! and building the devshell profile into the image) and the optional
-//! `agent-init.sh` runs (project-specific setup: toolchain prefetch, agent
-//! CLI install, …) — and `docker commit` freezes the result as the tagged
-//! image.
+//! over `/repo/.devenv` — `devenv shell` must write its state somewhere). The
+//! project's configured `commands.image_init` argv runs in `/repo`; its legacy
+//! default warms devenv and runs the optional `agent-init.sh`. Finally,
+//! `docker commit` freezes the result as the tagged image.
 //!
 //! Fail closed: a project without `.remoter/agent.Dockerfile` is a permanent
 //! error — never a silent fallback to host mode, which would strip the
@@ -88,10 +86,6 @@ const DOCKERFILE_REL: &str = ".remoter/agent.Dockerfile";
 /// Repo-relative path of the image build context — the content key covers
 /// every file in it.
 const IMAGE_CONTEXT_REL: &str = ".remoter";
-/// Repo-relative path of the optional init script (runs once per image build).
-const INIT_SCRIPT_REL: &str = ".remoter/agent-init.sh";
-/// Where the init script lands inside the image (the Dockerfile COPYs it).
-const INIT_SCRIPT_CONTAINER: &str = "/opt/agent-init.sh";
 /// Repo-relative path of the optional per-turn freshness hook — see the
 /// module docs for the exit-code contract.
 const CHECK_SCRIPT_REL: &str = ".remoter/check-image.sh";
@@ -155,6 +149,7 @@ pub async fn ensure_project_image(
     repo: &Path,
     project: &ProjectRepoConfig,
     task_id: i32,
+    project_config: &crate::project::ProjectConfig,
 ) -> Result<String, DriverError> {
     let lock = locks.for_project(project.project_id);
     let _guard = lock.lock().await;
@@ -206,6 +201,7 @@ pub async fn ensure_project_image(
     let result = build_and_commit(BuildSpec {
         cfg,
         repo,
+        project_config,
         project_id,
         task_id,
         hash: &hash,
@@ -236,6 +232,7 @@ pub async fn ensure_project_image(
 struct BuildSpec<'a> {
     cfg: &'a ExecutionConfig,
     repo: &'a Path,
+    project_config: &'a crate::project::ProjectConfig,
     project_id: i32,
     task_id: i32,
     hash: &'a str,
@@ -252,6 +249,7 @@ async fn build_and_commit(spec: BuildSpec<'_>) -> Result<String, DriverError> {
     let BuildSpec {
         cfg,
         repo,
+        project_config,
         project_id,
         task_id,
         hash,
@@ -293,27 +291,7 @@ async fn build_and_commit(spec: BuildSpec<'_>) -> Result<String, DriverError> {
     // OS/arch — and entirely fail-open (every failure degrades to no cache).
     let nix_cache = prepare_nix_cache(cfg, repo, docker_bin, build_tag, flake_rev).await;
 
-    // The init step warms the project's devenv shell into the image (the run
-    // container's first `devenv shell --` must not pay a full nix download)
-    // and runs the project's optional init script inside that shell.
-    let mut init_cmd = if repo.join(INIT_SCRIPT_REL).is_file() {
-        format!("cd /repo && devenv shell --no-tui --no-eval-cache -- sh {INIT_SCRIPT_CONTAINER}")
-    } else {
-        "cd /repo && devenv shell --no-tui --no-eval-cache -- true".to_string()
-    };
-    if nix_cache.is_some() {
-        // Pay the warm forward: export the closures of every gcroot (system
-        // profile, devenv shell roots on the /repo/.devenv tmpfs) into the
-        // shared cache so the next bake — and same-arch run containers —
-        // substitute instead of rebuilding. Best-effort: the export must
-        // never fail the bake. The init script's exit code is captured
-        // first and restored after, so a failing agent-init.sh still fails
-        // the build — without this the `|| echo` below would swallow it.
-        init_cmd = format!(
-            "{init_cmd}\nrc=$?\n( {} ) || echo 'remoter: nix cache export failed; continuing' >&2\nexit $rc",
-            cache_populate_cmd()
-        );
-    }
+    let image_init = project_config.image_init(repo);
     // Best-effort pre-clean: the deterministic init-container name may still
     // be held by an orphan from a dropped build future or a crashed daemon —
     // possibly still *running* (ticket #204) — and `docker run --name` fails
@@ -329,7 +307,7 @@ async fn build_and_commit(spec: BuildSpec<'_>) -> Result<String, DriverError> {
         init_container,
         repo,
         build_tag,
-        &init_cmd,
+        &image_init,
         flake_rev,
         project_id,
         task_id,
@@ -520,7 +498,7 @@ fn init_run_args(
     init_container: &str,
     repo: &Path,
     build_tag: &str,
-    init_cmd: &str,
+    image_init: &[String],
     flake_rev: &str,
     project_id: i32,
     task_id: i32,
@@ -560,13 +538,25 @@ fn init_run_args(
             ]);
         }
     }
+    let mut init_cmd = "cd /repo && \"$@\"; rc=$?".to_string();
+    if nix_cache.is_some() {
+        // The export is best-effort, but the image-init command's exact exit
+        // status must survive it. An empty argv performs only this export.
+        init_cmd = format!(
+            "{init_cmd}\n( {} ) || echo 'remoter: nix cache export failed; continuing' >&2",
+            cache_populate_cmd()
+        );
+    }
+    init_cmd.push_str("\nexit $rc");
     args.extend(ssh_args);
     args.extend([
         build_tag.to_string(),
         "sh".to_string(),
         "-c".to_string(),
-        init_cmd.to_string(),
+        init_cmd,
+        "remoter-image-init".to_string(),
     ]);
+    args.extend(image_init.iter().cloned());
     args
 }
 
@@ -848,12 +838,11 @@ fn signing_key(cache_dir: &Path, host_nix: bool) -> Option<(PathBuf, String)> {
     Some((secret, public_key))
 }
 
-/// The best-effort export appended to the init command after the devenv warm
-/// and the init script: every gcroot's closure (the system profile — devenv,
-/// the agent profile — and the devenv shell roots under the /repo/.devenv
-/// tmpfs) is signed when the key is mounted and copied into the shared cache.
-/// Runs outside the devenv shell; nix is on the base image's PATH. `$roots`
-/// word-splitting is intentional (one store path per line).
+/// The best-effort export appended after `image_init`: every gcroot's closure
+/// (the system profile — devenv, the agent profile — and any devenv shell roots
+/// under the /repo/.devenv tmpfs) is signed when the key is mounted and copied
+/// into the shared cache. Runs outside `image_init`; nix is on the base image's
+/// PATH. `$roots` word-splitting is intentional (one store path per line).
 fn cache_populate_cmd() -> String {
     format!(
         "roots=$(nix-store --gc --print-roots 2>/dev/null | grep -oE '/nix/store/[^ ]+' | sort -u); \
@@ -1130,12 +1119,13 @@ mod tests {
     }
 
     #[test]
-    fn init_run_args_carry_flake_rev_ssh_and_labels() {
+    fn init_run_args_carry_flake_rev_ssh_labels_and_direct_argv() {
+        let image_init = vec!["custom-init".to_string(), "arg with spaces;$(false)".to_string()];
         let args = init_run_args(
             "init-ctr",
             Path::new("/srv/repos/p1/repo"),
             "img:build",
-            "cd /repo && true",
+            &image_init,
             "deadbeef",
             1,
             204,
@@ -1147,7 +1137,29 @@ mod tests {
         assert!(args.contains(&format!("{IMAGE_INIT_LABEL}=1")));
         assert!(args.contains(&format!("{PROJECT_ID_LABEL}=1")));
         assert!(args.contains(&format!("{TASK_ID_LABEL}=204")));
-        assert_eq!(args.last().unwrap(), "cd /repo && true");
+        let marker = args.iter().position(|arg| arg == "remoter-image-init").unwrap();
+        assert_eq!(&args[marker + 1..], image_init.as_slice());
+        assert!(args[marker - 1].contains("cd /repo && \"$@\""));
+        assert!(!args[marker - 1].contains("custom-init"));
+        assert!(!args[marker - 1].contains("arg with spaces"));
+    }
+
+    #[test]
+    fn init_run_args_allow_an_empty_image_init() {
+        let args = init_run_args(
+            "init-ctr",
+            Path::new("/srv/repos/p1/repo"),
+            "img:build",
+            &[],
+            "deadbeef",
+            1,
+            204,
+            vec![],
+            None,
+        );
+        let marker = args.iter().position(|arg| arg == "remoter-image-init").unwrap();
+        assert_eq!(marker + 1, args.len());
+        assert_eq!(args[marker - 1], "cd /repo && \"$@\"; rc=$?\nexit $rc");
     }
 
     /// Installs a stub `docker` that logs every invocation's argv (one line
@@ -1176,10 +1188,15 @@ mod tests {
             .collect()
     }
 
-    fn test_build_spec<'a>(cfg: &'a ExecutionConfig, repo: &'a Path) -> BuildSpec<'a> {
+    fn test_build_spec<'a>(
+        cfg: &'a ExecutionConfig,
+        repo: &'a Path,
+        project_config: &'a crate::project::ProjectConfig,
+    ) -> BuildSpec<'a> {
         BuildSpec {
             cfg,
             repo,
+            project_config,
             project_id: 1,
             task_id: 204,
             hash: "abc123",
@@ -1195,7 +1212,9 @@ mod tests {
     async fn build_and_commit_removes_stale_init_container_before_run() {
         let repo = setup_repo("build-preclean");
         let cfg = stub_docker(&repo, 0);
-        let tag = build_and_commit(test_build_spec(&cfg, &repo)).await.unwrap();
+        let tag = build_and_commit(test_build_spec(&cfg, &repo, &crate::project::ProjectConfig::default()))
+            .await
+            .unwrap();
         assert_eq!(tag, "img:p1-abc123");
         let log = docker_log(&repo);
         let rm_idx = log
@@ -1219,11 +1238,34 @@ mod tests {
     async fn build_and_commit_tolerates_a_failing_preclean() {
         let repo = setup_repo("build-preclean-fail");
         let cfg = stub_docker(&repo, 1);
-        let tag = build_and_commit(test_build_spec(&cfg, &repo)).await.unwrap();
+        let tag = build_and_commit(test_build_spec(&cfg, &repo, &crate::project::ProjectConfig::default()))
+            .await
+            .unwrap();
         assert_eq!(tag, "img:p1-abc123");
         let log = docker_log(&repo);
         assert!(log.iter().any(|l| l.starts_with("run --name")), "{log:?}");
         assert!(log.last().unwrap().starts_with("commit "), "{log:?}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[tokio::test]
+    async fn build_and_commit_uses_the_configured_image_init() {
+        let repo = setup_repo("build-custom-init");
+        let cfg = stub_docker(&repo, 0);
+        let project_config = crate::project::ProjectConfig::parse(
+            "[commands]\nimage_init = [\"custom-init\", \"arg with spaces;$(false)\"]",
+        )
+        .unwrap();
+        build_and_commit(test_build_spec(&cfg, &repo, &project_config))
+            .await
+            .unwrap();
+        let log = docker_log(&repo);
+        let full = log.join("\n");
+        assert!(
+            full.contains("remoter-image-init custom-init arg with spaces;$(false)"),
+            "{full}"
+        );
+        assert!(!full.contains("devenv shell"), "{full}");
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -1390,7 +1432,7 @@ mod tests {
             "c",
             Path::new("/r"),
             "img:build",
-            "true",
+            &[],
             "rev",
             1,
             2,
@@ -1418,7 +1460,7 @@ mod tests {
             "c",
             Path::new("/r"),
             "img:build",
-            "true",
+            &[],
             "rev",
             1,
             2,
@@ -1427,7 +1469,10 @@ mod tests {
         );
         let joined = args.join(" ");
         assert!(joined.contains("require-sigs = false"), "{joined}");
-        assert!(!joined.contains("key.secret"), "{joined}");
+        assert!(
+            !joined.contains("/srv/remoter-nix-cache-key.secret:/remoter-nix-cache-key.secret:ro"),
+            "{joined}"
+        );
     }
 
     #[test]
@@ -1448,7 +1493,9 @@ mod tests {
         let cache_dir = repo.join("host-cache");
         let mut cfg = stub_docker(&repo, 0);
         cfg.nix_binary_cache_dir = Some(cache_dir.clone());
-        let tag = build_and_commit(test_build_spec(&cfg, &repo)).await.unwrap();
+        let tag = build_and_commit(test_build_spec(&cfg, &repo, &crate::project::ProjectConfig::default()))
+            .await
+            .unwrap();
         assert_eq!(tag, "img:p1-abc123");
         assert!(cache_dir.is_dir(), "the cache dir is created");
         let log = docker_log(&repo);
@@ -1469,17 +1516,17 @@ mod tests {
             full.contains("|| echo 'remoter: nix cache export failed; continuing'"),
             "{full}"
         );
-        // The init script's exit code is captured before the export and
-        // restored after, so a failing agent-init.sh still fails the build.
+        // The image-init command's exit code is captured before the export and
+        // restored after, so an init failure still fails the build.
         assert!(full.contains("rc=$?"), "{full}");
         assert!(full.contains("exit $rc"), "{full}");
         let _ = std::fs::remove_dir_all(&repo);
     }
 
-    /// The init command must propagate agent-init.sh's exit code through the
-    /// cache-export suffix: a failing init script must fail the bake, not
-    /// produce a broken image. Regression test for the `; ( … ) || echo`
-    /// pattern that swallowed the exit code.
+    /// The init command must propagate its exit code through the cache-export
+    /// suffix: a failing command must fail the bake, not produce a broken
+    /// image. Regression test for the `; ( … ) || echo` pattern that swallowed
+    /// the exit code.
     #[test]
     fn init_cmd_preserves_exit_code_through_cache_export() {
         // Test the shell pattern directly: `cmd; rc=$?; ( … ) || echo …; exit $rc`
@@ -1510,7 +1557,9 @@ mod tests {
         std::fs::create_dir_all(&cache_dir).unwrap();
         let mut cfg = stub_docker(&repo, 0);
         cfg.nix_binary_cache_dir = Some(cache_dir);
-        build_and_commit(test_build_spec(&cfg, &repo)).await.unwrap();
+        build_and_commit(test_build_spec(&cfg, &repo, &crate::project::ProjectConfig::default()))
+            .await
+            .unwrap();
         let log = docker_log(&repo);
         let run = log
             .iter()

@@ -21,7 +21,8 @@ stall_idle_secs     = 300
 stall_grace_secs    = 30
 
 # Execution environment. Default is host mode — the agent runs on this host via
-# `devenv shell --`. Isolated modes never silently fall back to host execution.
+# `devenv shell --`. A project's .remoter/agent.toml can replace the environment,
+# service lifecycle, and image-init argv. Isolated modes never fall back to host.
 # [execution]
 # mode = "bwrap"                   # "host" | "container" | "bwrap"
 # bwrap_binary = "bwrap"           # bwrap only: rootless sandbox launcher
@@ -65,6 +66,7 @@ stall_grace_secs    = 30
 # and CAP_FOWNER make the non-setuid bwrap binary reject startup.
 
 [driver]
+# A project's .remoter/agent.toml may override kind for that project's runs.
 kind = "kimi-acp"    # dry-run = "stub"; real ACP agents = "kimi-acp" or "opencode-acp"
 # simulate_delay_ms = 0          # stub only: artificial run duration
 # ACP drivers (defaults shown for kimi-acp):

@@ -22,26 +22,6 @@ const CA_BUNDLE: &str = "/etc/ssl/certs/ca-bundle.crt";
 const DART_CA_BUNDLE: &str = "/etc/pki/tls/certs/ca-bundle.crt";
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(20);
 const NIX_CONFIG: &str = "experimental-features = nix-command flakes";
-const GUEST_SCRIPT: &str = r#"
-devenv_enabled=$1
-project_dir=$2
-shift 2
-if [ "$devenv_enabled" = "1" ]; then
-    cd "$project_dir" || exit
-    processes=$(devenv --no-eval-cache eval processes) || exit
-    processes=$(printf '%s' "$processes" | tr -d '[:space:]')
-    if [ "$processes" != '{"processes":{}}' ]; then
-        trap 'devenv --no-eval-cache processes down >&2 2>/dev/null || :' EXIT
-        devenv --no-eval-cache processes down >&2 2>/dev/null || :
-        devenv --no-eval-cache up -d >&2 || exit
-        devenv --no-eval-cache processes wait --timeout 120 >&2 || exit
-    fi
-    devenv --no-eval-cache shell --no-tui -- "$@"
-    status=$?
-    exit "$status"
-fi
-exec "$@"
-"#;
 
 static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -52,7 +32,10 @@ struct LaunchOptions {
     agent_home: PathBuf,
     state_root: PathBuf,
     worktree: PathBuf,
-    devenv: bool,
+    env_wrap: Vec<String>,
+    services_up: Vec<String>,
+    services_wait: Vec<String>,
+    services_down: Vec<String>,
     retain: Vec<String>,
     env: Vec<(String, String)>,
     command: Vec<String>,
@@ -110,13 +93,25 @@ pub async fn prewarm(
     worktree: &Path,
     agent_home: &Path,
     env: &[(String, String)],
+    env_wrap: &[String],
 ) -> Result<(), crate::driver::DriverError> {
-    prewarm_inner(worktree, agent_home, env)
+    prewarm_inner(worktree, agent_home, env, env_wrap)
         .await
-        .map_err(|error| crate::driver::DriverError::Transient(format!("devenv pre-warm: {error:#}")))
+        .map_err(|error| crate::driver::DriverError::Transient(format!("environment pre-warm: {error:#}")))
 }
 
-async fn prewarm_inner(worktree: &Path, agent_home: &Path, env: &[(String, String)]) -> anyhow::Result<()> {
+async fn prewarm_inner(
+    worktree: &Path,
+    agent_home: &Path,
+    env: &[(String, String)],
+    env_wrap: &[String],
+) -> anyhow::Result<()> {
+    if env_wrap.is_empty() {
+        return Ok(());
+    }
+    if env_wrap[0].is_empty() {
+        bail!("environment wrapper executable must not be empty");
+    }
     require_absolute(worktree, "worktree")?;
     require_absolute(agent_home, "agent home")?;
     if !worktree.is_dir() {
@@ -125,17 +120,18 @@ async fn prewarm_inner(worktree: &Path, agent_home: &Path, env: &[(String, Strin
     fs::create_dir_all(agent_home.join(".cache"))
         .with_context(|| format!("create Nix cache under {}", agent_home.display()))?;
     let environment = merge_supplied_env(host_environment(agent_home), env);
-    let mut command = tokio::process::Command::new("devenv");
+    let mut command = tokio::process::Command::new(&env_wrap[0]);
     command
-        .args(["--no-eval-cache", "shell", "--no-tui", "--", "true"])
+        .args(&env_wrap[1..])
+        .arg("true")
         .current_dir(worktree)
         .env_clear()
         .envs(environment)
         .kill_on_drop(true);
-    let output = command.output().await.context("start host devenv shell")?;
+    let output = command.output().await.context("start host environment wrapper")?;
     if !output.status.success() {
         bail!(
-            "host shell exited with {}: {}",
+            "host environment wrapper exited with {}: {}",
             display_status(output.status),
             String::from_utf8_lossy(&output.stderr).trim()
         );
@@ -435,7 +431,10 @@ fn parse_args(args: &[String]) -> anyhow::Result<LaunchOptions> {
     let mut agent_home = None;
     let mut state_root = None;
     let mut worktree = None;
-    let mut devenv = None;
+    let mut env_wrap = None;
+    let mut services_up = None;
+    let mut services_wait = None;
+    let mut services_down = None;
     let mut retain = Vec::new();
     let mut environment = Vec::new();
     let mut index = 0;
@@ -468,7 +467,10 @@ fn parse_args(args: &[String]) -> anyhow::Result<LaunchOptions> {
             "--agent-home" => &mut agent_home,
             "--state-root" => &mut state_root,
             "--worktree" => &mut worktree,
-            "--devenv" => &mut devenv,
+            "--env-wrap" => &mut env_wrap,
+            "--services-up" => &mut services_up,
+            "--services-wait" => &mut services_wait,
+            "--services-down" => &mut services_down,
             _ => bail!("unknown launcher option {option}"),
         };
         if slot.replace(value.to_string()).is_some() {
@@ -493,18 +495,16 @@ fn parse_args(args: &[String]) -> anyhow::Result<LaunchOptions> {
     if agent_home == Path::new("/") || worktree == Path::new("/") {
         bail!("agent home and worktree must not be the filesystem root");
     }
-    let devenv = match required_option(devenv, "--devenv")?.as_str() {
-        "0" => false,
-        "1" => true,
-        _ => bail!("--devenv must be 0 or 1"),
-    };
     Ok(LaunchOptions {
         bwrap,
         slirp4netns,
         agent_home,
         state_root,
         worktree,
-        devenv,
+        env_wrap: parse_command_option(env_wrap, "--env-wrap")?,
+        services_up: parse_command_option(services_up, "--services-up")?,
+        services_wait: parse_command_option(services_wait, "--services-wait")?,
+        services_down: parse_command_option(services_down, "--services-down")?,
         retain,
         env: environment,
         command: command.to_vec(),
@@ -519,7 +519,10 @@ fn option_value<'a>(args: &'a [String], index: usize, option: &str) -> anyhow::R
             | "--agent-home"
             | "--state-root"
             | "--worktree"
-            | "--devenv"
+            | "--env-wrap"
+            | "--services-up"
+            | "--services-wait"
+            | "--services-down"
             | "--retain"
             | "--env"
     ) {
@@ -529,6 +532,16 @@ fn option_value<'a>(args: &'a [String], index: usize, option: &str) -> anyhow::R
         .map(String::as_str)
         .filter(|value| !value.starts_with("--"))
         .with_context(|| format!("missing value for {option}"))
+}
+
+fn parse_command_option(value: Option<String>, option: &str) -> anyhow::Result<Vec<String>> {
+    let value = required_option(value, option)?;
+    let command: Vec<String> =
+        serde_json::from_str(&value).with_context(|| format!("{option} must be a JSON array of strings"))?;
+    if command.first().is_some_and(String::is_empty) {
+        bail!("{option} executable must not be empty");
+    }
+    Ok(command)
 }
 
 fn required_option(value: Option<String>, name: &str) -> anyhow::Result<String> {
@@ -696,7 +709,16 @@ fn retain_store_paths(options: &LaunchOptions, run_dir: &Path) -> anyhow::Result
     if current.starts_with("/nix/store") {
         store_paths.insert(current);
     }
-    for program in std::iter::once(&options.command[0]).chain(&options.retain) {
+    let configured = [
+        &options.env_wrap,
+        &options.services_up,
+        &options.services_wait,
+        &options.services_down,
+    ];
+    for program in std::iter::once(&options.command[0])
+        .chain(configured.into_iter().filter_map(|command| command.first()))
+        .chain(&options.retain)
+    {
         let path = resolve_program(program, &options.worktree)?;
         if path.starts_with("/nix/store") {
             store_paths.insert(path);
@@ -867,18 +889,71 @@ fn bwrap_arguments(
         gate_fd.to_string(),
         "--".to_string(),
     ]);
-    if options.devenv {
-        args.extend([
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            GUEST_SCRIPT.to_string(),
-            "remoter-bwrap".to_string(),
-            "1".to_string(),
-            options.worktree.to_string_lossy().into_owned(),
-        ]);
-    }
-    args.extend(options.command.iter().cloned());
+    args.extend(guest_argv(options));
     Ok(args)
+}
+
+fn positional_argv(command: &[String], next: &mut usize) -> String {
+    command
+        .iter()
+        .map(|_| {
+            let argument = format!("\"${{{next}}}\"");
+            *next += 1;
+            argument
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn guest_script(options: &LaunchOptions) -> String {
+    let mut next = 1;
+    let env_wrap = positional_argv(&options.env_wrap, &mut next);
+    let services_up = positional_argv(&options.services_up, &mut next);
+    let services_wait = positional_argv(&options.services_wait, &mut next);
+    let services_down = positional_argv(&options.services_down, &mut next);
+    let agent = positional_argv(&options.command, &mut next);
+    let agent = if env_wrap.is_empty() {
+        agent
+    } else {
+        format!("{env_wrap} {agent}")
+    };
+    let mut script = String::new();
+    if !options.services_down.is_empty() {
+        script.push_str(&format!(
+            "trap 'status=$?; trap - EXIT; {services_down} >&2 || :; exit \"$status\"' EXIT\n"
+        ));
+        script.push_str(&format!("{services_down} >&2 || :\n"));
+    }
+    if !options.services_up.is_empty() {
+        script.push_str(&format!("{services_up} >&2 || exit\n"));
+    }
+    if !options.services_wait.is_empty() {
+        script.push_str(&format!("{services_wait} >&2 || exit\n"));
+    }
+    script.push_str(&format!("{agent}\nstatus=$?\nexit \"$status\"\n"));
+    script
+}
+
+fn guest_argv(options: &LaunchOptions) -> Vec<String> {
+    let commands = [
+        &options.env_wrap,
+        &options.services_up,
+        &options.services_wait,
+        &options.services_down,
+    ];
+    if commands.iter().all(|command| command.is_empty()) {
+        return options.command.clone();
+    }
+    let mut args = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        guest_script(options),
+        "remoter-bwrap".to_string(),
+    ];
+    for command in commands.into_iter().chain([&options.command]) {
+        args.extend(command.iter().cloned());
+    }
+    args
 }
 
 struct TrustedGit {
@@ -1297,8 +1372,14 @@ mod tests {
             "/state",
             "--worktree",
             "/worktree",
-            "--devenv",
-            "0",
+            "--env-wrap",
+            "[]",
+            "--services-up",
+            "[]",
+            "--services-wait",
+            "[]",
+            "--services-down",
+            "[]",
             "--",
             "agent",
             "--flag",
@@ -1362,6 +1443,8 @@ mod tests {
     #[test]
     fn cli_parses_command_and_env_without_eating_agent_flags() {
         let mut args = valid_args();
+        let env_wrap = args.iter().position(|arg| arg == "--env-wrap").unwrap();
+        args[env_wrap + 1] = "[\"wrapper\",\"arg with spaces\",\"$HOME;echo no\"]".to_string();
         let separator = args.iter().position(|arg| arg == "--").unwrap();
         args.splice(
             separator..separator,
@@ -1383,7 +1466,11 @@ mod tests {
             strings(&["/nix/store/remoter-mcp/bin/remoter-mcp", "late-tool"])
         );
         assert_eq!(parsed.env, vec![("A".to_string(), "x=y".to_string())]);
-        assert!(!parsed.devenv);
+        assert_eq!(
+            parsed.env_wrap,
+            strings(&["wrapper", "arg with spaces", "$HOME;echo no"])
+        );
+        assert!(parsed.services_up.is_empty() && parsed.services_wait.is_empty() && parsed.services_down.is_empty());
     }
 
     #[test]
@@ -1402,10 +1489,6 @@ mod tests {
                     }
                 })
                 .collect(),
-            valid_args()
-                .into_iter()
-                .map(|arg| if arg == "0" { "yes".to_string() } else { arg })
-                .collect(),
             strings(&["--unknown", "x"]),
         ];
         for args in cases {
@@ -1418,6 +1501,24 @@ mod tests {
         let separator = bad_env.iter().position(|arg| arg == "--").unwrap();
         bad_env.splice(separator..separator, strings(&["--env", "=bad"]).iter().cloned());
         assert!(parse_args(&bad_env).is_err());
+    }
+
+    #[test]
+    fn cli_rejects_malformed_command_arrays_and_empty_executables() {
+        for value in [
+            "not-json",
+            "null",
+            "{}",
+            "[1]",
+            "[\"tool\",1]",
+            "[\"\"]",
+            "[\"tool\"] trailing",
+        ] {
+            let mut args = valid_args();
+            let option = args.iter().position(|arg| arg == "--services-wait").unwrap();
+            args[option + 1] = value.to_string();
+            assert!(parse_args(&args).is_err(), "unexpectedly accepted {value}");
+        }
     }
 
     #[test]
@@ -1707,29 +1808,108 @@ mod tests {
     }
 
     #[test]
-    fn guest_script_uses_devenv_shell_and_preserves_agent_args() {
-        let root = scratch("script");
-        let mut parsed = trusted_options(&root);
-        parsed.devenv = true;
+    fn guest_uses_direct_argv_or_positional_shell_arguments() {
+        let mut parsed = options();
+        assert_eq!(guest_argv(&parsed), parsed.command);
+
+        parsed.env_wrap = strings(&["wrapper", "wrapped arg"]);
+        parsed.services_down = strings(&["cleanup"]);
         parsed.command = strings(&["agent", "arg with spaces", "$HOME;echo no"]);
-        let args = bwrap_arguments(
-            &parsed,
-            &root,
-            Path::new("/nix/store/ca"),
-            Path::new("/nix/store/sh"),
-            Path::new("/nix/store/env"),
-            10,
-            11,
-        )
-        .unwrap();
-        let separator = args.iter().position(|arg| arg == "--").unwrap();
-        let command = &args[separator + 1..];
-        assert_eq!(&command[..4], ["/bin/sh", "-c", GUEST_SCRIPT, "remoter-bwrap"]);
-        assert!(command.ends_with(&parsed.command));
-        assert!(GUEST_SCRIPT.contains("shell --no-tui -- \"$@\""));
-        assert!(GUEST_SCRIPT.contains("status=$?"));
-        assert!(GUEST_SCRIPT.contains("exit \"$status\""));
-        assert!(GUEST_SCRIPT.contains("trap 'devenv"));
+        let args = guest_argv(&parsed);
+        assert_eq!(&args[..2], ["/bin/sh", "-c"]);
+        assert_eq!(args[3], "remoter-bwrap");
+        assert!(args[2].contains("trap 'status=$?"));
+        assert!(args[2].contains("status=$?\nexit \"$status\""));
+        for value in ["wrapper", "wrapped arg", "arg with spaces", "$HOME;echo no"] {
+            assert!(!args[2].contains(value), "guest script interpolated {value}");
+        }
+        assert!(args.ends_with(&parsed.command));
+    }
+
+    fn fake_service(name: &str, log: &Path) -> Vec<String> {
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf '%s\\n' \"$1\"; printf '%s\\n' \"$1\" >> \"$2\"".to_string(),
+            "service".to_string(),
+            name.to_string(),
+            log.to_string_lossy().into_owned(),
+        ]
+    }
+
+    fn run_guest(options: &LaunchOptions) -> std::process::Output {
+        let args = guest_argv(options);
+        Command::new(&args[0]).args(&args[1..]).output().unwrap()
+    }
+
+    #[test]
+    fn guest_readiness_failure_skips_agent_and_runs_cleanup() {
+        let root = scratch("readiness");
+        let log = root.join("services.log");
+        let agent_marker = root.join("agent-ran");
+        let mut parsed = options();
+        parsed.services_down = fake_service("down", &log);
+        parsed.services_up = fake_service("up", &log);
+        parsed.services_wait = fake_service("wait", &log);
+        parsed.services_wait[2].push_str("; exit 17");
+        parsed.command = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf ran > \"$1\"".to_string(),
+            "agent".to_string(),
+            agent_marker.to_string_lossy().into_owned(),
+        ];
+        let output = run_guest(&parsed);
+        assert_eq!(output.status.code(), Some(17), "{output:?}");
+        assert!(!agent_marker.exists());
+        assert_eq!(fs::read_to_string(log).unwrap(), "down\nup\nwait\ndown\n");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("up\nwait\n"), "{stderr}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn guest_wrap_preserves_agent_stdio_arguments_status_and_cleanup() {
+        let root = scratch("cleanup");
+        let log = root.join("services.log");
+        let mut parsed = options();
+        parsed.env_wrap = strings(&["/bin/sh", "-c", "\"$@\"", "env-wrap"]);
+        parsed.services_down = fake_service("down", &log);
+        parsed.command = strings(&[
+            "/bin/sh",
+            "-c",
+            "printf 'agent-stdout:%s' \"$1\"; printf agent-stderr >&2; exit 23",
+            "agent",
+            "arg with spaces;$HOME",
+        ]);
+        let output = run_guest(&parsed);
+        assert_eq!(output.status.code(), Some(23), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "agent-stdout:arg with spaces;$HOME"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("agent-stderr"));
+        assert_eq!(fs::read_to_string(log).unwrap(), "down\ndown\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prewarm_is_optional_and_appends_true_to_wrapper() {
+        prewarm_inner(Path::new("/missing"), Path::new("/also-missing"), &[], &[])
+            .await
+            .unwrap();
+        let root = scratch("prewarm");
+        let home = root.join("home");
+        let log = root.join("prewarm.log");
+        let wrapper = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf '%s' \"$2\" > \"$1\"".to_string(),
+            "prewarm".to_string(),
+            log.to_string_lossy().into_owned(),
+        ];
+        prewarm_inner(&root, &home, &[], &wrapper).await.unwrap();
+        assert_eq!(fs::read_to_string(log).unwrap(), "true");
         fs::remove_dir_all(root).unwrap();
     }
 

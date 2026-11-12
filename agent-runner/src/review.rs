@@ -31,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     client::{ProjectRepoConfig, RemoterClient, TaskDetail, TaskSummary},
     config::Config,
-    driver::{AgentDriver, DriverError, RunFailure, RunOutcome, RunSpec},
+    driver::{AgentDriver, DriverError, DriverFactory, RunFailure, RunOutcome, RunSpec},
     logstore::LogStore,
     ports::PortBlock,
     run::{self, RunLogGuard},
@@ -153,7 +153,9 @@ impl Reviewer {
 pub struct ReviewContext {
     pub client: RemoterClient,
     pub config: Arc<Config>,
+    pub driver_factory: DriverFactory,
     pub driver: Arc<dyn AgentDriver>,
+    pub project_config: crate::project::ProjectConfig,
     pub task: TaskSummary,
     /// The ticket's project repo config; `None` when the project is not
     /// agent-managed (the run then reviews the report without git context).
@@ -169,11 +171,9 @@ pub struct ReviewContext {
     pub log_store: LogStore,
 }
 
-/// Where a review attempt runs: the agent's working directory, whether devenv
-/// services wrap the turn (spec §5.8), and the branch recorded on the run row.
+/// Where a review attempt runs and the branch recorded on the run row.
 struct AttemptEnv<'a> {
     cwd: &'a std::path::Path,
-    devenv: bool,
     branch: &'a str,
 }
 
@@ -211,12 +211,34 @@ struct GitContext {
 /// could not open a fresh run row anyway — a failure closes the row as failed
 /// and the ticket stays in `review` for the human.
 pub async fn execute(rc: ReviewContext) {
+    let mut rc = rc;
     let task_id = rc.task.id;
+    match run::effective_project(&rc.config, rc.project.as_ref(), &rc.driver_factory).await {
+        Ok((config, project_config, driver)) => {
+            rc.config = config;
+            rc.project_config = project_config;
+            rc.driver = driver;
+        }
+        Err(error) => {
+            let Ok(run) = rc.client.start_run(task_id, REVIEW_RUN_KIND).await else {
+                return;
+            };
+            run::finish_failed(
+                &rc.client,
+                task_id,
+                run.id,
+                format!("project configuration failed: {error}"),
+                None,
+                None,
+            )
+            .await;
+            return;
+        }
+    }
     // The agent works in the ticket's existing worktree when one exists, else
     // in the project clone (reviewing a diff needs no checkout); with neither,
     // the workspace root keeps the session spawnable and the prompt degrades.
     let cwd = review_cwd(&rc);
-    let devenv = workspace::uses_devenv(&cwd);
     let branch = ticket_branch(&rc).await.unwrap_or_default();
 
     if rc.cancel.is_cancelled() {
@@ -271,7 +293,6 @@ pub async fn execute(rc: ReviewContext) {
 
     let env = AttemptEnv {
         cwd: &cwd,
-        devenv,
         branch: &branch,
     };
     let outcome = match run_attempt(&rc, run.id, &logger, &prompt, &env).await {
@@ -386,7 +407,7 @@ fn review_env(rc: &ReviewContext) -> Vec<(String, String)> {
     env
 }
 
-/// One driver turn with the cancellation/timeout envelope: devenv services up
+/// One driver turn with the cancellation/timeout envelope: project services up
 /// around the turn, always down after. `None` = cancelled mid-attempt.
 async fn run_attempt(
     rc: &ReviewContext,
@@ -402,6 +423,14 @@ async fn run_attempt(
         )));
     }
     let env_vars = review_env(rc);
+    let commands = match rc
+        .project_config
+        .commands_for(rc.config.execution.mode, env.cwd, &env_vars)
+        .await
+    {
+        Ok(commands) => commands,
+        Err(error) => return Some(Err(RunFailure::new(error, None))),
+    };
     // Container mode: the review turn runs in a container like any other run —
     // no silent fallback to host. A ticket whose project is not agent-managed
     // has no repo to build an image from — it keeps the host path (its review
@@ -447,7 +476,8 @@ async fn run_attempt(
                 rc.task.id,
                 run_id,
                 env.cwd,
-                env.devenv,
+                &rc.project_config,
+                &commands,
                 &env_vars,
                 &child_refs,
             )
@@ -471,18 +501,14 @@ async fn run_attempt(
         }
     }
     if containers.is_none()
-        && env.devenv
-        && let Err(e) = workspace::services_up(env.cwd, &env_vars).await
+        && let Err(e) = workspace::services_up(env.cwd, &env_vars, &commands).await
     {
         return Some(Err(RunFailure::new(
-            DriverError::Transient(format!("devenv services up: {e}")),
+            DriverError::Transient(format!("project services up: {e}")),
             None,
         )));
     }
-    let exec = match &containers {
-        Some(_) => run::exec_env(&rc.config, run_id, env.devenv),
-        None => workspace::ExecEnv::host(env.devenv),
-    };
+    let exec = run::exec_env(&rc.config, run_id, &commands);
     let spec = RunSpec {
         task_id: rc.task.id,
         run_id,
@@ -502,9 +528,9 @@ async fn run_attempt(
         _ = rc.cancel.cancelled() => None,
         r = tokio::time::timeout(timeout, rc.driver.run(spec)) => Some(r),
     };
-    if containers.is_none() && env.devenv {
+    if containers.is_none() {
         // Best-effort, must not mask the turn's real outcome (spec §5.8).
-        workspace::services_down(env.cwd, &review_env(rc)).await;
+        workspace::services_down(env.cwd, &review_env(rc), &commands.services_down).await;
     }
     result.map(|r| {
         r.unwrap_or_else(|_| {
@@ -1321,8 +1347,10 @@ kind = "stub"
         let log_store = LogStore::new(&config.logs).unwrap();
         ReviewContext {
             client,
+            driver_factory: DriverFactory::new(&config),
             config,
             driver: Arc::new(crate::driver::stub::StubDriver::new(0, false)),
+            project_config: crate::project::ProjectConfig::default(),
             task: summary(),
             project: None,
             port_block: None,

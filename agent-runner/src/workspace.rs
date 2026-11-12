@@ -73,8 +73,6 @@ pub async fn existing_branch(root: &Path, project_id: i32, task_id: i32) -> Opti
 pub struct PreparedWorktree {
     pub dir: PathBuf,
     pub branch: String,
-    /// The worktree contains `devenv.nix` / `devenv.yaml` (spec §5.8).
-    pub devenv: bool,
 }
 
 #[derive(Debug)]
@@ -216,11 +214,7 @@ pub async fn prepare_with_stack(
         branch
     };
 
-    Ok(PreparedWorktree {
-        devenv: uses_devenv(&wt),
-        dir: wt,
-        branch,
-    })
+    Ok(PreparedWorktree { dir: wt, branch })
 }
 
 // ── reference repos (docs/specs/cross-repo-projects.md, #169) ────────────────
@@ -872,46 +866,32 @@ pub fn uses_devenv(dir: &Path) -> bool {
     dir.join("devenv.nix").exists() || dir.join("devenv.yaml").exists()
 }
 
-// ── devenv command wrapping (spec §5.8) ──────────────────────────────────────
+// ── project command wrapping ─────────────────────────────────────────────────
 
 /// Where a driver-spawned command executes (docs/specs/remoter-agent-containers.md).
 #[derive(Debug, Clone)]
 pub enum ExecEnv {
-    /// On the daemon host — directly, or wrapped in `devenv shell --` when the
-    /// worktree uses devenv (spec §5.8).
-    Host {
-        /// The worktree carries `devenv.nix` / `devenv.yaml`.
-        devenv: bool,
-    },
-    /// Inside the run container via `docker exec` (container mode).
+    Host { env_wrap: Vec<String> },
     Container(ContainerExec),
-    /// Inside a per-turn rootless Bubblewrap launcher.
     Bwrap(BwrapExec),
 }
 
 /// Container-mode execution details threaded from the daemon to the driver.
 #[derive(Debug, Clone)]
 pub struct ContainerExec {
-    /// The docker CLI binary (config `execution.docker_binary`).
     pub docker: String,
-    /// The run container's name (`docker exec` target).
     pub container: String,
-    /// The worktree mount point inside the container (`/work`).
     pub work_dir: PathBuf,
-    /// The worktree uses devenv — wrap as `devenv shell -- …` *inside* the
-    /// container (the image has the shell warmed, see `image.rs`).
-    pub devenv: bool,
+    pub env_wrap: Vec<String>,
     /// Host-side kimi sessions directory (`<agent_home>/.kimi-code/sessions`)
     /// — where the wire files appear, since the container mounts the agent
     /// home at `/root`. Used by the token-usage fallback.
     pub sessions_dir: PathBuf,
-    /// The backend API URL rewritten for in-container reachability
-    /// (loopback → `host.docker.internal`).
     pub api_url: String,
 }
 
 /// Bubblewrap execution details. The launcher keeps the real worktree path so
-/// host pre-warm and guest devenv commands evaluate consistent derivations.
+/// host pre-warm and guest commands evaluate consistent derivations.
 #[derive(Debug, Clone)]
 pub struct BwrapExec {
     pub launcher: PathBuf,
@@ -919,33 +899,34 @@ pub struct BwrapExec {
     pub slirp4netns: String,
     pub agent_home: PathBuf,
     pub state_root: PathBuf,
-    pub devenv: bool,
+    pub env_wrap: Vec<String>,
+    pub services_up: Vec<String>,
+    pub services_wait: Vec<String>,
+    pub services_down: Vec<String>,
     pub retained_commands: Vec<String>,
     pub sessions_dir: PathBuf,
     pub api_url: String,
 }
 
 impl ExecEnv {
-    pub fn host(devenv: bool) -> Self {
-        ExecEnv::Host { devenv }
-    }
-
-    /// Whether commands are wrapped in `devenv shell --` (either side).
-    pub fn devenv(&self) -> bool {
-        match self {
-            ExecEnv::Host { devenv } => *devenv,
-            ExecEnv::Container(c) => c.devenv,
-            ExecEnv::Bwrap(c) => c.devenv,
-        }
+    pub fn host(env_wrap: Vec<String>) -> Self {
+        ExecEnv::Host { env_wrap }
     }
 }
 
-/// Builds the command a driver spawns. Host mode: with devenv, the invocation
-/// is wrapped as `devenv shell --no-tui --no-eval-cache -- <program> <args>`
-/// (with `CI=1` / `DEVENV_NO_AI_AGENT=1`); without, it runs directly.
-/// Container mode: `docker exec -i -w /work [-e K=V]… <run> [devenv shell …
-/// --] <program> <args>` — the devenv shell is entered *inside* the container,
-/// where the image has it warmed.
+fn is_devenv_wrapper(env_wrap: &[String]) -> bool {
+    env_wrap.first().is_some_and(|program| program == "devenv")
+}
+
+fn append_wrapped(cmd: &mut std::process::Command, env_wrap: &[String], program: &str, args: &[&str]) {
+    if let Some(wrapper) = env_wrap.first() {
+        cmd.arg(wrapper).args(&env_wrap[1..]);
+    }
+    cmd.arg(program).args(args);
+}
+
+/// Builds the argv a driver spawns. Project wrappers receive the agent program
+/// and arguments directly; no additional shell is inserted on the ACP stdio path.
 pub fn wrap_command(
     dir: &Path,
     exec: &ExecEnv,
@@ -958,7 +939,7 @@ pub fn wrap_command(
             let mut cmd = std::process::Command::new(&c.docker);
             cmd.arg("exec").arg("-i").arg("-w").arg(&c.work_dir);
             cmd.arg("-e").arg("CI=1");
-            if c.devenv {
+            if is_devenv_wrapper(&c.env_wrap) {
                 cmd.arg("-e").arg("DEVENV_NO_AI_AGENT=1");
             }
             for (k, v) in env {
@@ -968,16 +949,7 @@ pub fn wrap_command(
             // Keep the legacy human token out of the agent process even when
             // it was baked into or inherited by the run container.
             cmd.arg("env").arg("-u").arg("REMOTER_TOKEN");
-            if c.devenv {
-                cmd.arg("devenv")
-                    .arg("shell")
-                    .arg("--no-tui")
-                    .arg("--no-eval-cache")
-                    .arg("--");
-            }
-            cmd.arg(program).args(args);
-            // `docker exec` runs on the host; `current_dir` is meaningless
-            // for the in-container process but harmless for the CLI itself.
+            append_wrapped(&mut cmd, &c.env_wrap, program, args);
             cmd
         }
         ExecEnv::Bwrap(c) => {
@@ -992,13 +964,20 @@ pub fn wrap_command(
                 .arg("--state-root")
                 .arg(&c.state_root)
                 .arg("--worktree")
-                .arg(dir)
-                .arg("--devenv")
-                .arg(if c.devenv { "1" } else { "0" });
+                .arg(dir);
+            for (option, command) in [
+                ("--env-wrap", &c.env_wrap),
+                ("--services-up", &c.services_up),
+                ("--services-wait", &c.services_wait),
+                ("--services-down", &c.services_down),
+            ] {
+                cmd.arg(option)
+                    .arg(serde_json::to_string(command).expect("string argv serializes"));
+            }
             for command in &c.retained_commands {
                 cmd.arg("--retain").arg(command);
             }
-            if c.devenv {
+            if is_devenv_wrapper(&c.env_wrap) {
                 cmd.arg("--env").arg("DEVENV_NO_AI_AGENT=1");
             }
             for (key, value) in env {
@@ -1008,22 +987,19 @@ pub fn wrap_command(
             cmd.current_dir(dir).env_remove("REMOTER_TOKEN");
             cmd
         }
-        ExecEnv::Host { devenv } => {
-            let mut cmd = if *devenv {
-                let mut c = std::process::Command::new("devenv");
-                c.arg("shell")
-                    .arg("--no-tui")
-                    .arg("--no-eval-cache")
-                    .arg("--")
-                    .arg(program)
-                    .args(args);
-                c.env("DEVENV_NO_AI_AGENT", "1");
+        ExecEnv::Host { env_wrap } => {
+            let mut cmd = if let Some(wrapper) = env_wrap.first() {
+                let mut c = std::process::Command::new(wrapper);
+                c.args(&env_wrap[1..]).arg(program).args(args);
                 c
             } else {
                 let mut c = std::process::Command::new(program);
                 c.args(args);
                 c
             };
+            if is_devenv_wrapper(env_wrap) {
+                cmd.env("DEVENV_NO_AI_AGENT", "1");
+            }
             cmd.current_dir(dir);
             // Do not leak the pre-agent legacy human token into the child
             // process. The injected remoter MCP server receives the daemon's
@@ -1036,42 +1012,34 @@ pub fn wrap_command(
     }
 }
 
-/// `devenv --no-eval-cache up -d` + `devenv --no-eval-cache processes wait
-/// --timeout 120` before a run (R§5). Shell-only devenv projects skip up and
-/// readiness. Self-healing: a best-effort `processes down` always runs first
-/// (a stale supervisor from a crashed previous attempt would otherwise fail
-/// `up -d` with "Processes already running"), and once more when `up -d`/`wait`
-/// fails, so a partially started supervisor is never leaked into the caller's
-/// retry loop.
-pub async fn services_up(dir: &Path, env: &[(String, String)]) -> Result<(), WorkspaceError> {
-    services_down(dir, env).await;
-    if !has_processes(dir, env).await? {
-        return Ok(());
-    }
+/// Best-effort startup cleanup, then the project's service and readiness argv.
+/// A failed up/wait triggers the same best-effort down so retries start clean.
+pub async fn services_up(
+    dir: &Path,
+    env: &[(String, String)],
+    commands: &crate::project::ProjectCommands,
+) -> Result<(), WorkspaceError> {
+    services_down(dir, env, &commands.services_down).await;
     let result = async {
-        devenv(dir, env, &["up", "-d"]).await?;
-        devenv(dir, env, &["processes", "wait", "--timeout", "120"]).await
+        run_argv(dir, env, &commands.services_up).await?;
+        run_argv(dir, env, &commands.services_wait).await
     }
     .await;
     if result.is_err() {
-        services_down(dir, env).await;
+        services_down(dir, env, &commands.services_down).await;
     }
     result
 }
 
-/// `devenv --no-eval-cache processes down` — fully best-effort: a non-zero
-/// exit (commonly "nothing running") or a spawn failure is logged at debug
-/// level and never returned, so a down can never mask the run's real outcome
-/// or block a subsequent up.
-pub async fn services_down(dir: &Path, env: &[(String, String)]) {
-    if let Err(e) = devenv(dir, env, &["processes", "down"]).await {
-        tracing::debug!(dir = %dir.display(), error = %e, "devenv processes down failed (ignored)");
+/// Best-effort service cleanup; an empty argv explicitly disables the step.
+pub async fn services_down(dir: &Path, env: &[(String, String)], command: &[String]) {
+    if let Err(e) = run_argv(dir, env, command).await {
+        tracing::debug!(dir = %dir.display(), error = %e, "project services down failed (ignored)");
     }
 }
 
-/// Startup sweep (spec §5.8): best-effort `services_down` in every existing
-/// devenv worktree under `root` (`p*/wt-*`), cleaning up processes leaked by
-/// a daemon crash or an older daemon version. Never fails the caller.
+/// Startup sweep: best-effort `services_down` in every existing worktree under
+/// `root` (`p*/wt-*`), using the central clone's current project configuration.
 pub async fn down_all_worktrees(root: &Path) {
     let projects = match std::fs::read_dir(root) {
         Ok(projects) => projects,
@@ -1085,6 +1053,13 @@ pub async fn down_all_worktrees(root: &Path) {
         if !name.to_string_lossy().starts_with('p') {
             continue;
         }
+        let config = match crate::project::ProjectConfig::from_file(&project.path().join("repo")) {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::warn!(dir = %project.path().display(), %error, "startup sweep: invalid project configuration");
+                continue;
+            }
+        };
         let worktrees = match std::fs::read_dir(project.path()) {
             Ok(worktrees) => worktrees,
             Err(e) => {
@@ -1098,55 +1073,32 @@ pub async fn down_all_worktrees(root: &Path) {
                 continue;
             }
             let dir = wt.path();
-            if !dir.is_dir() || !uses_devenv(&dir) {
-                tracing::trace!(dir = %dir.display(), "startup sweep: skipping non-devenv worktree");
+            if !dir.is_dir() {
                 continue;
             }
-            tracing::info!(dir = %dir.display(), "startup sweep: stopping devenv processes");
-            services_down(&dir, &[]).await;
+            let command = config.legacy_services_down(crate::config::ExecutionMode::Host, &dir);
+            if command.is_empty() {
+                continue;
+            }
+            tracing::info!(dir = %dir.display(), "startup sweep: stopping project services");
+            services_down(&dir, &[], &command).await;
         }
     }
 }
 
-fn devenv_command(dir: &Path, env: &[(String, String)], args: &[&str]) -> std::process::Command {
-    let mut cmd = std::process::Command::new("devenv");
-    cmd.arg("--no-eval-cache")
-        .args(args)
+async fn run_argv(dir: &Path, env: &[(String, String)], argv: &[String]) -> Result<(), WorkspaceError> {
+    let Some(program) = argv.first() else {
+        return Ok(());
+    };
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(&argv[1..])
         .current_dir(dir)
         .env("CI", "1")
-        .env("DEVENV_NO_AI_AGENT", "1")
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-    cmd
-}
-
-async fn devenv(dir: &Path, env: &[(String, String)], args: &[&str]) -> Result<(), WorkspaceError> {
-    run(
-        devenv_command(dir, env, args),
-        &format!("devenv --no-eval-cache {}", args.join(" ")),
-    )
-    .await
-}
-
-async fn has_processes(dir: &Path, env: &[(String, String)]) -> Result<bool, WorkspaceError> {
-    let args = ["eval", "processes"];
-    let what = "devenv --no-eval-cache eval processes";
-    let out = tokio::process::Command::from(devenv_command(dir, env, &args))
-        .output()
-        .await
-        .map_err(|e| WorkspaceError(format!("{what}: {e}")))?;
-    if !out.status.success() {
-        return Err(WorkspaceError(format!(
-            "{what} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        )));
+    if program == "devenv" {
+        cmd.env("DEVENV_NO_AI_AGENT", "1");
     }
-    let evaluated: serde_json::Value =
-        serde_json::from_slice(&out.stdout).map_err(|e| WorkspaceError(format!("{what}: invalid JSON output: {e}")))?;
-    let processes = evaluated
-        .get("processes")
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| WorkspaceError(format!("{what}: missing processes object")))?;
-    Ok(!processes.is_empty())
+    run(cmd, &format!("project command {}", argv.join(" "))).await
 }
 
 // ── git helpers ───────────────────────────────────────────────────────────────
@@ -2464,7 +2416,7 @@ mod tests {
     #[test]
     fn wrap_command_plain_runs_directly() {
         let env = vec![("REMOTER_AGENT_TASK_ID".to_string(), "42".to_string())];
-        let cmd = wrap_command(Path::new("/wt"), &ExecEnv::host(false), "kimi", &["acp"], &env);
+        let cmd = wrap_command(Path::new("/wt"), &ExecEnv::host(Vec::new()), "kimi", &["acp"], &env);
         assert_eq!(cmd.get_program(), "kimi");
         let args: Vec<_> = cmd.get_args().collect();
         assert_eq!(args, ["acp"]);
@@ -2479,7 +2431,7 @@ mod tests {
 
     #[test]
     fn wrap_command_removes_legacy_human_token() {
-        let cmd = wrap_command(Path::new("/wt"), &ExecEnv::host(false), "kimi", &["acp"], &[]);
+        let cmd = wrap_command(Path::new("/wt"), &ExecEnv::host(Vec::new()), "kimi", &["acp"], &[]);
         let legacy = std::ffi::OsStr::new("REMOTER_TOKEN");
         assert!(
             cmd.get_envs().any(|(key, value)| key == legacy && value.is_none()),
@@ -2489,7 +2441,10 @@ mod tests {
 
     #[test]
     fn wrap_command_devenv_wraps_in_shell() {
-        let cmd = wrap_command(Path::new("/wt"), &ExecEnv::host(true), "kimi", &["acp", "--yolo"], &[]);
+        let wrap = ["devenv", "shell", "--no-tui", "--no-eval-cache", "--"]
+            .map(str::to_string)
+            .to_vec();
+        let cmd = wrap_command(Path::new("/wt"), &ExecEnv::host(wrap), "kimi", &["acp", "--yolo"], &[]);
         assert_eq!(cmd.get_program(), "devenv");
         let args: Vec<_> = cmd.get_args().collect();
         assert_eq!(
@@ -2510,7 +2465,9 @@ mod tests {
             docker: "docker".to_string(),
             container: "remoter-run-7".to_string(),
             work_dir: PathBuf::from("/work"),
-            devenv: true,
+            env_wrap: ["devenv", "shell", "--no-tui", "--no-eval-cache", "--"]
+                .map(str::to_string)
+                .to_vec(),
             sessions_dir: PathBuf::from("/agent-home/.kimi-code/sessions"),
             api_url: "http://host.docker.internal:8181".to_string(),
         });
@@ -2552,7 +2509,7 @@ mod tests {
             docker: "docker".to_string(),
             container: "remoter-run-9".to_string(),
             work_dir: PathBuf::from("/work"),
-            devenv: false,
+            env_wrap: Vec::new(),
             sessions_dir: PathBuf::from("/agent-home/.kimi-code/sessions"),
             api_url: "http://host.docker.internal:8181".to_string(),
         });
@@ -2589,7 +2546,9 @@ mod tests {
             docker: "docker".to_string(),
             container: "remoter-run-3".to_string(),
             work_dir: PathBuf::from("/work"),
-            devenv: true,
+            env_wrap: ["devenv", "shell", "--no-tui", "--no-eval-cache", "--"]
+                .map(str::to_string)
+                .to_vec(),
             sessions_dir: PathBuf::from("/agent-home/.kimi-code/sessions"),
             api_url: "http://host.docker.internal:8181".to_string(),
         });
@@ -2612,7 +2571,12 @@ mod tests {
             slirp4netns: "slirp4netns".to_string(),
             agent_home: PathBuf::from("/state/agent-home"),
             state_root: PathBuf::from("/state/bwrap"),
-            devenv: true,
+            env_wrap: ["devenv", "--no-eval-cache", "shell", "--no-tui", "--"]
+                .map(str::to_string)
+                .to_vec(),
+            services_up: Vec::new(),
+            services_wait: Vec::new(),
+            services_down: Vec::new(),
             retained_commands: vec!["/nix/store/remoter-mcp/bin/remoter-mcp".to_string()],
             sessions_dir: PathBuf::from("/state/agent-home/.kimi-code/sessions"),
             api_url: "http://10.0.2.2:8181".to_string(),
@@ -2638,8 +2602,14 @@ mod tests {
                 "/state/bwrap",
                 "--worktree",
                 "/host/wt",
-                "--devenv",
-                "1",
+                "--env-wrap",
+                "[\"devenv\",\"--no-eval-cache\",\"shell\",\"--no-tui\",\"--\"]",
+                "--services-up",
+                "[]",
+                "--services-wait",
+                "[]",
+                "--services-down",
+                "[]",
                 "--retain",
                 "/nix/store/remoter-mcp/bin/remoter-mcp",
                 "--env",
@@ -2654,7 +2624,6 @@ mod tests {
                 "--yolo",
             ]
         );
-        assert!(exec.devenv());
         assert!(
             cmd.get_envs()
                 .any(|(key, value)| key == "REMOTER_TOKEN" && value.is_none())
@@ -2749,6 +2718,13 @@ mod tests {
             .collect()
     }
 
+    async fn legacy_commands(dir: &Path) -> Result<crate::project::ProjectCommands, crate::driver::DriverError> {
+        std::fs::write(dir.join("devenv.nix"), "{}").unwrap();
+        crate::project::ProjectConfig::default()
+            .commands_for(crate::config::ExecutionMode::Host, dir, &[])
+            .await
+    }
+
     /// Two-level directory listing of a sweep root, for failure diagnostics.
     fn list_tree(root: &Path) -> Vec<String> {
         let mut out = Vec::new();
@@ -2770,12 +2746,14 @@ mod tests {
         let _guard = ENV_LOCK.lock().await;
         let stub = DevenvStub::install("up-order");
         let dir = scratch("up-order-wt");
-        services_up(&dir, &[]).await.unwrap();
+        services_up(&dir, &[], &legacy_commands(&dir).await.unwrap())
+            .await
+            .unwrap();
         assert_eq!(
             args_only(&stub.calls()),
             [
-                "--no-eval-cache processes down",
                 "--no-eval-cache eval processes",
+                "--no-eval-cache processes down",
                 "--no-eval-cache up -d",
                 "--no-eval-cache processes wait --timeout 120"
             ]
@@ -2789,26 +2767,25 @@ mod tests {
         let stub = DevenvStub::install("no-processes");
         stub.processes(r#"{"processes":{}}"#);
         let dir = scratch("no-processes-wt");
-        services_up(&dir, &[]).await.unwrap();
+        services_up(&dir, &[], &legacy_commands(&dir).await.unwrap())
+            .await
+            .unwrap();
         assert_eq!(
             args_only(&stub.calls()),
-            ["--no-eval-cache processes down", "--no-eval-cache eval processes"]
+            ["--no-eval-cache eval processes", "--no-eval-cache processes down"]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
-    async fn services_up_cleans_up_before_process_evaluation_failure() {
+    async fn legacy_process_evaluation_failure_is_transient() {
         let _guard = ENV_LOCK.lock().await;
         let stub = DevenvStub::install("eval-fails");
         stub.fail_on("eval processes");
         let dir = scratch("eval-fails-wt");
-        let err = services_up(&dir, &[]).await.unwrap_err();
-        assert!(err.0.contains("eval processes"), "{err}");
-        assert_eq!(
-            args_only(&stub.calls()),
-            ["--no-eval-cache processes down", "--no-eval-cache eval processes"]
-        );
+        let err = legacy_commands(&dir).await.unwrap_err();
+        assert!(err.to_string().contains("eval processes"), "{err}");
+        assert_eq!(args_only(&stub.calls()), ["--no-eval-cache eval processes"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2818,12 +2795,14 @@ mod tests {
         let stub = DevenvStub::install("down-fails");
         stub.fail_on("processes down");
         let dir = scratch("down-fails-wt");
-        services_up(&dir, &[]).await.unwrap();
+        services_up(&dir, &[], &legacy_commands(&dir).await.unwrap())
+            .await
+            .unwrap();
         assert_eq!(
             args_only(&stub.calls()),
             [
-                "--no-eval-cache processes down",
                 "--no-eval-cache eval processes",
+                "--no-eval-cache processes down",
                 "--no-eval-cache up -d",
                 "--no-eval-cache processes wait --timeout 120"
             ]
@@ -2837,19 +2816,55 @@ mod tests {
         let stub = DevenvStub::install("wait-fails");
         stub.fail_on("processes wait");
         let dir = scratch("wait-fails-wt");
-        let err = services_up(&dir, &[]).await.unwrap_err();
+        let commands = legacy_commands(&dir).await.unwrap();
+        let err = services_up(&dir, &[], &commands).await.unwrap_err();
         assert!(err.0.contains("processes wait"), "{err}");
         assert_eq!(
             args_only(&stub.calls()),
             [
-                "--no-eval-cache processes down",
                 "--no-eval-cache eval processes",
+                "--no-eval-cache processes down",
                 "--no-eval-cache up -d",
                 "--no-eval-cache processes wait --timeout 120",
                 "--no-eval-cache processes down"
             ]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn explicit_service_argv_is_repeatable_and_cleans_up_readiness_failures() {
+        let dir = scratch("custom-services");
+        let log = dir.join("services.log");
+        let service = |name: &str, exit: i32| {
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("printf '%s\\n' \"$1\" >> \"$2\"; exit {exit}"),
+                "service".to_string(),
+                name.to_string(),
+                log.to_string_lossy().into_owned(),
+            ]
+        };
+        let mut commands = crate::project::ProjectCommands {
+            env_wrap: vec![],
+            services_up: service("up", 0),
+            services_wait: service("wait", 0),
+            services_down: service("down", 0),
+            image_init: vec![],
+        };
+        for _ in 0..2 {
+            services_up(&dir, &[], &commands).await.unwrap();
+            services_down(&dir, &[], &commands.services_down).await;
+        }
+        commands.services_wait = service("wait", 17);
+        let error = services_up(&dir, &[], &commands).await.unwrap_err();
+        assert!(error.0.contains("project command"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "down\nup\nwait\ndown\ndown\nup\nwait\ndown\ndown\nup\nwait\ndown\n"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

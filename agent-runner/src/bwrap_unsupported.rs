@@ -20,7 +20,12 @@ pub fn run_env(task_id: i32) -> Vec<(String, String)> {
     ]
 }
 
-pub async fn prewarm(_worktree: &Path, _agent_home: &Path, _env: &[(String, String)]) -> Result<(), DriverError> {
+pub async fn prewarm(
+    _worktree: &Path,
+    _agent_home: &Path,
+    _env: &[(String, String)],
+    _env_wrap: &[String],
+) -> Result<(), DriverError> {
     Err(DriverError::Permanent(UNSUPPORTED.to_string()))
 }
 

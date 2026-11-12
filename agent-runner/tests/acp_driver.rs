@@ -83,7 +83,7 @@ fn spec(
         resume_session: resume,
         branch: "agent/task-1-test".to_string(),
         env,
-        exec: remoter_agent::workspace::ExecEnv::host(false),
+        exec: remoter_agent::workspace::ExecEnv::host(Vec::new()),
         config_options,
         logger: remoter_agent::session_log::SessionLogger::noop(),
         phase_tx: None,

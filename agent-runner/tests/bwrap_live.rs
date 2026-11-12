@@ -14,6 +14,7 @@
 //! store and delegate builds/substitution to the host Nix daemon.
 
 use remoter_agent::bwrap::{INTERNAL_LAUNCH_ARG, prewarm, run_env};
+use remoter_agent::project::ProjectCommands;
 use std::collections::HashSet;
 use std::env;
 use std::fs::{self, File};
@@ -58,11 +59,20 @@ impl TestDir {
         for path in [&worktree, &agent_home, &state_root] {
             fs::create_dir_all(path).unwrap();
         }
+        let commands = if devenv {
+            ProjectCommands {
+                env_wrap: devenv_env_wrap(),
+                services_down: devenv_services_down(),
+                ..ProjectCommands::default()
+            }
+        } else {
+            ProjectCommands::default()
+        };
         LaunchSpec {
             worktree,
             agent_home,
             state_root,
-            devenv,
+            commands,
             retain: Vec::new(),
             env: run_env(249),
         }
@@ -79,7 +89,7 @@ struct LaunchSpec {
     worktree: PathBuf,
     agent_home: PathBuf,
     state_root: PathBuf,
-    devenv: bool,
+    commands: ProjectCommands,
     retain: Vec<String>,
     env: Vec<(String, String)>,
 }
@@ -518,7 +528,7 @@ async fn devenv_shell_without_processes() {
     let dir = TestDir::new("shell-only");
     let spec = dir.launch_spec("run", true);
     write_shell_only_devenv_project(&spec.worktree);
-    prewarm(&spec.worktree, &spec.agent_home, &spec.env)
+    prewarm(&spec.worktree, &spec.agent_home, &spec.env, &spec.commands.env_wrap)
         .await
         .unwrap_or_else(|error| panic!("host devenv pre-warm failed: {error}"));
     let output = run_launch(
@@ -544,7 +554,7 @@ async fn devenv_shell_change_uses_host_nix_daemon() {
     let dir = TestDir::new("shell-change");
     let spec = dir.launch_spec("run", true);
     write_shell_only_devenv_project(&spec.worktree);
-    prewarm(&spec.worktree, &spec.agent_home, &spec.env)
+    prewarm(&spec.worktree, &spec.agent_home, &spec.env, &spec.commands.env_wrap)
         .await
         .unwrap_or_else(|error| panic!("host devenv pre-warm failed: {error}"));
     write_devenv_config(&spec.worktree, "{ pkgs, ... }:\n{\n  packages = [ pkgs.hello ];\n}\n");
@@ -618,8 +628,10 @@ async fn devenv_postgres_parallel_and_restart() {
     let mut two = dir.launch_spec("two", true);
     for (spec, task_id) in [(&mut one, 251), (&mut two, 252)] {
         write_devenv_project(&spec.worktree);
+        spec.commands.services_up = devenv_services_up();
+        spec.commands.services_wait = devenv_services_wait();
         spec.env.clone_from(&run_env(task_id));
-        prewarm(&spec.worktree, &spec.agent_home, &spec.env)
+        prewarm(&spec.worktree, &spec.agent_home, &spec.env, &spec.commands.env_wrap)
             .await
             .unwrap_or_else(|error| panic!("host devenv pre-warm failed for task {task_id}: {error}"));
     }
@@ -726,6 +738,22 @@ fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_string()).collect()
 }
 
+fn devenv_env_wrap() -> Vec<String> {
+    strings(&["devenv", "--no-eval-cache", "shell", "--no-tui", "--"])
+}
+
+fn devenv_services_up() -> Vec<String> {
+    strings(&["devenv", "--no-eval-cache", "up", "-d"])
+}
+
+fn devenv_services_wait() -> Vec<String> {
+    strings(&["devenv", "--no-eval-cache", "processes", "wait", "--timeout", "120"])
+}
+
+fn devenv_services_down() -> Vec<String> {
+    strings(&["devenv", "--no-eval-cache", "processes", "down"])
+}
+
 fn launcher_command(tools: &Tools, spec: &LaunchSpec, program: &str, args: Vec<String>) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_remoter-agent"));
     command
@@ -739,9 +767,17 @@ fn launcher_command(tools: &Tools, spec: &LaunchSpec, program: &str, args: Vec<S
         .arg("--state-root")
         .arg(&spec.state_root)
         .arg("--worktree")
-        .arg(&spec.worktree)
-        .arg("--devenv")
-        .arg(if spec.devenv { "1" } else { "0" });
+        .arg(&spec.worktree);
+    for (option, argv) in [
+        ("--env-wrap", &spec.commands.env_wrap),
+        ("--services-up", &spec.commands.services_up),
+        ("--services-wait", &spec.commands.services_wait),
+        ("--services-down", &spec.commands.services_down),
+    ] {
+        command
+            .arg(option)
+            .arg(serde_json::to_string(argv).expect("string argv serializes"));
+    }
     for program in &spec.retain {
         command.arg("--retain").arg(program);
     }

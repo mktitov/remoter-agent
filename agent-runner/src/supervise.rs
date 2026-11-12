@@ -36,7 +36,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     client::{self, CommentDto, ProjectRepoConfig, RemoterClient, TaskDetail, TaskSummary},
     config::Config,
-    driver::{AgentDriver, DriverError, RunFailure, RunOutcome, RunSpec},
+    driver::{AgentDriver, DriverError, DriverFactory, RunFailure, RunOutcome, RunSpec},
     logstore::LogStore,
     ports::PortBlock,
     run::{self, RunLogGuard},
@@ -537,7 +537,9 @@ impl Supervisor {
 pub struct SuperviseContext {
     pub client: RemoterClient,
     pub config: Arc<Config>,
+    pub driver_factory: DriverFactory,
     pub driver: Arc<dyn AgentDriver>,
+    pub project_config: crate::project::ProjectConfig,
     pub parent: TaskSummary,
     /// Children that were in `review` when the run was triggered.
     pub review_children: Vec<i32>,
@@ -559,13 +561,11 @@ pub struct SuperviseContext {
     pub human_notified: HumanNotified,
 }
 
-/// Where a supervise attempt runs: the agent's working directory, whether
-/// devenv services wrap the turn (spec §5.8), and the branch recorded on the
-/// run row. Identical for every attempt of a run; merge-conflict nudges reuse
-/// the parent's worktree as the cwd.
+/// Where a supervise attempt runs and the branch recorded on the run row.
+/// Identical for every attempt of a run; merge-conflict nudges reuse the
+/// parent's worktree as the cwd.
 struct AttemptEnv<'a> {
     cwd: &'a std::path::Path,
-    devenv: bool,
     branch: &'a str,
 }
 
@@ -627,12 +627,34 @@ struct GitContext {
 /// supervise run must not disturb the poll loop, and it never moves the
 /// parent (the supervision loop re-triggers on its own cadence).
 pub async fn execute(rc: SuperviseContext) {
+    let mut rc = rc;
     let parent_id = rc.parent.id;
+    match run::effective_project(&rc.config, rc.project.as_ref(), &rc.driver_factory).await {
+        Ok((config, project_config, driver)) => {
+            rc.config = config;
+            rc.project_config = project_config;
+            rc.driver = driver;
+        }
+        Err(error) => {
+            let Ok(run) = rc.client.start_run(parent_id, SUPERVISE_RUN_KIND).await else {
+                return;
+            };
+            run::finish_failed(
+                &rc.client,
+                parent_id,
+                run.id,
+                format!("project configuration failed: {error}"),
+                None,
+                None,
+            )
+            .await;
+            return;
+        }
+    }
     // The agent works in the parent's worktree when one exists, else in the
     // project clone (reviewing diffs needs no checkout); with neither, the
     // workspace root keeps the session spawnable and the prompt degrades.
     let cwd = supervise_cwd(&rc);
-    let devenv = workspace::uses_devenv(&cwd);
     let branch = parent_branch(&rc).await.unwrap_or_default();
 
     // Each attempt opens its own run row (mirroring `run::execute`): a
@@ -700,7 +722,6 @@ pub async fn execute(rc: SuperviseContext) {
 
         let env = AttemptEnv {
             cwd: &cwd,
-            devenv,
             branch: &branch,
         };
         let mut outcome = match run_attempt(&rc, run.id, &logger, &prompt, None, &env).await {
@@ -761,8 +782,7 @@ pub async fn execute(rc: SuperviseContext) {
         // Accepting a cross-project child opens/refreshes the draft
         // integration PR; its URL goes onto this run's finish body so it
         // surfaces in the parent's `TaskDetail.prUrl` and run history (#207).
-        let integration_pr_url =
-            process_verdicts(&rc, run.id, run.created_at, &mut outcome, &logger, devenv, &branch).await;
+        let integration_pr_url = process_verdicts(&rc, run.id, run.created_at, &mut outcome, &logger, &branch).await;
         if rc.cancel.is_cancelled() {
             run::finish_failed(
                 &rc.client,
@@ -854,7 +874,7 @@ fn supervise_env(rc: &SuperviseContext) -> Vec<(String, String)> {
     env
 }
 
-/// One driver turn with the cancellation/timeout envelope: devenv services up
+/// One driver turn with the cancellation/timeout envelope: project services up
 /// around the turn, always down after. `None` = cancelled mid-attempt.
 async fn run_attempt(
     rc: &SuperviseContext,
@@ -871,6 +891,14 @@ async fn run_attempt(
         )));
     }
     let env_vars = supervise_env(rc);
+    let commands = match rc
+        .project_config
+        .commands_for(rc.config.execution.mode, env.cwd, &env_vars)
+        .await
+    {
+        Ok(commands) => commands,
+        Err(error) => return Some(Err(RunFailure::new(error, None))),
+    };
     // Container mode: the supervise turn runs in a container like any other
     // run — no silent fallback to host (a container-start failure is a normal
     // transient error with retry). The guard's drop is the teardown on every
@@ -901,7 +929,8 @@ async fn run_attempt(
                 rc.parent.id,
                 run_id,
                 env.cwd,
-                env.devenv,
+                &rc.project_config,
+                &commands,
                 &env_vars,
                 &child_refs,
             )
@@ -925,18 +954,14 @@ async fn run_attempt(
         }
     }
     if containers.is_none()
-        && env.devenv
-        && let Err(e) = workspace::services_up(env.cwd, &env_vars).await
+        && let Err(e) = workspace::services_up(env.cwd, &env_vars, &commands).await
     {
         return Some(Err(RunFailure::new(
-            DriverError::Transient(format!("devenv services up: {e}")),
+            DriverError::Transient(format!("project services up: {e}")),
             None,
         )));
     }
-    let exec = match &containers {
-        Some(_) => run::exec_env(&rc.config, run_id, env.devenv),
-        None => workspace::ExecEnv::host(env.devenv),
-    };
+    let exec = run::exec_env(&rc.config, run_id, &commands);
     let spec = RunSpec {
         task_id: rc.parent.id,
         run_id,
@@ -956,9 +981,9 @@ async fn run_attempt(
         _ = rc.cancel.cancelled() => None,
         r = tokio::time::timeout(timeout, rc.driver.run(spec)) => Some(r),
     };
-    if containers.is_none() && env.devenv {
+    if containers.is_none() {
         // Best-effort, must not mask the turn's real outcome (spec §5.8).
-        workspace::services_down(env.cwd, &supervise_env(rc)).await;
+        workspace::services_down(env.cwd, &supervise_env(rc), &commands.services_down).await;
     }
     result.map(|r| {
         r.unwrap_or_else(|_| {
@@ -1547,7 +1572,6 @@ async fn process_verdicts(
     run_started_at: Option<chrono::DateTime<chrono::Utc>>,
     outcome: &mut RunOutcome,
     logger: &SessionLogger,
-    devenv: bool,
     branch: &str,
 ) -> Option<String> {
     let mut integration_pr_url = None;
@@ -1585,7 +1609,7 @@ async fn process_verdicts(
                 .await;
             }
             Some("approve") => {
-                if let Some(url) = accept_child(rc, run_id, outcome, logger, devenv, branch, &detail).await {
+                if let Some(url) = accept_child(rc, run_id, outcome, logger, branch, &detail).await {
                     integration_pr_url = Some(url);
                 }
             }
@@ -1696,7 +1720,6 @@ async fn accept_child(
     run_id: i32,
     outcome: &mut RunOutcome,
     logger: &SessionLogger,
-    devenv: bool,
     branch: &str,
     child: &TaskDetail,
 ) -> Option<String> {
@@ -1869,11 +1892,7 @@ async fn accept_child(
                 run_id,
                 outcome,
                 logger,
-                env: AttemptEnv {
-                    cwd: &wt,
-                    devenv,
-                    branch,
-                },
+                env: AttemptEnv { cwd: &wt, branch },
             };
             resolve_conflicts_then_complete(rc, vx, child, &wt, &child_branch, &parent_branch).await;
         }
@@ -2348,7 +2367,6 @@ async fn resolve_conflicts_then_complete(
         let prompt = merge_conflict_nudge_prompt(parent_branch, child_branch, &unmerged);
         let nudge_env = AttemptEnv {
             cwd: wt,
-            devenv: vx.env.devenv,
             branch: vx.env.branch,
         };
         let Some(result) = run_attempt(
