@@ -15,6 +15,7 @@ use crate::{
     driver::AgentDriver,
     logstore::LogStore,
     ports::Ports,
+    question::{QuestionContext, Questioner, execute as question_execute},
     review::{ReviewContext, ReviewTrigger, Reviewer, execute as review_execute},
     run::{self, RunContext, RunKind},
     supervise::{SuperviseContext, SuperviseTrigger, Supervisor, execute as supervise_execute},
@@ -35,6 +36,7 @@ struct RunningEntry {
     cancel: CancellationToken,
     kind: RunKind,
     project_id: i32,
+    question_id: Option<i32>,
     join: JoinHandle<()>,
     /// When the cancel token was first fired; used to enforce the grace period
     /// before a hard abort.
@@ -57,6 +59,9 @@ pub struct Daemon {
     /// The review loop (#142): tickets with `agentReviewRequested` get a
     /// standalone review run.
     reviewer: Reviewer,
+    /// FIFO user Q&A queue. Question runs share the same capacity and
+    /// one-active-run-per-ticket registry as every other run kind.
+    questioner: Questioner,
     /// Long-lived staging environments are independent from per-run containers.
     staging: crate::staging::StagingHandle,
 }
@@ -75,6 +80,7 @@ impl Daemon {
             staging: crate::staging::StagingManager::handle(config.clone(), image_locks),
             supervisor: Supervisor::new(),
             reviewer: Reviewer::new(),
+            questioner: Questioner::new(),
         }
     }
 
@@ -225,7 +231,7 @@ impl Daemon {
                 "in_progress" => Some("implement"),
                 _ => None,
             };
-            if claim_rollback.is_none() && task.task_status != "review" {
+            if claim_rollback.is_none() && !matches!(task.task_status.as_str(), "review" | "plan_review") {
                 continue;
             }
             let runs = match self.client.list_runs(task.id).await {
@@ -238,11 +244,24 @@ impl Daemon {
             let mut orphans = 0;
             for r in runs.into_iter().filter(|r| r.status == "running") {
                 orphans += 1;
+                let body = if r.kind == "question" {
+                    let cancel_requested = self
+                        .client
+                        .task_agent_questions(task.id)
+                        .await
+                        .ok()
+                        .and_then(|questions| questions.into_iter().find(|q| q.run_id == Some(r.id)))
+                        .is_some_and(|q| q.status == "cancel_requested");
+                    if cancel_requested {
+                        crate::client::FinishRunBody::cancelled("cancelled by user during daemon restart".to_string())
+                    } else {
+                        crate::client::FinishRunBody::failed("daemon restart".to_string())
+                    }
+                } else {
+                    crate::client::FinishRunBody::failed("daemon restart".to_string())
+                };
                 self.client
-                    .finish_run(
-                        r.id,
-                        &crate::client::FinishRunBody::failed("daemon restart".to_string()),
-                    )
+                    .finish_run(r.id, &body)
                     .await
                     .map_err(|e| tracing::warn!(run_id = r.id, error = %e, "reconciliation: finish failed"))
                     .ok();
@@ -283,6 +302,13 @@ impl Daemon {
         let review_triggers = self.reviewer.poll(&self.client).await;
         for trigger in review_triggers {
             self.launch_review(trigger).await;
+        }
+        let questions = self.questioner.poll(&self.client).await;
+        for question in questions.cancellations {
+            self.cancel_question(question).await;
+        }
+        for trigger in questions.pending {
+            self.launch_question(trigger).await;
         }
     }
 
@@ -408,12 +434,13 @@ impl Daemon {
                     // `review` for the whole run; a review run likewise lives
                     // on the ticket itself in `review` (#142) — a human moving
                     // it out cancels the run.
-                    RunKind::Supervise | RunKind::Review => "review",
+                    RunKind::Supervise | RunKind::Review | RunKind::Question => "review",
                 };
                 let forward: &[&str] = match entry.kind {
                     RunKind::Plan => &["plan_review", "waiting"],
                     RunKind::Implement => &["review", "waiting"],
                     RunKind::Supervise | RunKind::Review => &["review"],
+                    RunKind::Question => &["plan_review", "review"],
                 };
                 let alive = statuses
                     .get(task_id)
@@ -632,6 +659,7 @@ impl Daemon {
                     cancel,
                     kind,
                     project_id,
+                    question_id: None,
                     join,
                     cancelled_at: None,
                 },
@@ -701,6 +729,7 @@ impl Daemon {
                 cancel,
                 kind: RunKind::Supervise,
                 project_id,
+                question_id: None,
                 join,
                 cancelled_at: None,
             },
@@ -765,10 +794,95 @@ impl Daemon {
                 cancel,
                 kind: RunKind::Review,
                 project_id,
+                question_id: None,
                 join,
                 cancelled_at: None,
             },
         );
+    }
+
+    async fn launch_question(&mut self, trigger: crate::question::QuestionTrigger) {
+        let task_id = trigger.task.id;
+        let question_id = trigger.question.id;
+        let project_id = trigger.task.project_id;
+        if self.running.contains_key(&task_id) {
+            tracing::debug!(
+                task_id,
+                question_id,
+                "question deferred: ticket already has an active run"
+            );
+            return;
+        }
+        if !self.has_capacity(project_id) {
+            tracing::debug!(task_id, question_id, "question deferred at concurrency cap");
+            return;
+        }
+        let project = match self.client.projects().await {
+            Ok(projects) => projects
+                .into_iter()
+                .filter_map(ProjectRepoConfig::from_dto)
+                .find(|p| p.project_id == project_id),
+            Err(e) => {
+                tracing::warn!(task_id, question_id, error = %e, "question: could not load project");
+                return;
+            }
+        };
+        let Some(project) = project else {
+            tracing::warn!(task_id, question_id, "question deferred: project is not agent-managed");
+            return;
+        };
+        let port_block = if self.config.execution.is_isolated() {
+            None
+        } else {
+            let Some(block) = self.ports.allocate() else {
+                tracing::warn!(task_id, question_id, "question deferred: no free port block");
+                return;
+            };
+            Some(block)
+        };
+        let cancel = CancellationToken::new();
+        let qc = QuestionContext {
+            client: self.client.clone(),
+            config: self.config.clone(),
+            driver: self.driver.clone(),
+            trigger,
+            project,
+            port_block,
+            image_locks: self.image_locks.clone(),
+            cancel: cancel.clone(),
+            log_store: self.log_store.clone(),
+        };
+        let join = tokio::spawn(question_execute(qc));
+        self.running.insert(
+            task_id,
+            RunningEntry {
+                cancel,
+                kind: RunKind::Question,
+                project_id,
+                question_id: Some(question_id),
+                join,
+                cancelled_at: None,
+            },
+        );
+    }
+
+    async fn cancel_question(&mut self, question: crate::client::AgentQuestionDto) {
+        if let Some(entry) = self.running.get_mut(&question.task_id)
+            && entry.kind == RunKind::Question
+            && entry.question_id == Some(question.id)
+        {
+            entry.cancel.cancel();
+            entry.cancelled_at.get_or_insert(Instant::now());
+            return;
+        }
+        // Restart/cancel race reconciliation: there is no local driver left to
+        // stop, but the server still has a running question-run to close.
+        if let Some(run_id) = question.run_id {
+            let body = crate::client::FinishRunBody::cancelled("cancelled by user".to_string());
+            if let Err(e) = self.client.finish_run(run_id, &body).await {
+                tracing::warn!(question_id = question.id, run_id, error = %e, "question: cancellation reconciliation failed");
+            }
+        }
     }
 
     /// Global and per-project concurrency caps (spec §5.1).
@@ -907,6 +1021,7 @@ kind = "stub"
             cancel: CancellationToken::new(),
             kind,
             project_id: 1,
+            question_id: None,
             join: tokio::spawn(std::future::pending()),
             cancelled_at,
         }
@@ -986,6 +1101,43 @@ kind = "stub"
             !daemon.running.contains_key(&7),
             "wedged run must be removed by shutdown"
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_requested_question_cancels_the_matching_live_run() {
+        let url = spawn_mock_backend(Vec::new()).await;
+        let mut daemon = test_daemon(&url);
+        let mut entry = running_run_kind(RunKind::Question, None);
+        entry.question_id = Some(9);
+        daemon.running.insert(7, entry);
+        let question = crate::client::AgentQuestionDto {
+            id: 9,
+            task_id: 7,
+            body: "q".to_string(),
+            status: "cancel_requested".to_string(),
+            answer: None,
+            error: None,
+            run_id: Some(42),
+            source_run_id: Some(4),
+            created_at: None,
+        };
+        daemon.cancel_question(question).await;
+        let entry = daemon.running.get(&7).unwrap();
+        assert!(entry.cancel.is_cancelled());
+        assert!(entry.cancelled_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn restart_reconciliation_closes_cancel_requested_question_as_cancelled() {
+        let url = spawn_mock_backend(vec![
+            (200, r#"[{"id":7,"projectId":1,"projectName":"proj","featureId":1,"featureDescription":"feat","title":"t","description":"d","taskStatus":"review","actionsTotal":0,"actionsCompleted":0,"timeSpent":0,"blocked":false}]"#),
+            (200, r#"[{"id":42,"task_id":7,"agent_user_id":2,"kind":"question","status":"running","session_id":"fork","branch":null,"plan":null,"summary":null,"error":null,"pr_url":null,"pr_error":null,"input_tokens":null,"output_tokens":null,"attempt":1}]"#),
+            (200, r#"[{"id":9,"taskId":7,"body":"q","status":"cancel_requested","runId":42,"sourceRunId":4}]"#),
+            (200, r#"{"id":42,"task_id":7,"agent_user_id":2,"kind":"question","status":"cancelled","session_id":"fork","branch":null,"plan":null,"summary":null,"error":"cancelled","pr_url":null,"pr_error":null,"input_tokens":null,"output_tokens":null,"attempt":1}"#),
+        ])
+        .await;
+        let daemon = test_daemon(&url);
+        daemon.reconcile().await;
     }
 
     #[test]

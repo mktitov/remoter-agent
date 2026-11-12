@@ -124,6 +124,58 @@ Projects need no Kimi configuration. To migrate an old project
 `.remoter/kimi-config.toml`, move its contents to `driver.kimi_config`; the
 project template is no longer read.
 
+### Generic ACP adapters (Claude Code and Codex)
+
+`driver.kind = "acp"` uses the same ACP driver without Kimi/OpenCode-specific
+program, session-directory, or model defaults. Set both the adapter command and
+its arguments explicitly. Claude Code and Codex use their adapters' own model
+configuration unless `*_model` keys are set; no Kimi-specific `thinking` value is
+imposed. An explicitly configured `*_thinking` value is sent as ACP `effort` for
+this kind and for OpenCode.
+
+```toml
+# Claude Code (install @zed-industries/claude-agent-acp and authenticate claude)
+[driver]
+kind = "acp"
+agent_program = "claude-agent-acp"
+agent_args = []
+
+# Codex (install @zed-industries/codex-acp and authenticate codex)
+# kind = "acp"
+# agent_program = "codex-acp"
+# agent_args = []
+```
+
+The opt-in conformance suite supports `@zed-industries/claude-agent-acp` and
+`@zed-industries/codex-acp`; each live run prints the exact adapter version into
+its output, which must be recorded with the test result. Kimi conformance is
+pinned to **0.41.0**. A missing adapter binary remains an explicit permanent
+spawn error; the daemon does not silently select another agent.
+
+### User Q&A with `session/fork`
+
+While a ticket is in `plan_review` or `review`, the daemon polls the backend's
+agent-question FIFO and runs one question at a time per ticket within the usual
+global/per-project concurrency limits. If `initialize` advertises
+`sessionCapabilities.fork`, the first answer uses `session/fork` on the selected
+plan/implement session. A follow-up forks the latest successful Q&A session and
+the new fork ID is stored on the question-run. The driver never substitutes a
+source-session resume for a fork.
+
+If fork or a source session is unavailable, a fresh read-only session receives a
+bounded fallback prompt: the original run prompt/log, current plan/diff/report,
+and previous Q&A. Question turns use the `dev-agent-question` MCP role, deny all
+permission requests, and compare HEAD plus tracked/untracked worktree state
+before and after. Any unexpected change fails the answer. They never perform
+status transitions, workflow comments, outcome/report writes, pushes, forge
+calls, or PR creation. The common history prefix can make a provider prompt-cache
+hit possible, but cache reuse is **not guaranteed or asserted** without provider
+usage metrics.
+
+`question_model` and `question_thinking` optionally override the adapter defaults
+for these runs. Backends without the question endpoints disable this poller once,
+without repeated error spam; plan/implement work is unaffected.
+
 At startup the daemon validates the token (`GET /auth/me`) and resolves
 `remoter-mcp` against its own PATH — it exits with a clear error if either
 fails. Then it polls the backend and claims tickets assigned to its agent
@@ -372,6 +424,10 @@ cargo test -p remoter-agent --test acp_kimi -- --ignored --nocapture
 #   ↑ live conformance against the pinned kimi version (spec §5.5); the test
 #     refuses to run against any other version — bump PINNED_KIMI_VERSION
 #     deliberately after re-validating.
+# Shared fork/isolation conformance for all supported adapters (authenticated):
+cargo test -p remoter-agent --test acp_fork_live -- --ignored --nocapture --test-threads=1
+# Individual tests: kimi_fork_conformance, opencode_fork_conformance,
+# claude_code_fork_conformance, codex_fork_conformance.
 
 # Real NixOS bwrap/Nix daemon/network/devenv/Postgres/Flutter/lifecycle suite:
 devenv shell --no-tui --no-eval-cache -- \

@@ -48,6 +48,7 @@ impl AgentDriver for StubDriver {
             "review" => {
                 "Dry-run review: reviewed the ticket diff and report (no verdict written — dry-run driver).".to_string()
             }
+            "question" => "Dry-run question: answered without changing the worktree.".to_string(),
             _ => {
                 if self.simulate_uncommitted_changes && spec.resume_session.is_none() {
                     leave_stub_untracked(&spec).await?;
@@ -59,8 +60,13 @@ impl AgentDriver for StubDriver {
             }
         };
         let (model, thinking) = outcome_model_thinking(&spec.config_options);
+        let session_id = if spec.kind == "question" {
+            format!("stub-question-{}-{}", spec.run_id, std::process::id())
+        } else {
+            format!("stub-session-{}", std::process::id())
+        };
         Ok(RunOutcome {
-            session_id: Some(format!("stub-session-{}", std::process::id())),
+            session_id: Some(session_id),
             text,
             input_tokens: Some(0),
             output_tokens: Some(0),
@@ -131,7 +137,7 @@ fn outcome_model_thinking(options: &[(String, String)]) -> (Option<String>, Opti
     for (id, value) in options {
         match id.as_str() {
             "model" => model = Some(value.clone()),
-            "thinking" => thinking = Some(value.clone()),
+            "thinking" | "effort" => thinking = Some(value.clone()),
             _ => {}
         }
     }

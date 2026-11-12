@@ -395,6 +395,36 @@ pub struct AgentRunDto {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// One user question for the agent (`agent_questions`, camelCase API DTO).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentQuestionDto {
+    pub id: i32,
+    pub task_id: i32,
+    pub body: String,
+    pub status: String,
+    #[serde(default)]
+    pub answer: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<i32>,
+    #[serde(default)]
+    pub source_run_id: Option<i32>,
+    #[serde(default)]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The server-side result of atomically starting a question. `run` and
+/// `source_run` are resolved from the run history when the endpoint returns
+/// only the updated question row.
+#[derive(Debug, Clone)]
+pub struct StartedQuestion {
+    pub question: AgentQuestionDto,
+    pub run: AgentRunDto,
+    pub source_run: Option<AgentRunDto>,
+}
+
 /// `PATCH /agent-runs/{id}` body (camelCase, mirrors the backend's `FinishRun`).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -456,6 +486,13 @@ impl FinishRunBody {
             output_tokens: None,
             model: None,
             thinking: None,
+        }
+    }
+
+    pub fn cancelled(error: String) -> Self {
+        Self {
+            status: "cancelled",
+            ..Self::failed(error)
         }
     }
 }
@@ -692,6 +729,85 @@ impl RemoterClient {
     pub async fn list_runs(&self, task_id: i32) -> Result<Vec<AgentRunDto>, ClientError> {
         self.get(&format!("{}/api/v1/tasks/{task_id}/agent-runs", self.base_url))
             .await
+    }
+
+    pub async fn agent_question_queue(&self, status: &str) -> Result<Vec<AgentQuestionDto>, ClientError> {
+        self.get(&format!(
+            "{}/api/v1/agent-questions?assignee=me&status={status}",
+            self.base_url
+        ))
+        .await
+    }
+
+    pub async fn task_agent_questions(&self, task_id: i32) -> Result<Vec<AgentQuestionDto>, ClientError> {
+        self.get(&format!("{}/api/v1/tasks/{task_id}/agent-questions", self.base_url))
+            .await
+    }
+
+    /// Atomically claims a pending question and resolves both the new
+    /// question-run and the backend-selected source run. The backend may
+    /// return either the updated question or an object embedding `question`,
+    /// `run`, and `sourceRun`; older shapes are normalized here.
+    pub async fn start_agent_question(&self, pending: &AgentQuestionDto) -> Result<StartedQuestion, ClientError> {
+        let resp = self
+            .auth_request(
+                self.http
+                    .post(format!("{}/api/v1/agent-questions/{}/run", self.base_url, pending.id)),
+            )
+            .send()
+            .await
+            .map_err(ClientError::transport)?;
+        let value: serde_json::Value = Self::decode(resp).await?;
+        let question_value = value.get("question").cloned().unwrap_or_else(|| value.clone());
+        let mut question =
+            serde_json::from_value::<AgentQuestionDto>(question_value).unwrap_or_else(|_| pending.clone());
+        let embedded_run = value.get("run").cloned().or_else(|| {
+            value
+                .get("kind")
+                .and_then(|k| k.as_str())
+                .filter(|kind| *kind == "question")
+                .map(|_| value.clone())
+        });
+        let run = match embedded_run {
+            Some(v) => serde_json::from_value::<AgentRunDto>(v).map_err(|e| ClientError {
+                status: None,
+                message: format!("could not decode started question-run: {e}"),
+            })?,
+            None => {
+                let run_id = question.run_id.ok_or_else(|| ClientError {
+                    status: None,
+                    message: "question start response contains neither run nor runId".to_string(),
+                })?;
+                self.list_runs(pending.task_id)
+                    .await?
+                    .into_iter()
+                    .find(|r| r.id == run_id)
+                    .ok_or_else(|| ClientError {
+                        status: None,
+                        message: format!("started question-run {run_id} is absent from task run history"),
+                    })?
+            }
+        };
+        question.run_id = Some(run.id);
+        let source_run_id = question.source_run_id.or(pending.source_run_id);
+        let source_run = match value.get("sourceRun").or_else(|| value.get("source_run")) {
+            Some(v) => Some(
+                serde_json::from_value::<AgentRunDto>(v.clone()).map_err(|e| ClientError {
+                    status: None,
+                    message: format!("could not decode question source run: {e}"),
+                })?,
+            ),
+            None => match source_run_id {
+                Some(id) => self.list_runs(pending.task_id).await?.into_iter().find(|r| r.id == id),
+                None => None,
+            },
+        };
+        question.source_run_id = source_run.as_ref().map(|r| r.id).or(source_run_id);
+        Ok(StartedQuestion {
+            question,
+            run,
+            source_run,
+        })
     }
 
     // ── helpers ─────────────────────────────────────────────────────────

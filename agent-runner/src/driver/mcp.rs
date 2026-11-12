@@ -61,6 +61,7 @@ fn remoter_mcp(
         RunKind::Implement => "dev-agent-implement",
         RunKind::Supervise => "dev-agent-supervise",
         RunKind::Review => "dev-agent-review",
+        RunKind::Question => "dev-agent-question",
     };
     let mut env = vec![
         EnvVariable::new("REMOTER_API_URL", api_url),

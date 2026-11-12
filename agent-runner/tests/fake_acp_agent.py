@@ -42,10 +42,12 @@ Env knobs:
 
 import json
 import os
+import re
 import subprocess
 import sys
 
 capture_path = os.environ.get("FAKE_AGENT_CAPTURE")
+state_path = os.environ.get("FAKE_AGENT_STATE")
 hang = os.environ.get("FAKE_AGENT_HANG") == "1"
 hang_marker = os.environ.get("FAKE_AGENT_HANG_MARKER")
 ignore_cancel = os.environ.get("FAKE_AGENT_IGNORE_CANCEL") == "1"
@@ -54,6 +56,8 @@ quota = os.environ.get("FAKE_AGENT_QUOTA") == "1"
 exit_on_prompt = os.environ.get("FAKE_AGENT_EXIT_ON_PROMPT") == "1"
 empty = os.environ.get("FAKE_AGENT_EMPTY") == "1"
 no_allow = os.environ.get("FAKE_AGENT_NO_ALLOW") == "1"
+no_fork = os.environ.get("FAKE_AGENT_NO_FORK") == "1"
+echo_context = os.environ.get("FAKE_AGENT_ECHO_CONTEXT") == "1"
 fail_prompt_on_session = [
     s for s in os.environ.get("FAKE_AGENT_FAIL_PROMPT_ON_SESSION", "").split(",") if s
 ]
@@ -126,10 +130,22 @@ def chunk(session_id, text):
     })
 
 
+def prompt_text(prompt_msg):
+    return "\n".join(
+        block.get("text", "")
+        for block in prompt_msg["params"].get("prompt", [])
+        if block.get("type") == "text"
+    )
+
+
 def finish_turn(prompt_msg):
     sid = prompt_msg["params"]["sessionId"]
+    reply = "world"
+    if echo_context:
+        markers = re.findall(r"SECRET-[A-Za-z0-9-]+", "\n".join(histories.get(sid, [])))
+        reply = markers[-1] if markers else "NO_CONTEXT"
     if not empty:
-        chunk(sid, "world")
+        chunk(sid, reply)
     send({
         "jsonrpc": "2.0",
         "id": prompt_msg["id"],
@@ -143,6 +159,20 @@ def finish_turn(prompt_msg):
 next_req = 0
 pending = {}  # our request id -> ("permission" | "elicitation", prompt_msg)
 session_count = 0
+histories = {"known-session": []}
+if state_path and os.path.exists(state_path):
+    with open(state_path) as f:
+        state = json.load(f)
+    session_count = state["session_count"]
+    histories = state["histories"]
+
+
+def save_state():
+    if state_path:
+        with open(state_path, "w") as f:
+            json.dump({"session_count": session_count, "histories": histories}, f)
+
+
 hung_prompt = None  # session/prompt msg being hung (FAKE_AGENT_HANG)
 
 for line in sys.stdin:
@@ -178,21 +208,41 @@ for line in sys.stdin:
 
     method = msg["method"]
     if method == "initialize":
+        capabilities = {} if no_fork else {"sessionCapabilities": {"fork": {}}}
         send({"jsonrpc": "2.0", "id": msg["id"],
-              "result": {"protocolVersion": 1, "agentCapabilities": {}}})
+              "result": {"protocolVersion": 1, "agentCapabilities": capabilities}})
     elif method == "session/new":
         session_count += 1
+        sid = "sess-%d" % session_count
+        histories[sid] = []
+        save_state()
         record({"session_new": {
+            "sessionId": sid,
             "cwd": msg["params"].get("cwd"),
             "mcpServers": msg["params"].get("mcpServers", []),
         }})
         send({"jsonrpc": "2.0", "id": msg["id"], "result": {
-            "sessionId": "sess-%d" % session_count,
+            "sessionId": sid,
+            "configOptions": config_options(),
+        }})
+    elif method == "session/fork":
+        source = msg["params"].get("sessionId")
+        if source not in histories:
+            send({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32002, "message": "no such session"}})
+            continue
+        session_count += 1
+        sid = "sess-%d" % session_count
+        histories[sid] = list(histories[source])
+        save_state()
+        record({"session_fork": {"source": source, "sessionId": sid, "inherited": list(histories[source])}})
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {
+            "sessionId": sid,
             "configOptions": config_options(),
         }})
     elif method == "session/resume":
-        record({"session_resume": msg["params"].get("sessionId")})
-        if msg["params"].get("sessionId") == "known-session":
+        sid = msg["params"].get("sessionId")
+        record({"session_resume": sid})
+        if sid in histories:
             send({"jsonrpc": "2.0", "id": msg["id"], "result": {
                 "configOptions": config_options(),
             }})
@@ -232,7 +282,9 @@ for line in sys.stdin:
             subprocess.Popen(["sleep", "60"], stdin=subprocess.DEVNULL, stdout=sys.stdout, stderr=subprocess.DEVNULL)
             os._exit(1)
         sid = msg["params"]["sessionId"]
-        record({"prompt": msg["params"].get("prompt")})
+        histories.setdefault(sid, []).append(prompt_text(msg))
+        save_state()
+        record({"prompt": msg["params"].get("prompt"), "sessionId": sid, "history": list(histories[sid])})
         if quota:
             record({"prompt_quota": sid})
             send({"jsonrpc": "2.0", "id": msg["id"],
@@ -245,7 +297,7 @@ for line in sys.stdin:
                   "error": {"code": -32603,
                             "message": "400 total message size exceeds limit"}})
             continue
-        if not empty:
+        if not empty and not echo_context:
             chunk(sid, "Hello, ")
         # Reject is listed first: the driver must still pick the allow option.
         options = (

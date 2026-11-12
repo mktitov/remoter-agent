@@ -35,6 +35,7 @@ pub enum RunKind {
     Implement,
     Supervise,
     Review,
+    Question,
 }
 
 impl RunKind {
@@ -44,6 +45,7 @@ impl RunKind {
             RunKind::Implement => "implement",
             RunKind::Supervise => "supervise",
             RunKind::Review => "review",
+            RunKind::Question => "question",
         }
     }
 
@@ -54,8 +56,7 @@ impl RunKind {
         match self {
             RunKind::Plan => "plan_review",
             RunKind::Implement => "review",
-            RunKind::Supervise => "review",
-            RunKind::Review => "review",
+            RunKind::Supervise | RunKind::Review | RunKind::Question => "review",
         }
     }
 
@@ -68,8 +69,7 @@ impl RunKind {
         match self {
             RunKind::Plan => "todo",
             RunKind::Implement => "implement",
-            RunKind::Supervise => "review",
-            RunKind::Review => "review",
+            RunKind::Supervise | RunKind::Review | RunKind::Question => "review",
         }
     }
 
@@ -83,8 +83,7 @@ impl RunKind {
         match self {
             RunKind::Plan => "plan_review",
             RunKind::Implement => "review",
-            RunKind::Supervise => "review",
-            RunKind::Review => "review",
+            RunKind::Supervise | RunKind::Review | RunKind::Question => "review",
         }
     }
 }
@@ -568,7 +567,7 @@ pub async fn execute(rc: RunContext) {
                     }
                     // Supervise and review runs never reach run::execute — they
                     // have their own lifecycles in supervise.rs / review.rs.
-                    RunKind::Supervise | RunKind::Review => {
+                    RunKind::Supervise | RunKind::Review | RunKind::Question => {
                         unreachable!("supervise/review runs use supervise::execute / review::execute")
                     }
                 }
@@ -789,6 +788,8 @@ async fn attempt_run(
         prompt: prompt.to_string(),
         kind: rc.kind.as_str(),
         resume_session: resume_session.clone(),
+        fork_session: None,
+        fallback_prompt: None,
         branch: branch.to_string(),
         env: env.clone(),
         exec: exec_env(&rc.config, run_id, prepared.devenv),
@@ -868,6 +869,8 @@ async fn ensure_clean_worktree(
             prompt: nudge_prompt.clone(),
             kind: rc.kind.as_str(),
             resume_session: merged.session_id.clone(),
+            fork_session: None,
+            fallback_prompt: None,
             branch: branch.to_string(),
             env: env.clone(),
             exec: exec_env(&rc.config, run_id, devenv),
@@ -923,7 +926,9 @@ fn dirty_nudge_prompt(kind: RunKind, status: &str) -> String {
         ),
         // Supervise/review runs never nudge dirty worktrees (their lifecycles
         // live outside run::execute).
-        RunKind::Supervise | RunKind::Review => unreachable!("supervise/review runs never nudge dirty worktrees"),
+        RunKind::Supervise | RunKind::Review | RunKind::Question => {
+            unreachable!("supervise/review runs never nudge dirty worktrees")
+        }
     }
 }
 
@@ -1004,6 +1009,8 @@ async fn ensure_final_actions(
             prompt,
             kind: rc.kind.as_str(),
             resume_session: merged.session_id.clone(),
+            fork_session: None,
+            fallback_prompt: None,
             branch: branch.to_string(),
             env: env.clone(),
             exec: exec_env(&rc.config, run_id, devenv),
@@ -1395,7 +1402,7 @@ async fn escalate(rc: &RunContext, run_id: i32, reason: &str, attempt: u32) {
 /// run from resuming.
 fn resume_session_for(kind: RunKind, runs: &[crate::client::AgentRunDto]) -> Option<String> {
     runs.iter()
-        .find(|r| r.kind != crate::supervise::SUPERVISE_RUN_KIND)
+        .find(|r| !matches!(r.kind.as_str(), "supervise" | "question"))
         .filter(|r| r.status == "succeeded" && r.kind == kind.as_str())
         .and_then(|r| r.session_id.clone())
 }
@@ -1707,7 +1714,7 @@ fn render_prompt(
                     ));
                 }
                 // Supervise/review runs never render through this prompt builder.
-                RunKind::Supervise | RunKind::Review => {}
+                RunKind::Supervise | RunKind::Review | RunKind::Question => {}
             }
         }
         p.push('\n');
@@ -1750,7 +1757,7 @@ fn render_prompt(
             ),
             // Review runs are read-only like supervise: questions are shown
             // for context but the reviewer must not be nudged to edit them.
-            RunKind::Supervise | RunKind::Review => {}
+            RunKind::Supervise | RunKind::Review | RunKind::Question => {}
         }
     }
     // Earlier plans/summaries/errors, newest first, capped (spec §5.6). The
@@ -1891,7 +1898,7 @@ fn render_prompt(
         }
         // Supervise/review runs never render through this prompt builder —
         // their prompts are built in supervise.rs / review.rs.
-        RunKind::Supervise | RunKind::Review => {}
+        RunKind::Supervise | RunKind::Review | RunKind::Question => {}
     }
     p
 }
@@ -2251,6 +2258,8 @@ async fn rebase_nudge_loop(
             prompt,
             kind: rc.kind.as_str(),
             resume_session: outcome.session_id.clone(),
+            fork_session: None,
+            fallback_prompt: None,
             branch: branch.to_string(),
             env: env.to_vec(),
             exec: exec_env(&rc.config, run_id, devenv),
@@ -3027,6 +3036,18 @@ mod tests {
 
         let impl_ok = run_row(3, "implement", "succeeded", Some("sess-impl".into()), None);
         assert_eq!(resume_session_for(RunKind::Plan, &[impl_ok]), None);
+    }
+
+    #[test]
+    fn resume_session_ignores_question_runs() {
+        let runs = vec![
+            run_row(4, "question", "succeeded", Some("question-fork".into()), None),
+            run_row(3, "implement", "succeeded", Some("sess-impl".into()), None),
+        ];
+        assert_eq!(
+            resume_session_for(RunKind::Implement, &runs),
+            Some("sess-impl".to_string())
+        );
     }
 
     /// A retry after a failure never resumes: the newest run is failed, even

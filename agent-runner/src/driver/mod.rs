@@ -37,8 +37,15 @@ pub struct RunSpec {
     pub kind: &'static str,
     /// The ACP session to resume (only bounce review → implement and re-plan
     /// runs resume — the previous run's session of the same kind, spec §5.4);
-    /// `None` = fresh session.
+    /// `None` = fresh session. Never used for question runs.
     pub resume_session: Option<String>,
+    /// Source session for `session/fork` (question runs only). This is a
+    /// separate channel from resume: a question must never continue the
+    /// source conversation itself.
+    pub fork_session: Option<String>,
+    /// Self-contained read-only context for a fresh fallback session when
+    /// fork is unavailable. Non-question runs leave this unset.
+    pub fallback_prompt: Option<String>,
     /// Working branch (`agent/task-<id>-<slug>`) — for drivers that need it.
     pub branch: String,
     /// Extra env for the agent process (and its devenv services):
@@ -173,7 +180,7 @@ pub fn from_config(
             cfg.simulate_delay_ms,
             cfg.simulate_uncommitted_changes,
         ))),
-        "kimi-acp" | "opencode-acp" => Ok(std::sync::Arc::new(acp::AcpDriver::new(
+        "acp" | "kimi-acp" | "opencode-acp" => Ok(std::sync::Arc::new(acp::AcpDriver::new(
             cfg,
             api_url,
             token,
@@ -181,6 +188,8 @@ pub fn from_config(
             stall_idle_secs,
             stall_grace_secs,
         ))),
-        other => anyhow::bail!("unknown driver kind {other:?} (expected \"stub\", \"kimi-acp\", or \"opencode-acp\")"),
+        other => anyhow::bail!(
+            "unknown driver kind {other:?} (expected \"stub\", \"acp\", \"kimi-acp\", or \"opencode-acp\")"
+        ),
     }
 }
