@@ -1141,9 +1141,12 @@ pub(crate) fn exec_env(config: &Config, run_id: i32, commands: &crate::project::
             agent_home: config.execution.agent_home(&config.workspace_root),
             state_root: config.workspace_root.join("bwrap"),
             env_wrap: commands.env_wrap.clone(),
+            processes_detect: commands.processes_detect.clone(),
             services_up: commands.services_up.clone(),
             services_wait: commands.services_wait.clone(),
             services_down: commands.services_down.clone(),
+            services_up_if_processes: commands.services_up_if_processes,
+            services_wait_if_processes: commands.services_wait_if_processes,
             retained_commands: (config.driver.kind != "stub")
                 .then(|| config.driver.remoter_mcp_command.clone())
                 .into_iter()
@@ -1271,7 +1274,8 @@ pub(crate) async fn start_container_runtime(
     Ok(Some(RunRuntime::Container(containers)))
 }
 
-/// Runs the project's service and readiness argv directly inside the container.
+/// Runs service and readiness argv inside the container. Only the inherited
+/// `just db-up` receives its legacy devenv wrapper; explicit commands stay direct.
 async fn container_services(
     config: &Config,
     run_id: i32,
@@ -1282,7 +1286,16 @@ async fn container_services(
         let Some(program) = argv.first() else {
             continue;
         };
-        let exec = exec_env(config, run_id, &crate::project::ProjectCommands::default());
+        let env_wrap = if name == "up" {
+            commands.services_up_wrap.clone()
+        } else {
+            Vec::new()
+        };
+        let exec_commands = crate::project::ProjectCommands {
+            env_wrap,
+            ..Default::default()
+        };
+        let exec = exec_env(config, run_id, &exec_commands);
         let args = argv[1..].iter().map(String::as_str).collect::<Vec<_>>();
         let cmd = workspace::wrap_command(Path::new("/"), &exec, program, &args, env);
         let out = tokio::process::Command::from(cmd)
@@ -2476,7 +2489,7 @@ mod tests {
     use crate::client::{AgentRunDto, CommentDto};
 
     #[tokio::test]
-    async fn container_services_run_project_up_then_wait_without_agent_wrapper() {
+    async fn container_services_use_legacy_wrap_only_for_inherited_up() {
         let dir = std::env::temp_dir().join(format!("remoter-container-services-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2506,6 +2519,7 @@ kind = "stub"
             services_wait: vec!["project-wait".to_string()],
             services_down: vec!["project-down".to_string()],
             image_init: vec![],
+            ..Default::default()
         };
         container_services(&config, 77, &[], &commands).await.unwrap();
         let calls = std::fs::read_to_string(&log).unwrap();
@@ -2521,6 +2535,23 @@ kind = "stub"
         );
         assert!(
             !calls.contains("must-not-wrap") && !calls.contains("just db-up"),
+            "{calls}"
+        );
+
+        let legacy_dir = dir.join("legacy");
+        std::fs::create_dir(&legacy_dir).unwrap();
+        std::fs::write(legacy_dir.join("devenv.nix"), "").unwrap();
+        std::fs::write(legacy_dir.join("justfile"), "").unwrap();
+        let legacy = crate::project::ProjectConfig::default()
+            .commands_for(crate::config::ExecutionMode::Container, &legacy_dir, &[])
+            .await
+            .unwrap();
+        std::fs::write(&log, "").unwrap();
+        container_services(&config, 77, &[], &legacy).await.unwrap();
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(calls.lines().count(), 1, "{calls}");
+        assert!(
+            calls.contains("devenv shell --no-tui --no-eval-cache -- just db-up"),
             "{calls}"
         );
         std::fs::remove_dir_all(&dir).unwrap();

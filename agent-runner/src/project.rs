@@ -33,6 +33,13 @@ pub struct ProjectCommands {
     pub services_wait: Vec<String>,
     pub services_down: Vec<String>,
     pub image_init: Vec<String>,
+    /// Lazy legacy detection executed only inside the bwrap guest.
+    pub processes_detect: Vec<String>,
+    pub services_up_if_processes: bool,
+    pub services_wait_if_processes: bool,
+    /// Legacy container `just db-up` needs the project devenv environment;
+    /// explicitly configured service commands leave this empty.
+    pub services_up_wrap: Vec<String>,
 }
 
 impl ProjectConfig {
@@ -123,12 +130,9 @@ impl ProjectConfig {
     {
         let raw = &self.commands;
         let devenv = uses_devenv(worktree);
+        let needs_process_detection = devenv && (raw.services_up.is_none() || raw.services_wait.is_none());
         let legacy_processes = match mode {
-            ExecutionMode::Host | ExecutionMode::Bwrap
-                if devenv && (raw.services_up.is_none() || raw.services_wait.is_none()) =>
-            {
-                detect_processes().await?
-            }
+            ExecutionMode::Host if needs_process_detection => detect_processes().await?,
             _ => false,
         };
         let env_wrap = raw.env_wrap.clone().unwrap_or_else(|| {
@@ -144,14 +148,16 @@ impl ProjectConfig {
             }
         });
         let services_up = raw.services_up.clone().unwrap_or_else(|| match mode {
-            ExecutionMode::Host | ExecutionMode::Bwrap if legacy_processes => {
-                argv(&["devenv", "--no-eval-cache", "up", "-d"])
-            }
+            ExecutionMode::Host if legacy_processes => argv(&["devenv", "--no-eval-cache", "up", "-d"]),
+            ExecutionMode::Bwrap if devenv => argv(&["devenv", "--no-eval-cache", "up", "-d"]),
             ExecutionMode::Container if devenv && has_justfile(worktree) => argv(&["just", "db-up"]),
             _ => Vec::new(),
         });
         let services_wait = raw.services_wait.clone().unwrap_or_else(|| match mode {
-            ExecutionMode::Host | ExecutionMode::Bwrap if legacy_processes => {
+            ExecutionMode::Host if legacy_processes => {
+                argv(&["devenv", "--no-eval-cache", "processes", "wait", "--timeout", "120"])
+            }
+            ExecutionMode::Bwrap if devenv => {
                 argv(&["devenv", "--no-eval-cache", "processes", "wait", "--timeout", "120"])
             }
             _ => Vec::new(),
@@ -162,12 +168,29 @@ impl ProjectConfig {
             }
             _ => Vec::new(),
         });
+        let processes_detect = if mode == ExecutionMode::Bwrap && needs_process_detection {
+            argv(&["devenv", "--no-eval-cache", "eval", "processes"])
+        } else {
+            Vec::new()
+        };
+        let services_up_if_processes = mode == ExecutionMode::Bwrap && devenv && raw.services_up.is_none();
+        let services_wait_if_processes = mode == ExecutionMode::Bwrap && devenv && raw.services_wait.is_none();
+        let services_up_wrap =
+            if mode == ExecutionMode::Container && raw.services_up.is_none() && devenv && has_justfile(worktree) {
+                argv(&["devenv", "shell", "--no-tui", "--no-eval-cache", "--"])
+            } else {
+                Vec::new()
+            };
         Ok(ProjectCommands {
             env_wrap,
             services_up,
             services_wait,
             services_down,
             image_init: self.image_init(worktree),
+            processes_detect,
+            services_up_if_processes,
+            services_wait_if_processes,
+            services_up_wrap,
         })
     }
 
@@ -408,6 +431,10 @@ mod tests {
                     "sh",
                     "/opt/agent-init.sh",
                 ]),
+                processes_detect: vec![],
+                services_up_if_processes: false,
+                services_wait_if_processes: false,
+                services_up_wrap: argv(&["devenv", "shell", "--no-tui", "--no-eval-cache", "--"]),
             }
         );
     }
@@ -449,46 +476,78 @@ mod tests {
                 services_wait: vec![],
                 services_down: vec![],
                 image_init: vec![],
+                processes_detect: vec![],
+                services_up_if_processes: false,
+                services_wait_if_processes: false,
+                services_up_wrap: vec![],
             }
         );
     }
 
     #[tokio::test]
-    async fn host_and_bwrap_defaults_follow_detected_processes() {
-        for mode in [ExecutionMode::Host, ExecutionMode::Bwrap] {
-            let dir = TestDir::new();
-            std::fs::write(dir.path().join("devenv.yaml"), "").unwrap();
-            let commands = ProjectConfig::default()
-                .commands_for_with_detector(mode, dir.path(), || async { Ok(true) })
-                .await
-                .unwrap();
-            let expected_wrap = match mode {
-                ExecutionMode::Host => argv(&["devenv", "shell", "--no-tui", "--no-eval-cache", "--"]),
-                ExecutionMode::Bwrap => argv(&["devenv", "--no-eval-cache", "shell", "--no-tui", "--"]),
-                ExecutionMode::Container => unreachable!(),
-            };
-            assert_eq!(commands.env_wrap, expected_wrap);
-            assert_eq!(commands.services_up, argv(&["devenv", "--no-eval-cache", "up", "-d"]));
-            assert_eq!(
-                commands.services_wait,
-                argv(&["devenv", "--no-eval-cache", "processes", "wait", "--timeout", "120"])
-            );
-            assert_eq!(
-                commands.services_down,
-                argv(&["devenv", "--no-eval-cache", "processes", "down"])
-            );
+    async fn host_defaults_follow_detected_processes() {
+        let dir = TestDir::new();
+        std::fs::write(dir.path().join("devenv.yaml"), "").unwrap();
+        let commands = ProjectConfig::default()
+            .commands_for_with_detector(ExecutionMode::Host, dir.path(), || async { Ok(true) })
+            .await
+            .unwrap();
+        assert_eq!(
+            commands.env_wrap,
+            argv(&["devenv", "shell", "--no-tui", "--no-eval-cache", "--"])
+        );
+        assert_eq!(commands.services_up, argv(&["devenv", "--no-eval-cache", "up", "-d"]));
+        assert_eq!(
+            commands.services_wait,
+            argv(&["devenv", "--no-eval-cache", "processes", "wait", "--timeout", "120"])
+        );
+        assert_eq!(
+            commands.services_down,
+            argv(&["devenv", "--no-eval-cache", "processes", "down"])
+        );
 
-            let commands = ProjectConfig::default()
-                .commands_for_with_detector(mode, dir.path(), || async { Ok(false) })
-                .await
-                .unwrap();
-            assert!(commands.services_up.is_empty());
-            assert!(commands.services_wait.is_empty());
-            assert_eq!(
-                commands.services_down,
-                argv(&["devenv", "--no-eval-cache", "processes", "down"])
-            );
-        }
+        let commands = ProjectConfig::default()
+            .commands_for_with_detector(ExecutionMode::Host, dir.path(), || async { Ok(false) })
+            .await
+            .unwrap();
+        assert!(commands.services_up.is_empty());
+        assert!(commands.services_wait.is_empty());
+        assert_eq!(
+            commands.services_down,
+            argv(&["devenv", "--no-eval-cache", "processes", "down"])
+        );
+    }
+
+    #[tokio::test]
+    async fn bwrap_defaults_are_lazy_in_guest() {
+        let dir = TestDir::new();
+        std::fs::write(dir.path().join("devenv.yaml"), "").unwrap();
+        let commands = ProjectConfig::default()
+            .commands_for_with_detector(ExecutionMode::Bwrap, dir.path(), || async {
+                Err(DriverError::Permanent(
+                    "host process detection is forbidden".to_string(),
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            commands.env_wrap,
+            argv(&["devenv", "--no-eval-cache", "shell", "--no-tui", "--"])
+        );
+        assert_eq!(
+            commands.processes_detect,
+            argv(&["devenv", "--no-eval-cache", "eval", "processes"])
+        );
+        assert_eq!(commands.services_up, argv(&["devenv", "--no-eval-cache", "up", "-d"]));
+        assert_eq!(
+            commands.services_wait,
+            argv(&["devenv", "--no-eval-cache", "processes", "wait", "--timeout", "120"])
+        );
+        assert!(commands.services_up_if_processes && commands.services_wait_if_processes);
+        assert_eq!(
+            commands.services_down,
+            argv(&["devenv", "--no-eval-cache", "processes", "down"])
+        );
     }
 
     #[tokio::test]

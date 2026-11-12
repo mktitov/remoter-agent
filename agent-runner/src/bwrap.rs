@@ -33,9 +33,12 @@ struct LaunchOptions {
     state_root: PathBuf,
     worktree: PathBuf,
     env_wrap: Vec<String>,
+    processes_detect: Vec<String>,
     services_up: Vec<String>,
     services_wait: Vec<String>,
     services_down: Vec<String>,
+    services_up_if_processes: bool,
+    services_wait_if_processes: bool,
     retain: Vec<String>,
     env: Vec<(String, String)>,
     command: Vec<String>,
@@ -432,9 +435,12 @@ fn parse_args(args: &[String]) -> anyhow::Result<LaunchOptions> {
     let mut state_root = None;
     let mut worktree = None;
     let mut env_wrap = None;
+    let mut processes_detect = None;
     let mut services_up = None;
     let mut services_wait = None;
     let mut services_down = None;
+    let mut services_up_if_processes = None;
+    let mut services_wait_if_processes = None;
     let mut retain = Vec::new();
     let mut environment = Vec::new();
     let mut index = 0;
@@ -468,9 +474,12 @@ fn parse_args(args: &[String]) -> anyhow::Result<LaunchOptions> {
             "--state-root" => &mut state_root,
             "--worktree" => &mut worktree,
             "--env-wrap" => &mut env_wrap,
+            "--processes-detect" => &mut processes_detect,
             "--services-up" => &mut services_up,
             "--services-wait" => &mut services_wait,
             "--services-down" => &mut services_down,
+            "--services-up-if-processes" => &mut services_up_if_processes,
+            "--services-wait-if-processes" => &mut services_wait_if_processes,
             _ => bail!("unknown launcher option {option}"),
         };
         if slot.replace(value.to_string()).is_some() {
@@ -502,9 +511,12 @@ fn parse_args(args: &[String]) -> anyhow::Result<LaunchOptions> {
         state_root,
         worktree,
         env_wrap: parse_command_option(env_wrap, "--env-wrap")?,
+        processes_detect: parse_command_option(processes_detect, "--processes-detect")?,
         services_up: parse_command_option(services_up, "--services-up")?,
         services_wait: parse_command_option(services_wait, "--services-wait")?,
         services_down: parse_command_option(services_down, "--services-down")?,
+        services_up_if_processes: parse_bool_option(services_up_if_processes, "--services-up-if-processes")?,
+        services_wait_if_processes: parse_bool_option(services_wait_if_processes, "--services-wait-if-processes")?,
         retain,
         env: environment,
         command: command.to_vec(),
@@ -520,9 +532,12 @@ fn option_value<'a>(args: &'a [String], index: usize, option: &str) -> anyhow::R
             | "--state-root"
             | "--worktree"
             | "--env-wrap"
+            | "--processes-detect"
             | "--services-up"
             | "--services-wait"
             | "--services-down"
+            | "--services-up-if-processes"
+            | "--services-wait-if-processes"
             | "--retain"
             | "--env"
     ) {
@@ -542,6 +557,14 @@ fn parse_command_option(value: Option<String>, option: &str) -> anyhow::Result<V
         bail!("{option} executable must not be empty");
     }
     Ok(command)
+}
+
+fn parse_bool_option(value: Option<String>, option: &str) -> anyhow::Result<bool> {
+    match required_option(value, option)?.as_str() {
+        "1" => Ok(true),
+        "0" => Ok(false),
+        _ => bail!("{option} must be 0 or 1"),
+    }
 }
 
 fn required_option(value: Option<String>, name: &str) -> anyhow::Result<String> {
@@ -711,6 +734,7 @@ fn retain_store_paths(options: &LaunchOptions, run_dir: &Path) -> anyhow::Result
     }
     let configured = [
         &options.env_wrap,
+        &options.processes_detect,
         &options.services_up,
         &options.services_wait,
         &options.services_down,
@@ -908,6 +932,7 @@ fn positional_argv(command: &[String], next: &mut usize) -> String {
 fn guest_script(options: &LaunchOptions) -> String {
     let mut next = 1;
     let env_wrap = positional_argv(&options.env_wrap, &mut next);
+    let processes_detect = positional_argv(&options.processes_detect, &mut next);
     let services_up = positional_argv(&options.services_up, &mut next);
     let services_wait = positional_argv(&options.services_wait, &mut next);
     let services_down = positional_argv(&options.services_down, &mut next);
@@ -924,11 +949,28 @@ fn guest_script(options: &LaunchOptions) -> String {
         ));
         script.push_str(&format!("{services_down} >&2 || :\n"));
     }
+    if !options.processes_detect.is_empty() {
+        script.push_str(&format!(
+            "processes=$({processes_detect}) || exit\nprocesses=$(printf '%s' \"$processes\" | tr -d '[:space:]')\n"
+        ));
+    }
     if !options.services_up.is_empty() {
+        if options.services_up_if_processes {
+            script.push_str("if [ \"$processes\" != '{\"processes\":{}}' ]; then\n");
+        }
         script.push_str(&format!("{services_up} >&2 || exit\n"));
+        if options.services_up_if_processes {
+            script.push_str("fi\n");
+        }
     }
     if !options.services_wait.is_empty() {
+        if options.services_wait_if_processes {
+            script.push_str("if [ \"$processes\" != '{\"processes\":{}}' ]; then\n");
+        }
         script.push_str(&format!("{services_wait} >&2 || exit\n"));
+        if options.services_wait_if_processes {
+            script.push_str("fi\n");
+        }
     }
     script.push_str(&format!("{agent}\nstatus=$?\nexit \"$status\"\n"));
     script
@@ -937,6 +979,7 @@ fn guest_script(options: &LaunchOptions) -> String {
 fn guest_argv(options: &LaunchOptions) -> Vec<String> {
     let commands = [
         &options.env_wrap,
+        &options.processes_detect,
         &options.services_up,
         &options.services_wait,
         &options.services_down,
@@ -1374,12 +1417,18 @@ mod tests {
             "/worktree",
             "--env-wrap",
             "[]",
+            "--processes-detect",
+            "[]",
             "--services-up",
             "[]",
             "--services-wait",
             "[]",
             "--services-down",
             "[]",
+            "--services-up-if-processes",
+            "0",
+            "--services-wait-if-processes",
+            "0",
             "--",
             "agent",
             "--flag",
@@ -1840,6 +1889,53 @@ mod tests {
     fn run_guest(options: &LaunchOptions) -> std::process::Output {
         let args = guest_argv(options);
         Command::new(&args[0]).args(&args[1..]).output().unwrap()
+    }
+
+    #[tokio::test]
+    async fn legacy_bwrap_detection_and_down_run_only_in_guest() {
+        let root = scratch("lazy-services");
+        let log = root.join("services.log");
+        std::fs::write(root.join("devenv.nix"), "").unwrap();
+        let config = crate::project::ProjectConfig {
+            driver: None,
+            commands: crate::project::RawProjectCommands {
+                services_down: Some(fake_service("down", &log)),
+                ..Default::default()
+            },
+        };
+        let commands = crate::workspace::resolve_commands(&config, crate::config::ExecutionMode::Bwrap, &root, &[])
+            .await
+            .unwrap();
+        assert!(!log.exists(), "bwrap resolution ran service commands on the host");
+        assert!(!commands.processes_detect.is_empty());
+
+        let mut parsed = options();
+        parsed.processes_detect = fake_service("detect", &log);
+        parsed.services_up = fake_service("up", &log);
+        parsed.services_wait = fake_service("wait", &log);
+        parsed.services_down = commands.services_down;
+        parsed.services_up_if_processes = true;
+        parsed.services_wait_if_processes = true;
+        parsed.command = fake_service("agent", &log);
+        let output = run_guest(&parsed);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            fs::read_to_string(&log).unwrap(),
+            "down\ndetect\nup\nwait\nagent\ndown\n"
+        );
+
+        fs::write(&log, "").unwrap();
+        parsed.processes_detect = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf 'detect\\n' >> \"$1\"; printf '%s' '{\"processes\":{}}'".to_string(),
+            "detect".to_string(),
+            log.to_string_lossy().into_owned(),
+        ];
+        let output = run_guest(&parsed);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(fs::read_to_string(&log).unwrap(), "down\ndetect\nagent\ndown\n");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

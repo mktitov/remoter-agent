@@ -62,7 +62,12 @@ impl TestDir {
         let commands = if devenv {
             ProjectCommands {
                 env_wrap: devenv_env_wrap(),
+                processes_detect: strings(&["devenv", "--no-eval-cache", "eval", "processes"]),
+                services_up: devenv_services_up(),
+                services_wait: devenv_services_wait(),
                 services_down: devenv_services_down(),
+                services_up_if_processes: true,
+                services_wait_if_processes: true,
                 ..ProjectCommands::default()
             }
         } else {
@@ -628,8 +633,11 @@ async fn devenv_postgres_parallel_and_restart() {
     let mut two = dir.launch_spec("two", true);
     for (spec, task_id) in [(&mut one, 251), (&mut two, 252)] {
         write_devenv_project(&spec.worktree);
+        spec.commands.processes_detect = strings(&["devenv", "--no-eval-cache", "eval", "processes"]);
         spec.commands.services_up = devenv_services_up();
         spec.commands.services_wait = devenv_services_wait();
+        spec.commands.services_up_if_processes = true;
+        spec.commands.services_wait_if_processes = true;
         spec.env.clone_from(&run_env(task_id));
         prewarm(&spec.worktree, &spec.agent_home, &spec.env, &spec.commands.env_wrap)
             .await
@@ -770,6 +778,7 @@ fn launcher_command(tools: &Tools, spec: &LaunchSpec, program: &str, args: Vec<S
         .arg(&spec.worktree);
     for (option, argv) in [
         ("--env-wrap", &spec.commands.env_wrap),
+        ("--processes-detect", &spec.commands.processes_detect),
         ("--services-up", &spec.commands.services_up),
         ("--services-wait", &spec.commands.services_wait),
         ("--services-down", &spec.commands.services_down),
@@ -778,6 +787,19 @@ fn launcher_command(tools: &Tools, spec: &LaunchSpec, program: &str, args: Vec<S
             .arg(option)
             .arg(serde_json::to_string(argv).expect("string argv serializes"));
     }
+    command
+        .arg("--services-up-if-processes")
+        .arg(if spec.commands.services_up_if_processes {
+            "1"
+        } else {
+            "0"
+        })
+        .arg("--services-wait-if-processes")
+        .arg(if spec.commands.services_wait_if_processes {
+            "1"
+        } else {
+            "0"
+        });
     for program in &spec.retain {
         command.arg("--retain").arg(program);
     }

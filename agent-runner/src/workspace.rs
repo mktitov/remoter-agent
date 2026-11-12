@@ -900,9 +900,12 @@ pub struct BwrapExec {
     pub agent_home: PathBuf,
     pub state_root: PathBuf,
     pub env_wrap: Vec<String>,
+    pub processes_detect: Vec<String>,
     pub services_up: Vec<String>,
     pub services_wait: Vec<String>,
     pub services_down: Vec<String>,
+    pub services_up_if_processes: bool,
+    pub services_wait_if_processes: bool,
     pub retained_commands: Vec<String>,
     pub sessions_dir: PathBuf,
     pub api_url: String,
@@ -967,6 +970,7 @@ pub fn wrap_command(
                 .arg(dir);
             for (option, command) in [
                 ("--env-wrap", &c.env_wrap),
+                ("--processes-detect", &c.processes_detect),
                 ("--services-up", &c.services_up),
                 ("--services-wait", &c.services_wait),
                 ("--services-down", &c.services_down),
@@ -974,6 +978,10 @@ pub fn wrap_command(
                 cmd.arg(option)
                     .arg(serde_json::to_string(command).expect("string argv serializes"));
             }
+            cmd.arg("--services-up-if-processes")
+                .arg(if c.services_up_if_processes { "1" } else { "0" })
+                .arg("--services-wait-if-processes")
+                .arg(if c.services_wait_if_processes { "1" } else { "0" });
             for command in &c.retained_commands {
                 cmd.arg("--retain").arg(command);
             }
@@ -1012,16 +1020,19 @@ pub fn wrap_command(
     }
 }
 
-/// Runs best-effort cleanup before resolving legacy process detection, so even
-/// a failed `devenv eval processes` cannot leave a stale supervisor behind.
+/// Host mode runs best-effort cleanup before legacy process detection. Isolated
+/// modes only resolve argv here: container cleanup is container removal, while
+/// bwrap detection and cleanup belong in the guest after pre-warm.
 pub async fn resolve_commands(
     config: &crate::project::ProjectConfig,
     mode: crate::config::ExecutionMode,
     dir: &Path,
     env: &[(String, String)],
 ) -> Result<crate::project::ProjectCommands, crate::driver::DriverError> {
-    let down = config.legacy_services_down(mode, dir);
-    services_down(dir, env, &down).await;
+    if mode == crate::config::ExecutionMode::Host {
+        let down = config.legacy_services_down(mode, dir);
+        services_down(dir, env, &down).await;
+    }
     config.commands_for(mode, dir, env).await
 }
 
@@ -1065,10 +1076,17 @@ pub async fn down_all_worktrees(root: &Path) {
         if !name.to_string_lossy().starts_with('p') {
             continue;
         }
-        let config = match crate::project::ProjectConfig::from_file(&project.path().join("repo")) {
+        let repo = project.path().join("repo");
+        let config_result = if repo.join(".git").exists() {
+            let base = worktree_branch(&repo).await.ok();
+            crate::project::ProjectConfig::from_git(&repo, base.as_deref()).await
+        } else {
+            crate::project::ProjectConfig::from_file(&repo)
+        };
+        let config = match config_result {
             Ok(config) => config,
             Err(error) => {
-                tracing::warn!(dir = %project.path().display(), %error, "startup sweep: invalid project configuration");
+                tracing::warn!(dir = %repo.display(), %error, "startup sweep: cannot load fresh project configuration");
                 continue;
             }
         };
@@ -2586,9 +2604,12 @@ mod tests {
             env_wrap: ["devenv", "--no-eval-cache", "shell", "--no-tui", "--"]
                 .map(str::to_string)
                 .to_vec(),
+            processes_detect: Vec::new(),
             services_up: Vec::new(),
             services_wait: Vec::new(),
             services_down: Vec::new(),
+            services_up_if_processes: false,
+            services_wait_if_processes: false,
             retained_commands: vec!["/nix/store/remoter-mcp/bin/remoter-mcp".to_string()],
             sessions_dir: PathBuf::from("/state/agent-home/.kimi-code/sessions"),
             api_url: "http://10.0.2.2:8181".to_string(),
@@ -2616,12 +2637,18 @@ mod tests {
                 "/host/wt",
                 "--env-wrap",
                 "[\"devenv\",\"--no-eval-cache\",\"shell\",\"--no-tui\",\"--\"]",
+                "--processes-detect",
+                "[]",
                 "--services-up",
                 "[]",
                 "--services-wait",
                 "[]",
                 "--services-down",
                 "[]",
+                "--services-up-if-processes",
+                "0",
+                "--services-wait-if-processes",
+                "0",
                 "--retain",
                 "/nix/store/remoter-mcp/bin/remoter-mcp",
                 "--env",
@@ -2871,6 +2898,7 @@ mod tests {
             services_wait: service("wait", 0),
             services_down: service("down", 0),
             image_init: vec![],
+            ..Default::default()
         };
         for _ in 0..2 {
             services_down(&dir, &[], &commands.services_down).await;
@@ -2886,6 +2914,73 @@ mod tests {
             "down\nup\nwait\ndown\ndown\nup\nwait\ndown\ndown\nup\nwait\ndown\n"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn container_resolution_never_runs_down_on_host() {
+        let dir = scratch("container-no-host-down");
+        let marker = dir.join("host-down-ran");
+        let config = crate::project::ProjectConfig {
+            driver: None,
+            commands: crate::project::RawProjectCommands {
+                services_down: Some(vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "printf ran > \"$1\"".to_string(),
+                    "down".to_string(),
+                    marker.to_string_lossy().into_owned(),
+                ]),
+                ..Default::default()
+            },
+        };
+        let commands = resolve_commands(&config, crate::config::ExecutionMode::Container, &dir, &[])
+            .await
+            .unwrap();
+        assert!(!commands.services_down.is_empty());
+        assert!(!marker.exists(), "container services_down ran on the host");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn down_all_worktrees_reads_fresh_config_from_git_ref() {
+        let root = scratch("fresh-sweep");
+        let seed = root.join("seed");
+        let repo = root.join("p1/repo");
+        let worktree = root.join("p1/wt-1");
+        std::fs::create_dir_all(seed.join(".remoter")).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        git_output(&seed, &["init", "-b", "main"]).await.unwrap();
+        git_output(&seed, &["config", "user.email", "test@example.com"])
+            .await
+            .unwrap();
+        git_output(&seed, &["config", "user.name", "Test"]).await.unwrap();
+        let old_marker = root.join("old-down");
+        let new_marker = root.join("new-down");
+        let config = |name: &str, marker: &Path| {
+            format!(
+                "[commands]\nservices_down = [\"/bin/sh\", \"-c\", \"printf {name} > \\\"$1\\\"\", \"down\", \"{}\"]\n",
+                marker.display()
+            )
+        };
+        std::fs::write(seed.join(".remoter/agent.toml"), config("old", &old_marker)).unwrap();
+        git_output(&seed, &["add", ".remoter/agent.toml"]).await.unwrap();
+        git_output(&seed, &["commit", "-m", "old cleanup"]).await.unwrap();
+        git_output(&root, &["clone", seed.to_str().unwrap(), repo.to_str().unwrap()])
+            .await
+            .unwrap();
+        std::fs::write(seed.join(".remoter/agent.toml"), config("new", &new_marker)).unwrap();
+        git_output(&seed, &["add", ".remoter/agent.toml"]).await.unwrap();
+        git_output(&seed, &["commit", "-m", "new cleanup"]).await.unwrap();
+
+        down_all_worktrees(&root).await;
+        assert!(new_marker.exists(), "startup sweep used stale services_down");
+        assert!(!old_marker.exists(), "startup sweep ran the old services_down");
+        assert!(
+            std::fs::read_to_string(repo.join(".remoter/agent.toml"))
+                .unwrap()
+                .contains("old")
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[tokio::test]
