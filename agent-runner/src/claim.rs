@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     client::{ProjectRepoConfig, RemoterClient, TaskSummary},
     config::Config,
-    driver::AgentDriver,
+    driver::DriverFactory,
     logstore::LogStore,
     ports::Ports,
     review::{ReviewContext, ReviewTrigger, Reviewer, execute as review_execute},
@@ -44,7 +44,7 @@ struct RunningEntry {
 pub struct Daemon {
     config: Arc<Config>,
     client: RemoterClient,
-    driver: Arc<dyn AgentDriver>,
+    driver_factory: DriverFactory,
     ports: Ports,
     image_locks: crate::image::ImageLocks,
     log_store: LogStore,
@@ -62,12 +62,12 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    pub fn new(config: Arc<Config>, client: RemoterClient, driver: Arc<dyn AgentDriver>, log_store: LogStore) -> Self {
+    pub fn new(config: Arc<Config>, client: RemoterClient, driver_factory: DriverFactory, log_store: LogStore) -> Self {
         let image_locks = crate::image::ImageLocks::default();
         Self {
             config: config.clone(),
             client,
-            driver,
+            driver_factory,
             ports: Ports::default(),
             image_locks: image_locks.clone(),
             log_store,
@@ -614,7 +614,12 @@ impl Daemon {
             let rc = RunContext {
                 client: self.client.clone(),
                 config: self.config.clone(),
-                driver: self.driver.clone(),
+                driver_factory: self.driver_factory.clone(),
+                driver: self
+                    .driver_factory
+                    .build(&self.config.driver)
+                    .expect("global driver was validated at startup"),
+                project_config: crate::project::ProjectConfig::default(),
                 task,
                 project,
                 kind,
@@ -679,7 +684,12 @@ impl Daemon {
         let rc = SuperviseContext {
             client: self.client.clone(),
             config: self.config.clone(),
-            driver: self.driver.clone(),
+            driver_factory: self.driver_factory.clone(),
+            driver: self
+                .driver_factory
+                .build(&self.config.driver)
+                .expect("global driver was validated at startup"),
+            project_config: crate::project::ProjectConfig::default(),
             parent: trigger.parent,
             review_children: trigger.review_children,
             project,
@@ -745,7 +755,12 @@ impl Daemon {
         let rc = ReviewContext {
             client: self.client.clone(),
             config: self.config.clone(),
-            driver: self.driver.clone(),
+            driver_factory: self.driver_factory.clone(),
+            driver: self
+                .driver_factory
+                .build(&self.config.driver)
+                .expect("global driver was validated at startup"),
+            project_config: crate::project::ProjectConfig::default(),
             task: trigger.task,
             project,
             port_block,
@@ -795,7 +810,6 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::stub::StubDriver;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Minimal HTTP/1.1 mock backend: serves the queued `(status, body)`
@@ -848,9 +862,9 @@ kind = "stub"
         let config = Arc::new(Config::from_toml_str(&toml, Some("tok".to_string())).unwrap());
         let log_store = LogStore::new(&config.logs).unwrap();
         Daemon::new(
-            config,
+            config.clone(),
             RemoterClient::new(api_url, "tok", None),
-            Arc::new(StubDriver::new(0, false)),
+            DriverFactory::new(&config),
             log_store,
         )
     }

@@ -13,7 +13,7 @@ use crate::{
     client::{AttachmentDto, FinishRunBody, LinkDto, ProjectRepoConfig, RemoterClient, TaskDetail, TaskSummary},
     config::{Config, ExecutionMode},
     container,
-    driver::{AgentDriver, DriverError, DriverPhase, RunFailure, RunOutcome, RunSpec},
+    driver::{AgentDriver, DriverError, DriverFactory, DriverPhase, RunFailure, RunOutcome, RunSpec},
     forge, image,
     image::ImageLocks,
     logstore::LogStore,
@@ -92,7 +92,9 @@ impl RunKind {
 pub struct RunContext {
     pub client: RemoterClient,
     pub config: Arc<Config>,
+    pub driver_factory: DriverFactory,
     pub driver: Arc<dyn AgentDriver>,
+    pub project_config: crate::project::ProjectConfig,
     pub task: TaskSummary,
     pub project: ProjectRepoConfig,
     pub kind: RunKind,
@@ -237,12 +239,57 @@ async fn supervised_parent(rc: &RunContext) -> Option<(SupervisedParent, TaskDet
     ))
 }
 
+pub(crate) async fn effective_project(
+    config: &Arc<Config>,
+    project: Option<&ProjectRepoConfig>,
+    factory: &DriverFactory,
+) -> Result<(Arc<Config>, crate::project::ProjectConfig, Arc<dyn AgentDriver>), DriverError> {
+    let Some(project) = project else {
+        let driver = factory
+            .build(&config.driver)
+            .map_err(|e| DriverError::Permanent(e.to_string()))?;
+        return Ok((config.clone(), crate::project::ProjectConfig::default(), driver));
+    };
+    let repo = workspace::ensure_repo_clone(&config.workspace_root, project.project_id, &project.repo_url)
+        .await
+        .map_err(|e| DriverError::Transient(format!("prepare project config clone: {e}")))?;
+    let project_config = crate::project::ProjectConfig::from_git(&repo, project.base_branch.as_deref()).await?;
+    let effective = config
+        .with_project_driver(project_config.driver.as_deref())
+        .map_err(|e| DriverError::Permanent(format!("invalid project driver configuration: {e}")))?;
+    let driver = factory
+        .build(&effective.driver)
+        .map_err(|e| DriverError::Permanent(format!("invalid project driver configuration: {e}")))?;
+    Ok((Arc::new(effective), project_config, driver))
+}
+
 /// Executes the run to completion (success, escalation, rollback, or
 /// cancellation). All
 /// outcomes are recorded on the run row; this function only logs, never errors
 /// upward — a failed ticket must not kill the poll loop.
 pub async fn execute(rc: RunContext) {
+    let mut rc = rc;
     let task_id = rc.task.id;
+    match effective_project(&rc.config, Some(&rc.project), &rc.driver_factory).await {
+        Ok((config, project_config, driver)) => {
+            rc.config = config;
+            rc.project_config = project_config;
+            rc.driver = driver;
+        }
+        Err(error) => {
+            let Ok(run) = rc.client.start_run(task_id, rc.kind.as_str()).await else {
+                return;
+            };
+            let reason = format!("project configuration failed: {error}");
+            finish_failed(&rc.client, task_id, run.id, reason.clone(), None, None).await;
+            if matches!(error, DriverError::Permanent(_)) {
+                escalate(&rc, run.id, &reason, 1).await;
+            } else {
+                rollback(&rc).await;
+            }
+            return;
+        }
+    }
     // A ticket renamed between runs keeps the branch its worktree was created
     // with — recomputing from the current title would name a branch that
     // doesn't exist locally, and the push at finish time would fail.
@@ -699,12 +746,10 @@ pub async fn execute(rc: RunContext) {
     }
 }
 
-/// One attempt: prepare the worktree (spec §5.4 step 1), bring the runtime up
-/// (container mode: agent image + run container + sidecars; host mode: devenv
-/// services when the project uses devenv, §5.8), run the driver (with
-/// dirty-worktree nudges), always tear the runtime down. Workspace/devenv
-/// failures are transient (network, nix cache); a missing project Dockerfile
-/// is permanent (container mode fails closed).
+/// One attempt: prepare the worktree (spec §5.4 step 1), bring the runtime and
+/// configured project services up, run the driver (with dirty-worktree nudges),
+/// always tear the runtime down. Workspace/environment failures are transient;
+/// a missing project Dockerfile is permanent (container mode fails closed).
 #[allow(clippy::too_many_arguments)]
 async fn attempt_run(
     rc: &RunContext,
@@ -751,6 +796,9 @@ async fn attempt_run(
     }
 
     let env = run_env(rc);
+    let commands = workspace::resolve_commands(&rc.project_config, rc.config.execution.mode, &prepared.dir, &env)
+        .await
+        .map_err(|error| RunFailure::new(error, None))?;
     // Container mode: the guard's drop (`docker rm -f` + worktree unlock) is
     // the teardown on every exit path below, including cancellation.
     let containers = start_container_runtime(
@@ -760,7 +808,7 @@ async fn attempt_run(
         task_id,
         run_id,
         &prepared.dir,
-        prepared.devenv,
+        &commands,
         &env,
         &refs.mounted,
     )
@@ -776,10 +824,10 @@ async fn attempt_run(
             .await;
         }
     }
-    if containers.is_none() && prepared.devenv {
-        workspace::services_up(&prepared.dir, &env)
+    if containers.is_none() {
+        workspace::services_up(&prepared.dir, &env, &commands)
             .await
-            .map_err(|e| RunFailure::new(DriverError::Transient(format!("devenv services up: {e}")), None))?;
+            .map_err(|e| RunFailure::new(DriverError::Transient(format!("project services up: {e}")), None))?;
     }
 
     let spec = RunSpec {
@@ -791,24 +839,24 @@ async fn attempt_run(
         resume_session: resume_session.clone(),
         branch: branch.to_string(),
         env: env.clone(),
-        exec: exec_env(&rc.config, run_id, prepared.devenv),
+        exec: exec_env(&rc.config, run_id, &commands),
         config_options: rc.config.driver.config_options_for(rc.kind.as_str()),
         logger: logger.clone(),
         phase_tx,
     };
-    let result = run_with_dirty_nudges(rc, run_id, spec, branch, &prepared.dir, logger).await;
+    let result = run_with_dirty_nudges(rc, run_id, spec, branch, &prepared.dir, &commands, logger).await;
 
     // Implement runs: gate on task actions being final before any commit/PR work.
     let result = match result {
         Ok(outcome) if rc.kind == RunKind::Implement => {
-            ensure_final_actions(rc, run_id, outcome, branch, &prepared.dir, logger).await
+            ensure_final_actions(rc, run_id, outcome, branch, &prepared.dir, &commands, logger).await
         }
         other => other,
     };
 
-    if containers.is_none() && prepared.devenv {
+    if containers.is_none() {
         // Best-effort, must not mask the run's real outcome (spec §5.8).
-        workspace::services_down(&prepared.dir, &env).await;
+        workspace::services_down(&prepared.dir, &env, &commands.services_down).await;
     }
     result
 }
@@ -820,10 +868,11 @@ async fn run_with_dirty_nudges(
     spec: RunSpec,
     branch: &str,
     dir: &Path,
+    commands: &crate::project::ProjectCommands,
     logger: &SessionLogger,
 ) -> Result<RunOutcome, RunFailure> {
     let outcome = rc.driver.run(spec).await?;
-    ensure_clean_worktree(rc, run_id, outcome, branch, dir, logger).await
+    ensure_clean_worktree(rc, run_id, outcome, branch, dir, commands, logger).await
 }
 
 /// Checks `git status --porcelain`. A dirty worktree sends the agent back with
@@ -836,10 +885,10 @@ async fn ensure_clean_worktree(
     outcome: RunOutcome,
     branch: &str,
     dir: &Path,
+    commands: &crate::project::ProjectCommands,
     logger: &SessionLogger,
 ) -> Result<RunOutcome, RunFailure> {
     let task_id = rc.task.id;
-    let devenv = workspace::uses_devenv(dir);
     let env = run_env(rc);
     let config_options = rc.config.driver.config_options_for(rc.kind.as_str());
 
@@ -870,7 +919,7 @@ async fn ensure_clean_worktree(
             resume_session: merged.session_id.clone(),
             branch: branch.to_string(),
             env: env.clone(),
-            exec: exec_env(&rc.config, run_id, devenv),
+            exec: exec_env(&rc.config, run_id, commands),
             config_options: config_options.clone(),
             logger: logger.clone(),
             phase_tx: None,
@@ -965,6 +1014,7 @@ async fn ensure_final_actions(
     outcome: RunOutcome,
     branch: &str,
     dir: &Path,
+    commands: &crate::project::ProjectCommands,
     logger: &SessionLogger,
 ) -> Result<RunOutcome, RunFailure> {
     if rc.kind != RunKind::Implement {
@@ -972,7 +1022,6 @@ async fn ensure_final_actions(
     }
 
     let task_id = rc.task.id;
-    let devenv = workspace::uses_devenv(dir);
     let env = run_env(rc);
     let config_options = rc.config.driver.config_options_for(rc.kind.as_str());
     let mut merged = outcome;
@@ -1006,7 +1055,7 @@ async fn ensure_final_actions(
             resume_session: merged.session_id.clone(),
             branch: branch.to_string(),
             env: env.clone(),
-            exec: exec_env(&rc.config, run_id, devenv),
+            exec: exec_env(&rc.config, run_id, commands),
             config_options: config_options.clone(),
             logger: logger.clone(),
             phase_tx: None,
@@ -1022,7 +1071,7 @@ async fn ensure_final_actions(
 
     // After action nudges, re-run the full dirty-worktree check + nudges: the
     // agent may have left the worktree dirty while finalizing actions.
-    ensure_clean_worktree(rc, run_id, merged, branch, dir, logger).await
+    ensure_clean_worktree(rc, run_id, merged, branch, dir, commands, logger).await
 }
 
 fn sum_tokens(a: Option<i64>, b: Option<i64>) -> Option<i64> {
@@ -1034,26 +1083,26 @@ fn sum_tokens(a: Option<i64>, b: Option<i64>) -> Option<i64> {
     }
 }
 
-/// Host mode exports a port block. Both isolated modes own their loopback;
-/// only Docker injects sidecar database URLs.
-fn run_env(rc: &RunContext) -> Vec<(String, String)> {
-    match rc.config.execution.mode {
-        ExecutionMode::Container => container::container_env(rc.task.id),
-        ExecutionMode::Bwrap => crate::bwrap::run_env(rc.task.id),
+/// Host mode exports a port block and the effective driver's home. Both
+/// isolated modes own their loopback; only Docker injects sidecar database URLs.
+pub(crate) fn execution_env(config: &Config, task_id: i32, port_block: Option<&PortBlock>) -> Vec<(String, String)> {
+    match config.execution.mode {
+        ExecutionMode::Container => container::container_env(task_id),
+        ExecutionMode::Bwrap => crate::bwrap::run_env(task_id),
         ExecutionMode::Host => {
             let mut env = vec![
                 ("CI".to_string(), "1".to_string()),
-                ("REMOTER_AGENT_TASK_ID".to_string(), rc.task.id.to_string()),
+                ("REMOTER_AGENT_TASK_ID".to_string(), task_id.to_string()),
             ];
-            if let Some(block) = &rc.port_block {
+            if let Some(block) = port_block {
                 env.push(("REMOTER_AGENT_PORT_BASE".to_string(), block.base().to_string()));
             }
-            if rc.config.driver.kind == "kimi-acp" {
+            if config.driver.kind == "kimi-acp" {
                 env.push((
                     "KIMI_CODE_HOME".to_string(),
-                    rc.config
+                    config
                         .execution
-                        .agent_home(&rc.config.workspace_root)
+                        .agent_home(&config.workspace_root)
                         .join(".kimi-code")
                         .to_string_lossy()
                         .into_owned(),
@@ -1062,6 +1111,10 @@ fn run_env(rc: &RunContext) -> Vec<(String, String)> {
             env
         }
     }
+}
+
+fn run_env(rc: &RunContext) -> Vec<(String, String)> {
+    execution_env(&rc.config, rc.task.id, rc.port_block.as_ref())
 }
 
 fn sessions_dir(config: &Config) -> std::path::PathBuf {
@@ -1078,16 +1131,22 @@ fn sessions_dir(config: &Config) -> std::path::PathBuf {
 }
 
 /// The `RunSpec.exec` for a driver turn in the configured execution mode.
-pub(crate) fn exec_env(config: &Config, run_id: i32, devenv: bool) -> ExecEnv {
+pub(crate) fn exec_env(config: &Config, run_id: i32, commands: &crate::project::ProjectCommands) -> ExecEnv {
     match config.execution.mode {
-        ExecutionMode::Host => ExecEnv::host(devenv),
+        ExecutionMode::Host => ExecEnv::host(commands.env_wrap.clone()),
         ExecutionMode::Bwrap => ExecEnv::Bwrap(workspace::BwrapExec {
             launcher: std::env::current_exe().unwrap_or_else(|_| "remoter-agent".into()),
             bwrap: config.execution.bwrap_binary.clone(),
             slirp4netns: config.execution.slirp4netns_binary.clone(),
             agent_home: config.execution.agent_home(&config.workspace_root),
             state_root: config.workspace_root.join("bwrap"),
-            devenv,
+            env_wrap: commands.env_wrap.clone(),
+            processes_detect: commands.processes_detect.clone(),
+            services_up: commands.services_up.clone(),
+            services_wait: commands.services_wait.clone(),
+            services_down: commands.services_down.clone(),
+            services_up_if_processes: commands.services_up_if_processes,
+            services_wait_if_processes: commands.services_wait_if_processes,
             retained_commands: (config.driver.kind != "stub")
                 .then(|| config.driver.remoter_mcp_command.clone())
                 .into_iter()
@@ -1099,10 +1158,25 @@ pub(crate) fn exec_env(config: &Config, run_id: i32, devenv: bool) -> ExecEnv {
             docker: config.execution.docker_binary.clone(),
             container: container::run_container_name(run_id),
             work_dir: std::path::PathBuf::from(container::WORK_DIR),
-            devenv,
+            env_wrap: commands.env_wrap.clone(),
             sessions_dir: sessions_dir(config),
             api_url: container::container_api_url(&config.api_url),
         }),
+    }
+}
+
+/// Report-only review/supervise runs without an agent-managed project have no
+/// isolated runtime and keep their legacy host execution even in container mode.
+pub(crate) fn exec_env_for_runtime(
+    config: &Config,
+    run_id: i32,
+    commands: &crate::project::ProjectCommands,
+    has_runtime: bool,
+) -> ExecEnv {
+    if has_runtime {
+        exec_env(config, run_id, commands)
+    } else {
+        ExecEnv::host(commands.env_wrap.clone())
     }
 }
 
@@ -1134,10 +1208,9 @@ impl Drop for BwrapRuntime {
     }
 }
 
-/// Starts the isolated runtime for one attempt/nudge loop. Bwrap performs the
-/// real host devenv pre-warm here; each subsequent driver turn gets one fresh
-/// launcher and network namespace. Host mode returns `None`. No failure falls
-/// back to another execution mode.
+/// Starts the isolated runtime for one attempt/nudge loop. Bwrap pre-warms the
+/// configured environment on the host; container services start after sidecars.
+/// Host mode returns `None`. No failure falls back to another execution mode.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_container_runtime(
     config: &Config,
@@ -1146,7 +1219,7 @@ pub(crate) async fn start_container_runtime(
     task_id: i32,
     run_id: i32,
     worktree: &Path,
-    devenv: bool,
+    commands: &crate::project::ProjectCommands,
     env: &[(String, String)],
     refs: &[workspace::RefMount],
 ) -> Result<Option<RunRuntime>, RunFailure> {
@@ -1176,11 +1249,9 @@ pub(crate) async fn start_container_runtime(
             worktree: worktree.to_path_buf(),
             repo: repo.clone(),
         };
-        if devenv {
-            crate::bwrap::prewarm(worktree, &agent_home, env)
-                .await
-                .map_err(|e| RunFailure::new(e, None))?;
-        }
+        crate::bwrap::prewarm(worktree, &agent_home, env, &commands.env_wrap)
+            .await
+            .map_err(|e| RunFailure::new(e, None))?;
         return Ok(Some(RunRuntime::Bwrap(runtime)));
     }
     let image = image::ensure_project_image(&config.execution, image_locks, &repo, project, task_id)
@@ -1199,50 +1270,52 @@ pub(crate) async fn start_container_runtime(
     })
     .await
     .map_err(|e| RunFailure::new(e, None))?;
-    if devenv && worktree_has_justfile(worktree) {
-        container_services_up(config, run_id, env).await?;
-    } else if devenv {
-        tracing::info!(run_id, "no justfile in worktree — skipping db-up (no sidecar wait)");
-    }
+    container_services(config, run_id, env, commands).await?;
     Ok(Some(RunRuntime::Container(containers)))
 }
 
-/// Whether the worktree carries a justfile — the `db-up` contract below is
-/// optional: projects without a justfile have no services to wait for (their
-/// tests don't use the sidecars), so the step is skipped for them instead of
-/// dying on `just: command not found` (exit 127) inside the run container.
-fn worktree_has_justfile(worktree: &Path) -> bool {
-    ["justfile", "Justfile", ".justfile"]
-        .iter()
-        .any(|f| worktree.join(f).exists())
-}
-
-/// `just db-up` inside the run container — under `REMOTER_CONTAINER=1` the
-/// justfile only waits for the already-running sidecars (no devenv services).
-/// Called only when the worktree carries a justfile (see
-/// `worktree_has_justfile`); a justfile without a `db-up` recipe stays a hard
-/// error — that signals a broken project contract, not a missing one.
-async fn container_services_up(config: &Config, run_id: i32, env: &[(String, String)]) -> Result<(), RunFailure> {
-    let exec = exec_env(config, run_id, true);
-    let cmd = workspace::wrap_command(Path::new("/"), &exec, "just", &["db-up"], env);
-    let out = tokio::process::Command::from(cmd)
-        .output()
-        .await
-        .map_err(|e| RunFailure::new(DriverError::Transient(format!("container services up: {e}")), None))?;
-    if !out.status.success() {
-        // pg_isready and npm report failures on stdout, just on stderr — an
-        // error built from stderr alone comes out empty (run #944).
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(RunFailure::new(
-            DriverError::Transient(format!(
-                "container services up (just db-up, {}): {}{}",
-                out.status,
-                stderr.trim(),
-                if stderr.trim().is_empty() { stdout.trim() } else { "" }
-            )),
-            None,
-        ));
+/// Runs service and readiness argv inside the container. Only the inherited
+/// `just db-up` receives its legacy devenv wrapper; explicit commands stay direct.
+async fn container_services(
+    config: &Config,
+    run_id: i32,
+    env: &[(String, String)],
+    commands: &crate::project::ProjectCommands,
+) -> Result<(), RunFailure> {
+    for (name, argv) in [("up", &commands.services_up), ("wait", &commands.services_wait)] {
+        let Some(program) = argv.first() else {
+            continue;
+        };
+        let env_wrap = if name == "up" {
+            commands.services_up_wrap.clone()
+        } else {
+            Vec::new()
+        };
+        let exec_commands = crate::project::ProjectCommands {
+            env_wrap,
+            ..Default::default()
+        };
+        let exec = exec_env(config, run_id, &exec_commands);
+        let args = argv[1..].iter().map(String::as_str).collect::<Vec<_>>();
+        let cmd = workspace::wrap_command(Path::new("/"), &exec, program, &args, env);
+        let out = tokio::process::Command::from(cmd)
+            .output()
+            .await
+            .map_err(|e| RunFailure::new(DriverError::Transient(format!("container services {name}: {e}")), None))?;
+        if !out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(RunFailure::new(
+                DriverError::Transient(format!(
+                    "container services {name} ({}, {}): {}{}",
+                    argv.join(" "),
+                    out.status,
+                    stderr.trim(),
+                    if stderr.trim().is_empty() { stdout.trim() } else { "" }
+                )),
+                None,
+            ));
+        }
     }
     Ok(())
 }
@@ -2152,14 +2225,21 @@ async fn ensure_pr_mergeable(
     }
 
     // The forge reports a conflict — ask the agent to rebase. Services come
-    // up once for the whole nudge loop (the worktree and runtime are identical
-    // across iterations) and down once after, on every exit path (spec §5.8):
-    // container mode starts the run container + sidecars (the guard's drop is
-    // the down), host mode wraps the loop in devenv up/down. The loop lives in
-    // `rebase_nudge_loop` so its early returns cannot skip the down.
+    // up once for the whole nudge loop and down once after every exit path.
     let wt = workspace::worktree_dir(&rc.config.workspace_root, rc.project.project_id, rc.task.id);
     let env = run_env(rc);
-    let devenv = workspace::uses_devenv(&wt);
+    let commands = match workspace::resolve_commands(&rc.project_config, rc.config.execution.mode, &wt, &env).await {
+        Ok(commands) => commands,
+        Err(error) => {
+            note(
+                &rc.client,
+                task_id,
+                format!("PR is not mergeable into `{base}`: auto-rebase setup failed ({error}) — human help needed"),
+            )
+            .await;
+            return;
+        }
+    };
     let containers = match start_container_runtime(
         &rc.config,
         &rc.image_locks,
@@ -2167,7 +2247,7 @@ async fn ensure_pr_mergeable(
         task_id,
         run_id,
         &wt,
-        devenv,
+        &commands,
         &env,
         &[],
     )
@@ -2186,10 +2266,9 @@ async fn ensure_pr_mergeable(
         }
     };
     if containers.is_none()
-        && devenv
-        && let Err(e) = workspace::services_up(&wt, &env).await
+        && let Err(e) = workspace::services_up(&wt, &env, &commands).await
     {
-        tracing::warn!(task_id, error = %e, "rebase nudge: devenv services up failed");
+        tracing::warn!(task_id, error = %e, "rebase nudge: project services up failed");
         note(
             &rc.client,
             task_id,
@@ -2210,12 +2289,12 @@ async fn ensure_pr_mergeable(
         &base,
         &wt,
         &env,
-        devenv,
+        &commands,
         outcome,
     )
     .await;
-    if containers.is_none() && devenv {
-        workspace::services_down(&wt, &env).await;
+    if containers.is_none() {
+        workspace::services_down(&wt, &env, &commands.services_down).await;
     }
 }
 
@@ -2236,7 +2315,7 @@ async fn rebase_nudge_loop(
     base: &str,
     wt: &Path,
     env: &[(String, String)],
-    devenv: bool,
+    commands: &crate::project::ProjectCommands,
     outcome: &mut RunOutcome,
 ) {
     let task_id = rc.task.id;
@@ -2253,7 +2332,7 @@ async fn rebase_nudge_loop(
             resume_session: outcome.session_id.clone(),
             branch: branch.to_string(),
             env: env.to_vec(),
-            exec: exec_env(&rc.config, run_id, devenv),
+            exec: exec_env(&rc.config, run_id, commands),
             config_options: rc.config.driver.config_options_for(rc.kind.as_str()),
             logger: logger.clone(),
             phase_tx: None,
@@ -2409,6 +2488,75 @@ mod tests {
     use super::*;
     use crate::client::{AgentRunDto, CommentDto};
 
+    #[tokio::test]
+    async fn container_services_use_legacy_wrap_only_for_inherited_up() {
+        let dir = std::env::temp_dir().join(format!("remoter-container-services-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let docker = dir.join("docker");
+        let log = dir.join("docker.log");
+        crate::testutil::write_executable_script(
+            &docker,
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+        );
+        let toml = format!(
+            r#"
+api_url = "http://localhost:8181"
+workspace_root = "{}"
+[execution]
+mode = "container"
+docker_binary = "{}"
+[driver]
+kind = "stub"
+"#,
+            dir.display(),
+            docker.display()
+        );
+        let config = Config::from_toml_str(&toml, Some("tok".to_string())).unwrap();
+        let commands = crate::project::ProjectCommands {
+            env_wrap: vec!["must-not-wrap".to_string()],
+            services_up: vec!["project-up".to_string(), "ready argument".to_string()],
+            services_wait: vec!["project-wait".to_string()],
+            services_down: vec!["project-down".to_string()],
+            image_init: vec![],
+            ..Default::default()
+        };
+        container_services(&config, 77, &[], &commands).await.unwrap();
+        let calls = std::fs::read_to_string(&log).unwrap();
+        let lines = calls.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2, "{calls}");
+        assert!(
+            lines[0].contains("remoter-run-77 env -u REMOTER_TOKEN project-up ready argument"),
+            "{calls}"
+        );
+        assert!(
+            lines[1].contains("remoter-run-77 env -u REMOTER_TOKEN project-wait"),
+            "{calls}"
+        );
+        assert!(
+            !calls.contains("must-not-wrap") && !calls.contains("just db-up"),
+            "{calls}"
+        );
+
+        let legacy_dir = dir.join("legacy");
+        std::fs::create_dir(&legacy_dir).unwrap();
+        std::fs::write(legacy_dir.join("devenv.nix"), "").unwrap();
+        std::fs::write(legacy_dir.join("justfile"), "").unwrap();
+        let legacy = crate::project::ProjectConfig::default()
+            .commands_for(crate::config::ExecutionMode::Container, &legacy_dir, &[])
+            .await
+            .unwrap();
+        std::fs::write(&log, "").unwrap();
+        container_services(&config, 77, &[], &legacy).await.unwrap();
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(calls.lines().count(), 1, "{calls}");
+        assert!(
+            calls.contains("devenv shell --no-tui --no-eval-cache -- just db-up"),
+            "{calls}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// The `db-up` contract is keyed on the worktree carrying a justfile:
     /// without one the container-mode `just db-up` step is skipped (it would
     /// die on `just: command not found`, exit 127, inside the run container);
@@ -2418,9 +2566,9 @@ mod tests {
     fn worktree_has_justfile_detects_contract() {
         let dir = std::env::temp_dir().join(format!("remoter-run-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(!worktree_has_justfile(&dir));
+        assert!(!crate::project::has_justfile(&dir));
         std::fs::write(dir.join("justfile"), "").unwrap();
-        assert!(worktree_has_justfile(&dir));
+        assert!(crate::project::has_justfile(&dir));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3387,8 +3535,10 @@ kind = "stub"
         let log_store = LogStore::new(&config.logs).unwrap();
         RunContext {
             client: RemoterClient::new(api_url, "tok", None),
+            driver_factory: DriverFactory::new(&config),
             config,
             driver: Arc::new(crate::driver::stub::StubDriver::new(0, false)),
+            project_config: crate::project::ProjectConfig::default(),
             task: TaskSummary {
                 id: 42,
                 project_id: 1,
@@ -3441,7 +3591,7 @@ kind = "stub"
             rc.task.id,
             99,
             Path::new("/unused"),
-            false,
+            &crate::project::ProjectCommands::default(),
             &[],
             &[],
         )

@@ -81,8 +81,10 @@ cargo install --git https://github.com/mktitov/remoter-agent remoter-agent
 cargo install --git https://github.com/mktitov/remoter-agent remoter-mcp
 ```
 
-Runtime prerequisites on the same host: `kimi` CLI (the ACP driver), `git`,
-and `devenv`. From source instead: `cargo build --release -p remoter-agent -p remoter-mcp`.
+Legacy-default runtime prerequisites on the same host: `kimi` CLI (the ACP
+driver), `git`, and `devenv`. Projects can replace the devenv commands through
+`.remoter/agent.toml`. From source instead:
+`cargo build --release -p remoter-agent -p remoter-mcp`.
 
 ## Running
 
@@ -133,18 +135,111 @@ The daemon talks to the backend over HTTP only. Which projects it works on is
 backend-owned metadata (`projects.repo_url` / `base_branch`, edited from the
 Flutter UI) — there is deliberately no project list in the TOML.
 
+## Project execution configuration (`.remoter/agent.toml`)
+
+A project can version `.remoter/agent.toml` to select an existing driver and
+replace its environment, service lifecycle, and image initialization commands.
+The daemon reads this file from the project's **synced central clone**, not from
+an agent-edited ticket worktree. The effective configuration applies to plan,
+implement, supervise, and review runs, and to container image builds.
+
+The optional top-level `driver` accepts only `stub`, `kimi-acp`, or
+`opencode-acp`. If omitted, it inherits `[driver].kind` from the daemon's
+`remoter-agent.toml`. All commands are argv arrays, not shell strings. For
+`env_wrap`, the daemon appends the ACP agent program and arguments; ACP stdio
+does not pass through an additional shell.
+
+This example contains every supported key and the legacy devenv argv:
+
+```toml
+# Optional: defaults to [driver].kind in remoter-agent.toml.
+driver = "kimi-acp"
+
+[commands]
+# The daemon appends the ACP agent program and arguments to this argv.
+env_wrap = ["devenv", "shell", "--no-tui", "--no-eval-cache", "--"]
+
+services_up = ["devenv", "--no-eval-cache", "up", "-d"]
+services_wait = ["devenv", "--no-eval-cache", "processes", "wait", "--timeout", "120"]
+services_down = ["devenv", "--no-eval-cache", "processes", "down"]
+
+# Runs in the init container at /repo before docker commit.
+image_init = ["devenv", "shell", "--no-tui", "--no-eval-cache", "--", "sh", "/opt/agent-init.sh"]
+```
+
+An absent file, an empty file, or a file without `[commands]` preserves all
+legacy command behavior. If `driver` is also absent, the configuration is fully
+legacy. Within `[commands]`, every field inherits independently: a missing field
+uses the legacy behavior for the current mode, while an explicit empty array
+`[]` disables that wrapper or step. Disabling one command does not disable or
+otherwise change any other command.
+
+| Missing field | Host / bwrap default | Container default | Image build default |
+|---|---|---|---|
+| `driver` | Daemon `[driver].kind`. | Daemon `[driver].kind`. | Daemon `[driver].kind`; the build itself launches no ACP agent. |
+| `env_wrap` | Auto-detect devenv from `devenv.nix`/`devenv.yaml`, otherwise run directly. Host uses `devenv shell --no-tui --no-eval-cache --`; bwrap uses its legacy `devenv --no-eval-cache shell --no-tui --` order. | Auto-detect the legacy devenv shell, otherwise run directly. | Not used. |
+| `services_up` | `devenv --no-eval-cache up -d` when the evaluated configuration contains processes; otherwise no step. | `just db-up` when the project uses devenv and has a justfile; otherwise no step. | Not used. |
+| `services_wait` | `devenv --no-eval-cache processes wait --timeout 120` when processes are configured; otherwise no step. | No separate wait; legacy `just db-up` checks readiness itself. | Not used. |
+| `services_down` | Best-effort `devenv --no-eval-cache processes down` when the project uses devenv; otherwise no step. | No step. | Not used. |
+| `image_init` | Not used. | Not used for run containers. | `devenv shell --no-tui --no-eval-cache -- sh /opt/agent-init.sh` when that script exists; otherwise `devenv shell --no-tui --no-eval-cache -- true`. |
+
+For example, this replaces only service startup and disables the separate wait:
+
+```toml
+[commands]
+services_up = ["just", "db-up"]
+services_wait = []
+```
+
+Here `just db-up` is responsible for readiness. `env_wrap`, `services_down`,
+and `image_init` still inherit their mode-specific legacy behavior, and `driver`
+still comes from the daemon. To remove devenv entirely, replace each relevant
+command or explicitly disable it with `[]`.
+
+An explicitly configured service command is used as written, not replaced or
+gated by a hidden `devenv eval processes`; process detection is only used to
+resolve missing fields that have process-dependent legacy defaults. Commands
+that need mode-specific behavior can inspect `REMOTER_CONTAINER` and
+`REMOTER_EXECUTION`. Bwrap argv must include any options its tools need for the
+read-only local Nix store.
+
+### Execution order
+
+- **host:** best-effort `services_down` → `services_up` → `services_wait`, then
+  the ACP agent through `env_wrap`; `services_down` runs again after the run.
+- **container:** the daemon starts and provisions the postgres/minio sidecars,
+  then runs `services_up` → `services_wait` inside the run container before
+  starting the ACP agent through `env_wrap`. There is no additional hardcoded
+  `just db-up` after sidecar startup.
+- **bwrap:** before creating the sandbox, the daemon runs `<env_wrap> true` on
+  the host to pre-warm the environment. Inside the sandbox it runs best-effort
+  `services_down` → `services_up` → `services_wait` → ACP agent through
+  `env_wrap`, with `services_down` trapped on exit. Service argv runs **inside**
+  the sandbox, where `/nix/store` is read-only; `services_up` cannot replace the
+  host pre-warm. Sandbox retention and Nix store-path handling cover the
+  configured command executables as well as the agent and MCP executables.
+- **image build:** the daemon runs `docker build`, executes `image_init` in the
+  init container at `/repo`, then freezes the result with `docker commit`.
+  Mounts, the Nix binary cache, and the surrounding build remain daemon-owned.
+
+Malformed TOML, unknown fields or drivers, and invalid argv are permanent
+configuration errors; they are not retried as transient failures. Invalid argv
+includes a non-array command, an empty executable, or an argument containing a
+NUL byte. Do not store tokens, credentials, or other secrets in this versioned
+file; provide secrets through the daemon's environment or secret configuration.
+
 ## The port contract (spec §5.8)
 
-A ticket worktree that uses devenv gets its services via
+With legacy defaults, a ticket worktree that uses devenv gets its services via
 `devenv --no-eval-cache up -d` when its evaluated configuration defines
 processes. Shell-only projects skip service startup and readiness after the
-usual best-effort cleanup. Parallel tickets of one project would collide on
-hardcoded service ports (two Postgreses, one
-port), so:
+usual best-effort cleanup. `.remoter/agent.toml` can replace or disable these
+commands. Parallel tickets of one project would collide on hardcoded service
+ports (two Postgreses, one port), so:
 
 1. The daemon allocates a unique **port block per run** (blocks of 50) and
    exports `REMOTER_AGENT_PORT_BASE` (plus `REMOTER_AGENT_TASK_ID` and
-   `CI=1`) into every `devenv --no-eval-cache shell/up` invocation.
+   `CI=1`) into the project environment and service commands.
 2. Projects parameterize their service ports from that variable, keeping the
    historical fixed value as the human default. The Remoter monorepo's
    `devenv.nix` is the reference:
@@ -168,19 +263,20 @@ docker container instead of on the host:
 
 - The daemon builds a **per-project agent image** from the project clone's
   `.remoter/agent.Dockerfile` (Nix + devenv + the agent CLI) plus the optional
-  `.remoter/agent-init.sh`, warming the project's devenv shell into the image
-  in an init container and freezing it with `docker commit`. The tag is
-  content-keyed — `<image_tag_prefix>:p<project_id>-<sha256-16>` — so an
-  unchanged Dockerfile hits the local cache and a changed one rebuilds.
-  A project without `.remoter/agent.Dockerfile` is a hard error (no silent
-  fallback to host mode).
+  `.remoter/agent-init.sh`. The configured `image_init` argv runs in an init
+  container before `docker commit`; its legacy default warms devenv and runs
+  the optional init script. The tag is content-keyed —
+  `<image_tag_prefix>:p<project_id>-<sha256-16>` — so an unchanged build
+  context hits the local cache and a changed one rebuilds. A project without
+  `.remoter/agent.Dockerfile` is a hard error (no silent fallback to host mode).
 - Each run gets a fresh run container (worktree at `/work`, `repo/.git` at its
   host path, `agent_home` mounted as `$HOME`/`/root`) plus **postgres and
   minio sidecars sharing its network namespace** — inside, Postgres is always
   `127.0.0.1:5432` and MinIO `127.0.0.1:9000`, so the §5.8 port contract does
   not apply and `REMOTER_AGENT_PORT_BASE` is never exported.
-- Agent commands run as `docker exec … devenv shell --no-tui --no-eval-cache
-  -- <cmd>` — the same devenv shell as on the host, just inside Linux.
+- Agent commands use the configured `env_wrap`. The legacy default is `docker
+  exec … devenv shell --no-tui --no-eval-cache -- <cmd>` — the same devenv
+  shell as on the host, just inside Linux.
 - Prerequisites: a working docker daemon (checked via `docker info` at
   startup; the daemon refuses to boot without it) and the pinned sidecar
   images (pulled on first use).
@@ -198,14 +294,15 @@ docker container instead of on the host:
 ## Bubblewrap mode (rootless NixOS isolation)
 
 `[execution] mode = "bwrap"` isolates each ACP turn with Linux namespaces. It
-needs neither Docker, a per-project image, systemd-nspawn, root, nor sudo. The
-project keeps its own `devenv.nix` services; no Postgres/MinIO sidecars are
-created.
+needs neither Docker, a per-project image, systemd-nspawn, root, nor sudo. By
+default the project uses its own `devenv.nix` services; `.remoter/agent.toml`
+can replace those commands. No Postgres/MinIO sidecars are created.
 
 ### Prerequisites and configuration
 
 Use NixOS with unprivileged user namespaces enabled (the normal NixOS default)
-and put the tools on the daemon's PATH:
+and put the required tools on the daemon's PATH (`devenv` is needed for the
+legacy defaults):
 
 ```nix
 # NixOS host configuration
@@ -249,23 +346,24 @@ if startup fails its namespace smoke test.
 
 ### What happens on a run
 
-1. The daemon prepares the same ticket worktree and performs a real host
-   `devenv --no-eval-cache shell --no-tui -- true`. This fetches inputs and
-   realizes the shell/process closures. It deliberately does **not** use bare
-   `devenv build`, which does not warm the required environment in devenv 2.1.2.
-2. One Rust launcher per ACP turn creates GC roots for the launcher, agent, and
-   late-started `remoter-mcp` executable, then starts `bwrap` plus `slirp4netns`.
-   The guest reaches the host Nix daemon through its socket, so devenv commands
-   can realize derivations created or changed after the host pre-warm.
-3. Inside the sandbox it evaluates the configured processes. If any exist, it
-   runs best-effort `devenv processes down`, then `devenv up -d` and
-   `devenv processes wait --timeout 120`; shell-only projects skip this
-   lifecycle. It then `exec`s the agent with the original ACP stdio. Services
+1. The daemon prepares the same ticket worktree and runs `<env_wrap> true` on
+   the host. The legacy default is `devenv --no-eval-cache shell --no-tui --
+   true`, which fetches inputs and realizes the shell/process closures. It
+   deliberately does **not** use bare `devenv build`, which does not warm the
+   required environment in devenv 2.1.2.
+2. One Rust launcher per ACP turn creates GC roots for the launcher, agent,
+   late-started `remoter-mcp`, and configured command executables, then starts
+   `bwrap` plus `slirp4netns`. The guest reaches the host Nix daemon through its
+   socket, so commands can realize derivations created or changed after pre-warm.
+3. Inside the sandbox it runs best-effort `services_down`, then `services_up`
+   and `services_wait`, and finally `exec`s the agent through `env_wrap` with
+   the original ACP stdio. With legacy defaults, process detection controls the
+   devenv up/wait lifecycle and shell-only projects skip those steps. Services
    stop on exit; cancellation, timeout, SIGTERM and SIGKILL are bounded by
-   `--die-with-parent` and the
-   network helper's exit fd. A launcher parent-death signal extends the same
-   cleanup to daemon crashes, including SIGKILL. Stale state is reconciled using
-   PID plus process start time, so active or unrelated runs are not removed.
+   `--die-with-parent` and the network helper's exit fd. A launcher parent-death
+   signal extends the same cleanup to daemon crashes, including SIGKILL. Stale
+   state is reconciled using PID plus process start time, so active or unrelated
+   runs are not removed.
 
 The sandbox has separate user/PID/IPC/UTS/network namespaces and independent
 localhost. Parallel tickets can therefore both use `127.0.0.1:5432` without a
