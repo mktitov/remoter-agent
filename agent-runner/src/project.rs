@@ -87,25 +87,10 @@ impl ProjectConfig {
             .await
             .map_err(|e| DriverError::Transient(format!("fetch project config base {base}: {e}")))?;
         let spec = format!("origin/{base}:{CONFIG_REL}");
-        let output = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(["show", &spec])
-            .output()
-            .await
-            .map_err(|e| DriverError::Transient(format!("read project config from {spec}: {e}")))?;
-        if !output.status.success() {
-            if output.status.code() == Some(128) {
-                return Ok(Self::default());
-            }
-            return Err(DriverError::Permanent(format!(
-                "cannot read {spec}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
+        match read_git_file(repo, &spec, "git").await? {
+            Some(text) => Self::parse(&text),
+            None => Ok(Self::default()),
         }
-        let text = String::from_utf8(output.stdout)
-            .map_err(|e| DriverError::Permanent(format!("invalid UTF-8 in {spec}: {e}")))?;
-        Self::parse(&text)
     }
 
     pub async fn commands_for(
@@ -215,6 +200,44 @@ impl ProjectConfig {
             }
         })
     }
+}
+
+async fn read_git_file(repo: &Path, spec: &str, git_program: &str) -> Result<Option<String>, DriverError> {
+    let Some((treeish, path)) = spec.split_once(':') else {
+        return Err(DriverError::Permanent(format!("invalid git file spec {spec}")));
+    };
+    let listing = tokio::process::Command::new(git_program)
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-tree", "--name-only", treeish, "--", path])
+        .output()
+        .await
+        .map_err(|e| DriverError::Transient(format!("inspect {spec}: {e}")))?;
+    if !listing.status.success() {
+        return Err(DriverError::Permanent(format!(
+            "cannot inspect {spec}: {}",
+            String::from_utf8_lossy(&listing.stderr)
+        )));
+    }
+    if listing.stdout.is_empty() {
+        return Ok(None);
+    }
+    let output = tokio::process::Command::new(git_program)
+        .arg("-C")
+        .arg(repo)
+        .args(["show", spec])
+        .output()
+        .await
+        .map_err(|e| DriverError::Transient(format!("read project config from {spec}: {e}")))?;
+    if !output.status.success() {
+        return Err(DriverError::Permanent(format!(
+            "cannot read {spec}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    String::from_utf8(output.stdout)
+        .map(Some)
+        .map_err(|e| DriverError::Permanent(format!("invalid UTF-8 in {spec}: {e}")))
 }
 
 fn validate_command(name: &str, command: Option<&[String]>) -> Result<(), DriverError> {
@@ -343,6 +366,28 @@ mod tests {
             "driver = \"kimi-acp\"",
             "the shared checkout must not be advanced by run configuration loading"
         );
+        git(&seed, &["rm", ".remoter/agent.toml"]);
+        git(&seed, &["commit", "-m", "remove config"]);
+        assert_eq!(
+            ProjectConfig::from_git(&clone, Some("main")).await.unwrap(),
+            ProjectConfig::default(),
+            "a genuinely missing path keeps legacy defaults"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_show_failure_is_not_mistaken_for_missing_config() {
+        let dir = TestDir::new();
+        let git = dir.path().join("git-stub");
+        crate::testutil::write_executable_script(
+            &git,
+            "#!/bin/sh\nif [ \"$3\" = ls-tree ]; then printf '.remoter/agent.toml\\n'; exit 0; fi\nif [ \"$3\" = show ]; then echo 'fatal: simulated corrupt object' >&2; exit 128; fi\nexit 99\n",
+        );
+        let error = read_git_file(dir.path(), "origin/main:.remoter/agent.toml", git.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DriverError::Permanent(_)), "{error}");
+        assert!(error.to_string().contains("simulated corrupt object"), "{error}");
     }
 
     #[test]
