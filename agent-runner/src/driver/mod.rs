@@ -41,12 +41,12 @@ pub struct RunSpec {
     pub resume_session: Option<String>,
     /// Working branch (`agent/task-<id>-<slug>`) — for drivers that need it.
     pub branch: String,
-    /// Extra env for the agent process (and its devenv services):
+    /// Extra env for the agent process and project service commands:
     /// `CI`, `REMOTER_AGENT_PORT_BASE` (host mode), `REMOTER_CONTAINER`,
     /// `REMOTER_AGENT_TASK_ID` (spec §5.8 + containers spec §3.4).
     pub env: Vec<(String, String)>,
-    /// Where the agent process executes: on the host (optionally via
-    /// `devenv shell --`) or inside the run container via `docker exec`.
+    /// Where the agent process executes and which project `env_wrap` argv
+    /// prefixes it: host, run container, or Bubblewrap sandbox.
     pub exec: crate::workspace::ExecEnv,
     /// ACP `session/set_config_option` pairs (`config_id` → `value`) to apply
     /// after the session is created/resumed (spec §5.5). Empty for the stub
@@ -156,31 +156,78 @@ pub trait AgentDriver: Send + Sync {
     async fn run(&self, spec: RunSpec) -> Result<RunOutcome, RunFailure>;
 }
 
-/// Builds the configured driver. The ACP driver needs the API URL + agent token
-/// to inject into the per-session `remoter` MCP server (spec §5.6). The daemon's
-/// effective workspace is also forwarded so the spawned `remoter-mcp` does not
-/// fail on multi-workspace agents.
-pub fn from_config(
-    cfg: &DriverConfig,
-    api_url: &str,
-    token: &str,
+/// Builds drivers from the effective configuration of each project run.
+#[derive(Clone)]
+pub struct DriverFactory {
+    api_url: String,
+    token: String,
     workspace_id: Option<i32>,
     stall_idle_secs: u64,
     stall_grace_secs: u64,
-) -> anyhow::Result<std::sync::Arc<dyn AgentDriver>> {
-    match cfg.kind.as_str() {
-        "stub" => Ok(std::sync::Arc::new(stub::StubDriver::new(
-            cfg.simulate_delay_ms,
-            cfg.simulate_uncommitted_changes,
-        ))),
-        "kimi-acp" | "opencode-acp" => Ok(std::sync::Arc::new(acp::AcpDriver::new(
-            cfg,
-            api_url,
-            token,
-            workspace_id,
-            stall_idle_secs,
-            stall_grace_secs,
-        ))),
-        other => anyhow::bail!("unknown driver kind {other:?} (expected \"stub\", \"kimi-acp\", or \"opencode-acp\")"),
+}
+
+impl DriverFactory {
+    pub fn new(config: &crate::config::Config) -> Self {
+        Self {
+            api_url: config.api_url.clone(),
+            token: config.token.clone(),
+            workspace_id: config.workspace_id,
+            stall_idle_secs: config.stall_idle_secs,
+            stall_grace_secs: config.stall_grace_secs,
+        }
+    }
+
+    pub fn build(&self, cfg: &DriverConfig) -> anyhow::Result<std::sync::Arc<dyn AgentDriver>> {
+        match cfg.kind.as_str() {
+            "stub" => Ok(std::sync::Arc::new(stub::StubDriver::new(
+                cfg.simulate_delay_ms,
+                cfg.simulate_uncommitted_changes,
+            ))),
+            "kimi-acp" | "opencode-acp" => Ok(std::sync::Arc::new(acp::AcpDriver::new(
+                cfg,
+                &self.api_url,
+                &self.token,
+                self.workspace_id,
+                self.stall_idle_secs,
+                self.stall_grace_secs,
+            ))),
+            other => {
+                anyhow::bail!("unknown driver kind {other:?} (expected \"stub\", \"kimi-acp\", or \"opencode-acp\")")
+            }
+        }
+    }
+
+    pub fn validate(&self, cfg: &DriverConfig) -> anyhow::Result<()> {
+        self.build(cfg).map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn factory_builds_existing_kinds_and_rejects_unknown_ones() {
+        let config = crate::config::Config::from_toml_str(
+            r#"
+api_url = "http://localhost:8181"
+workspace_root = "/tmp/remoter-driver-factory-test"
+
+[driver]
+kind = "stub"
+"#,
+            Some("tok".to_string()),
+        )
+        .unwrap();
+        let factory = DriverFactory::new(&config);
+        for kind in ["stub", "kimi-acp", "opencode-acp"] {
+            let mut driver = config.driver.clone();
+            driver.kind = kind.to_string();
+            factory.validate(&driver).unwrap();
+        }
+        let mut driver = config.driver.clone();
+        driver.kind = "unknown".to_string();
+        let error = factory.validate(&driver).unwrap_err().to_string();
+        assert!(error.contains("unknown driver kind"), "{error}");
     }
 }
