@@ -237,8 +237,9 @@ impl AgentDriver for AcpDriver {
 
                 // Bounce/re-plan runs resume the previous session of the same
                 // kind. Question runs instead fork the source when the agent
-                // advertises session.fork; without fork or a source session they
-                // use a fresh session with the self-contained read-only prompt.
+                // advertises session.fork; without fork, a source session, or a
+                // successful fork request they use a fresh session with the
+                // self-contained read-only prompt.
                 let mut resumed = false;
                 let mut used_fallback = false;
                 let (mut session_id, advertised) = if read_only {
@@ -251,7 +252,21 @@ impl AgentDriver for AcpDriver {
                                 .is_some() =>
                         {
                             tracing::info!(session_id = %id, "forking source session for question");
-                            fork_session(&cx, &id, &cwd, &mcp_servers).await?
+                            match fork_session(&cx, &id, &cwd, &mcp_servers).await {
+                                Ok((forked, _)) if forked.0.as_ref() == id => {
+                                    return Err(agent_client_protocol::Error::new(
+                                        -32603,
+                                        "permanent driver error: session/fork returned the source session id",
+                                    ));
+                                }
+                                Ok(forked) => forked,
+                                Err(e) => {
+                                    tracing::warn!(session_id = %id, error = %e,
+                                        "session fork failed; using question fallback");
+                                    used_fallback = true;
+                                    new_session(&cx, &cwd, &mcp_servers).await?
+                                }
+                            }
                         }
                         Some(id) => {
                             tracing::info!(session_id = %id, "agent has no session.fork capability; using question fallback");
@@ -627,12 +642,6 @@ async fn fork_session(
         )
         .block_task()
         .await?;
-    if resp.session_id.0.as_ref() == session_id {
-        return Err(agent_client_protocol::Error::new(
-            -32603,
-            "permanent driver error: session/fork returned the source session id",
-        ));
-    }
     Ok((resp.session_id, resp.config_options.unwrap_or_default()))
 }
 

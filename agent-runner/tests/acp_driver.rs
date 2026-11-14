@@ -895,3 +895,51 @@ async fn question_without_fork_capability_uses_self_contained_fallback() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[tokio::test]
+async fn question_fork_failure_uses_self_contained_fallback() {
+    let dir = test_dir("question-fork-error-fallback");
+    let capture = dir.join("capture.jsonl");
+    let env = vec![
+        ("FAKE_AGENT_CAPTURE".to_string(), capture.to_string_lossy().to_string()),
+        ("FAKE_AGENT_ECHO_CONTEXT".to_string(), "1".to_string()),
+        (
+            "FAKE_AGENT_STATE".to_string(),
+            dir.join("state.json").to_string_lossy().to_string(),
+        ),
+    ];
+
+    let outcome = driver()
+        .run(question_spec(
+            &dir,
+            "question prompt without the marker",
+            Some("missing-source".to_string()),
+            "Fallback after fork error: SECRET-FORK-ERROR-789. Answer read-only.",
+            env,
+        ))
+        .await
+        .expect("fork failure should use a fresh fallback session");
+    assert!(outcome.text.contains("SECRET-FORK-ERROR-789"), "{}", outcome.text);
+    assert_ne!(outcome.session_id.as_deref(), Some("missing-source"));
+
+    let events = read_capture(&capture);
+    assert!(
+        events
+            .iter()
+            .filter_map(|e| e.get("session_fork"))
+            .any(|fork| fork["source"] == serde_json::json!("missing-source")),
+        "{events:?}"
+    );
+    assert!(events.iter().any(|e| e.get("session_new").is_some()), "{events:?}");
+    assert!(events.iter().all(|e| e.get("session_resume").is_none()), "{events:?}");
+    let prompts: Vec<&serde_json::Value> = events.iter().filter_map(|e| e.get("prompt")).collect();
+    assert!(
+        prompts
+            .last()
+            .unwrap()
+            .to_string()
+            .contains("Fallback after fork error")
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

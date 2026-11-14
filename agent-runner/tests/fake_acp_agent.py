@@ -228,6 +228,7 @@ for line in sys.stdin:
     elif method == "session/fork":
         source = msg["params"].get("sessionId")
         if source not in histories:
+            record({"session_fork": {"source": source, "error": "no such session"}})
             send({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32002, "message": "no such session"}})
             continue
         session_count += 1

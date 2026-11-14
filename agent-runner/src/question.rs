@@ -141,6 +141,9 @@ pub async fn execute(qc: QuestionContext) {
         }
         Err(e) => {
             tracing::warn!(task_id, question_id, error = %e, "question: could not start run");
+            if let Some(started) = recover_committed_start(&qc, question_id).await {
+                finish_failure(&qc, &started, format!("question start resolution failed: {e}"), None).await;
+            }
             return;
         }
     };
@@ -201,14 +204,47 @@ pub async fn execute(qc: QuestionContext) {
             body.output_tokens = outcome.output_tokens;
             body.model = outcome.model;
             body.thinking = outcome.thinking;
-            if let Err(e) = qc.client.finish_run(run_id, &body).await {
-                tracing::warn!(task_id, question_id, run_id, error = %e, "question: could not record answer");
-            } else {
-                tracing::info!(task_id, question_id, run_id, "question run succeeded");
+            match finish_run_with_retry(&qc, run_id, &body).await {
+                Ok(()) => tracing::info!(task_id, question_id, run_id, "question run succeeded"),
+                Err(e) => {
+                    tracing::warn!(task_id, question_id, run_id, error = %e, "question: could not record answer")
+                }
             }
         }
         Err(failure) => finish_failure(&qc, &started, failure.to_string(), Some(&failure)).await,
     }
+}
+
+async fn recover_committed_start(qc: &QuestionContext, question_id: i32) -> Option<StartedQuestion> {
+    let task_id = qc.trigger.task.id;
+    let question = qc
+        .client
+        .task_agent_questions(task_id)
+        .await
+        .ok()?
+        .into_iter()
+        .find(|q| {
+            q.id == question_id && q.run_id.is_some() && matches!(q.status.as_str(), "running" | "cancel_requested")
+        })?;
+    let runs = qc.client.list_runs(task_id).await.ok()?;
+    let run = runs
+        .iter()
+        .find(|r| Some(r.id) == question.run_id && r.kind == QUESTION_RUN_KIND && r.status == "running")
+        .cloned()?;
+    let source_run = question
+        .source_run_id
+        .and_then(|source_id| runs.iter().find(|r| r.id == source_id).cloned());
+    tracing::info!(
+        task_id,
+        question_id,
+        run_id = run.id,
+        "recovered committed question run after start resolution failure"
+    );
+    Some(StartedQuestion {
+        question,
+        run,
+        source_run,
+    })
 }
 
 fn question_cwd(qc: &QuestionContext) -> PathBuf {
@@ -483,6 +519,26 @@ fn question_env(qc: &QuestionContext) -> Vec<(String, String)> {
     run::host_run_env(&qc.config, qc.trigger.task.id, qc.port_block.as_ref())
 }
 
+async fn finish_run_with_retry(
+    qc: &QuestionContext,
+    run_id: i32,
+    body: &FinishRunBody,
+) -> Result<(), crate::client::ClientError> {
+    let mut backoff = Duration::from_secs(qc.config.retry_backoff_secs.max(1));
+    loop {
+        match qc.client.finish_run(run_id, body).await {
+            Ok(_) => return Ok(()),
+            Err(e) if e.is_transient() => {
+                tracing::warn!(run_id, error = %e, backoff_secs = backoff.as_secs(),
+                    "question: transient finish failure; retrying");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(60));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 async fn finish_failure(qc: &QuestionContext, started: &StartedQuestion, error: String, failure: Option<&RunFailure>) {
     let mut body = FinishRunBody::failed(error);
     if let Some(failure) = failure {
@@ -490,7 +546,7 @@ async fn finish_failure(qc: &QuestionContext, started: &StartedQuestion, error: 
         body.input_tokens = failure.input_tokens;
         body.output_tokens = failure.output_tokens;
     }
-    if let Err(e) = qc.client.finish_run(started.run.id, &body).await {
+    if let Err(e) = finish_run_with_retry(qc, started.run.id, &body).await {
         tracing::warn!(run_id = started.run.id, error = %e, "question: could not record failure");
     }
 }
@@ -513,7 +569,7 @@ async fn finish_cancelled(qc: &QuestionContext, started: &StartedQuestion, failu
         body.input_tokens = failure.input_tokens;
         body.output_tokens = failure.output_tokens;
     }
-    if let Err(e) = qc.client.finish_run(started.run.id, &body).await {
+    if let Err(e) = finish_run_with_retry(qc, started.run.id, &body).await {
         tracing::warn!(run_id = started.run.id, error = %e, "question: could not record cancellation");
     }
 }
@@ -533,7 +589,7 @@ impl WorktreeSnapshot {
         let head = git_output(cwd, &["rev-parse", "HEAD"]).await?;
         let status = git_output(cwd, &["status", "--porcelain=v1", "-z", "--untracked-files=all"]).await?;
         let diff = git_output(cwd, &["diff", "--binary", "HEAD"]).await?;
-        let names = git_output(cwd, &["ls-files", "--others", "--exclude-standard", "-z"]).await?;
+        let names = git_output(cwd, &["ls-files", "--others", "-z"]).await?;
         let mut untracked = Vec::new();
         for name in names.split(|b| *b == 0).filter(|name| !name.is_empty()) {
             let path = cwd.join(path_from_git_name(name));
@@ -962,6 +1018,7 @@ mod tests {
             (200, detail.to_string()),
             (200, serde_json::json!([current]).to_string()),
             (200, runs.to_string()),
+            (500, "{}".to_string()),
             (
                 200,
                 run_json(40, "question", "succeeded", Some("stub-question")).to_string(),
@@ -974,7 +1031,7 @@ mod tests {
 
         assert_eq!(before, WorktreeSnapshot::capture(&worktree).await.unwrap());
         let calls = requests.lock().unwrap().clone();
-        assert_eq!(calls.len(), 7, "{calls:?}");
+        assert_eq!(calls.len(), 8, "{calls:?}");
         assert!(calls[0].starts_with("POST /api/v1/agent-questions/4/run "));
         assert_eq!(calls[1], "GET /api/v1/tasks/7/agent-runs HTTP/1.1");
         assert_eq!(calls[2], "GET /api/v1/tasks/7/agent-runs HTTP/1.1");
@@ -982,12 +1039,79 @@ mod tests {
         assert_eq!(calls[4], "GET /api/v1/tasks/7/agent-questions HTTP/1.1");
         assert_eq!(calls[5], "GET /api/v1/tasks/7/agent-runs HTTP/1.1");
         assert_eq!(calls[6], "PATCH /api/v1/agent-runs/40 HTTP/1.1");
+        assert_eq!(calls[7], "PATCH /api/v1/agent-runs/40 HTTP/1.1");
         assert!(
             calls
                 .iter()
                 .all(|c| !c.contains("/status") && !c.contains("/comments") && !c.contains("forge"))
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn committed_start_resolution_failure_finishes_recovered_run() {
+        let root = std::env::temp_dir().join(format!("remoter-question-start-recovery-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let current = question_json(4, "running", Some(40));
+        let runs = serde_json::json!([
+            run_json(40, "question", "running", None),
+            run_json(10, "implement", "succeeded", Some("source-session"))
+        ]);
+        let (url, requests) = spawn_backend(vec![
+            (200, current.to_string()),
+            (500, "{}".to_string()),
+            (200, serde_json::json!([current]).to_string()),
+            (200, runs.to_string()),
+            (200, run_json(40, "question", "failed", None).to_string()),
+        ])
+        .await;
+        let mut pending = question(4, "pending", None);
+        pending.source_run_id = Some(10);
+        execute(test_context(&url, &root, pending)).await;
+
+        let calls = requests.lock().unwrap().clone();
+        assert_eq!(calls.len(), 5, "{calls:?}");
+        assert!(calls[0].starts_with("POST /api/v1/agent-questions/4/run "));
+        assert_eq!(calls[1], "GET /api/v1/tasks/7/agent-runs HTTP/1.1");
+        assert_eq!(calls[2], "GET /api/v1/tasks/7/agent-questions HTTP/1.1");
+        assert_eq!(calls[3], "GET /api/v1/tasks/7/agent-runs HTTP/1.1");
+        assert_eq!(calls[4], "PATCH /api/v1/agent-runs/40 HTTP/1.1");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn snapshot_detects_ignored_file_creation_and_modification() {
+        let dir = std::env::temp_dir().join(format!("remoter-question-ignored-snapshot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        init_repo(&dir);
+        std::fs::write(dir.join(".gitignore"), ".cache/\n").unwrap();
+        for args in [
+            vec!["add", ".gitignore"],
+            vec![
+                "-c",
+                "user.email=test@remoter",
+                "-c",
+                "user.name=test",
+                "commit",
+                "-qm",
+                "ignore cache",
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .current_dir(&dir)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let before = WorktreeSnapshot::capture(&dir).await.unwrap();
+        std::fs::create_dir(dir.join(".cache")).unwrap();
+        std::fs::write(dir.join(".cache/answer.tmp"), "created\n").unwrap();
+        let created = WorktreeSnapshot::capture(&dir).await.unwrap();
+        assert_ne!(before, created);
+        std::fs::write(dir.join(".cache/answer.tmp"), "modified\n").unwrap();
+        assert_ne!(created, WorktreeSnapshot::capture(&dir).await.unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
