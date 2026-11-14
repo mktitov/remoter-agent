@@ -453,30 +453,25 @@ async fn run_attempt(
     let branch = workspace::existing_branch(&qc.config.workspace_root, qc.project.project_id, qc.trigger.task.id)
         .await
         .unwrap_or_default();
-    let containers = if qc.config.execution.is_container() {
-        match run::start_container_runtime(
-            &qc.config,
-            &qc.image_locks,
-            &qc.project,
-            qc.trigger.task.id,
-            started.run.id,
-            cwd,
-            false,
-            &env,
-            &[],
-        )
-        .await
-        {
-            Ok(runtime) => runtime,
-            Err(failure) => return Err(failure),
-        }
-    } else {
-        None
+    let containers = match run::start_container_runtime(
+        &qc.config,
+        &qc.image_locks,
+        &qc.project,
+        qc.trigger.task.id,
+        started.run.id,
+        cwd,
+        false,
+        &env,
+        &[],
+    )
+    .await
+    {
+        Ok(runtime) => runtime,
+        Err(failure) => return Err(failure),
     };
-    let exec = if containers.is_some() {
-        run::exec_env(&qc.config, started.run.id, false)
-    } else {
-        workspace::ExecEnv::host(false)
+    let exec = match &containers {
+        Some(_) => run::exec_env(&qc.config, started.run.id, false),
+        None => workspace::ExecEnv::host(false),
     };
     let spec = RunSpec {
         task_id: qc.trigger.task.id,
@@ -577,6 +572,7 @@ async fn finish_cancelled(qc: &QuestionContext, started: &StartedQuestion, failu
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeSnapshot {
     head: String,
+    symbolic_head: Vec<u8>,
     status: Vec<u8>,
     diff: Vec<u8>,
     untracked: Vec<(Vec<u8>, [u8; 32])>,
@@ -587,6 +583,9 @@ impl WorktreeSnapshot {
         use sha2::{Digest, Sha256};
 
         let head = git_output(cwd, &["rev-parse", "HEAD"]).await?;
+        let symbolic_head = git_output(cwd, &["symbolic-ref", "--quiet", "HEAD"])
+            .await
+            .unwrap_or_default();
         let status = git_output(cwd, &["status", "--porcelain=v1", "-z", "--untracked-files=all"]).await?;
         let diff = git_output(cwd, &["diff", "--binary", "HEAD"]).await?;
         let names = git_output(cwd, &["ls-files", "--others", "-z"]).await?;
@@ -610,6 +609,7 @@ impl WorktreeSnapshot {
         }
         Ok(Self {
             head: String::from_utf8_lossy(&head).trim().to_string(),
+            symbolic_head,
             status,
             diff,
             untracked,
@@ -898,6 +898,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn snapshot_detects_branch_change_at_the_same_commit() {
+        let dir = std::env::temp_dir().join(format!("remoter-question-branch-snapshot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        init_repo(&dir);
+        let before = WorktreeSnapshot::capture(&dir).await.unwrap();
+        let status = std::process::Command::new("git")
+            .current_dir(&dir)
+            .args(["checkout", "-q", "-b", "question-side-effect"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let after = WorktreeSnapshot::capture(&dir).await.unwrap();
+        assert_eq!(before.head, after.head);
+        assert_ne!(before, after);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn test_context(api_url: &str, root: &Path, question: AgentQuestionDto) -> QuestionContext {
         let toml = format!(
             "api_url = \"{api_url}\"\nworkspace_root = \"{}\"\n[driver]\nkind = \"stub\"\n",
@@ -925,6 +943,60 @@ mod tests {
             cancel: CancellationToken::new(),
             log_store,
         }
+    }
+
+    #[derive(Default)]
+    struct CaptureDriver {
+        spec: Mutex<Option<RunSpec>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentDriver for CaptureDriver {
+        async fn run(&self, spec: RunSpec) -> Result<RunOutcome, RunFailure> {
+            self.spec.lock().unwrap().replace(spec);
+            Ok(RunOutcome {
+                session_id: Some("question-fork".to_string()),
+                text: "answer".to_string(),
+                input_tokens: None,
+                output_tokens: None,
+                model: None,
+                thinking: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn bwrap_question_run_uses_bwrap_exec_instead_of_host() {
+        let root = std::env::temp_dir().join(format!("remoter-question-bwrap-exec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let worktree = workspace::worktree_dir(&root, 1, 7);
+        init_repo(&worktree);
+        let mut qc = test_context("http://127.0.0.1:9", &root, question(4, "pending", None));
+        let toml = format!(
+            "api_url = \"http://127.0.0.1:9\"\nworkspace_root = \"{}\"\n[execution]\nmode = \"bwrap\"\n[driver]\nkind = \"stub\"\n",
+            root.display()
+        );
+        qc.config = Arc::new(Config::from_toml_str(&toml, Some("tok".to_string())).unwrap());
+        let driver = Arc::new(CaptureDriver::default());
+        qc.driver = driver.clone();
+        let started = StartedQuestion {
+            question: question(4, "running", Some(40)),
+            run: run(40, QUESTION_RUN_KIND, None),
+            source_run: None,
+        };
+        let prepared = PreparedPrompt {
+            prompt: "question".to_string(),
+            fallback_prompt: "fallback".to_string(),
+            fork_session: None,
+        };
+
+        run_attempt(&qc, &started, &prepared, &worktree, &SessionLogger::noop())
+            .await
+            .unwrap();
+
+        let spec = driver.spec.lock().unwrap().take().unwrap();
+        assert!(matches!(&spec.exec, workspace::ExecEnv::Bwrap(_)), "{:?}", spec.exec);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -165,14 +165,16 @@ source-session resume for a fork.
 If fork or a source session is unavailable, or the `session/fork` request fails,
 a fresh read-only session receives a bounded fallback prompt: the original run
 prompt/log, current plan/diff/report, and previous Q&A. A fork that returns the
-source session ID remains an error. Question turns use the `dev-agent-question`
-MCP role, deny all permission requests, and compare HEAD plus tracked, untracked,
-and ignored worktree state before and after. Any unexpected change fails the
-answer. Terminal run updates retry transient backend failures, and a committed
-question start is recovered and closed if resolving its run history fails. Q&A
-never performs
-status transitions, workflow comments, outcome/report writes, pushes, forge
-calls, or PR creation. The common history prefix can make a provider prompt-cache
+source session ID remains an error. Question turns use the selected host,
+container, or bwrap runtime without falling back to another execution mode. They
+use the `dev-agent-question` MCP role, deny all permission requests, and compare
+the commit and symbolic HEAD plus tracked, untracked, and ignored worktree state
+before and after. Any unexpected change, including a branch switch at the same
+commit, fails the answer. Terminal run updates retry transient backend failures,
+and a committed question start is recovered and closed if resolving its run
+history fails. Q&A never performs status transitions, workflow comments,
+outcome/report writes, pushes, forge calls, or PR creation. The common history
+prefix can make a provider prompt-cache
 hit possible, but cache reuse is **not guaranteed or asserted** without provider
 usage metrics.
 
