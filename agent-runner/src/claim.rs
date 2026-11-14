@@ -307,6 +307,9 @@ impl Daemon {
         for question in questions.cancellations {
             self.cancel_question(question).await;
         }
+        for question in questions.running {
+            self.reconcile_orphan_question(question).await;
+        }
         for trigger in questions.pending {
             self.launch_question(trigger).await;
         }
@@ -877,11 +880,16 @@ impl Daemon {
         }
         // Restart/cancel race reconciliation: there is no local driver left to
         // stop, but the server still has a running question-run to close.
-        if let Some(run_id) = question.run_id {
-            let body = crate::client::FinishRunBody::failed("cancelled by user".to_string());
-            if let Err(e) = self.client.finish_run(run_id, &body).await {
-                tracing::warn!(question_id = question.id, run_id, error = %e, "question: cancellation reconciliation failed");
-            }
+        crate::question::reconcile_orphan(&self.client, &question).await;
+    }
+
+    async fn reconcile_orphan_question(&self, question: crate::client::AgentQuestionDto) {
+        let locally_active = self
+            .running
+            .get(&question.task_id)
+            .is_some_and(|entry| entry.kind == RunKind::Question && entry.question_id == Some(question.id));
+        if !locally_active {
+            crate::question::reconcile_orphan(&self.client, &question).await;
         }
     }
 
@@ -916,6 +924,21 @@ mod tests {
     /// responses in request order, one connection each (`connection: close`
     /// forces reqwest to reconnect, so response N maps to request N).
     async fn spawn_mock_backend(responses: Vec<(u16, &'static str)>) -> String {
+        spawn_mock_backend_impl(responses, None).await
+    }
+
+    async fn spawn_recording_mock_backend(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let url = spawn_mock_backend_impl(responses, Some(requests.clone())).await;
+        (url, requests)
+    }
+
+    async fn spawn_mock_backend_impl(
+        responses: Vec<(u16, &'static str)>,
+        recorded: Option<Arc<std::sync::Mutex<Vec<String>>>>,
+    ) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -954,6 +977,12 @@ mod tests {
                             "backend rejects agent-run status {status}"
                         );
                     }
+                }
+                if let Some(recorded) = &recorded {
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&request).into_owned());
                 }
                 let response = format!(
                     "HTTP/1.1 {status} Reason\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -1159,6 +1188,103 @@ kind = "stub"
         .await;
         let daemon = test_daemon(&url);
         daemon.reconcile().await;
+    }
+
+    async fn reconcile_running_question_poll(daemon: &mut Daemon) {
+        let poll = daemon.questioner.poll(&daemon.client).await;
+        assert!(poll.pending.is_empty());
+        assert!(poll.cancellations.is_empty());
+        assert_eq!(poll.running.len(), 1);
+        for question in poll.running {
+            daemon.reconcile_orphan_question(question).await;
+        }
+    }
+
+    const REVIEW_TASK: &str = r#"[{"id":7,"projectId":1,"projectName":"proj","featureId":1,"featureDescription":"feat","title":"t","description":"d","taskStatus":"review","actionsTotal":0,"actionsCompleted":0,"timeSpent":0,"blocked":false}]"#;
+    const RUNNING_QUESTION_RUN: &str = r#"[{"id":42,"task_id":7,"agent_user_id":2,"kind":"question","status":"running","session_id":"fork","branch":null,"plan":null,"summary":null,"error":null,"pr_url":null,"pr_error":null,"input_tokens":null,"output_tokens":null,"attempt":1}]"#;
+    const RUNNING_QUESTION: &str = r#"[{"id":9,"taskId":7,"body":"q","status":"running","runId":42,"sourceRunId":4}]"#;
+    const FAILED_QUESTION_RUN: &str = r#"{"id":42,"task_id":7,"agent_user_id":2,"kind":"question","status":"failed","session_id":"fork","branch":null,"plan":null,"summary":null,"error":"recovered","pr_url":null,"pr_error":null,"input_tokens":null,"output_tokens":null,"attempt":1}"#;
+
+    fn assert_terminal_patch_retried(requests: &std::sync::Mutex<Vec<String>>, expected_calls: usize) {
+        let calls = requests.lock().unwrap();
+        assert_eq!(calls.len(), expected_calls, "{calls:?}");
+        let patches: Vec<_> = calls
+            .iter()
+            .filter(|call| call.starts_with("PATCH /api/v1/agent-runs/42 "))
+            .collect();
+        assert_eq!(patches.len(), 2, "{calls:?}");
+        let body = patches[1].split_once("\r\n\r\n").unwrap().1;
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(json["status"], "failed");
+    }
+
+    #[tokio::test]
+    async fn restart_question_finish_failure_is_retried_by_running_poll() {
+        let (url, requests) = spawn_recording_mock_backend(vec![
+            (200, REVIEW_TASK),
+            (200, RUNNING_QUESTION_RUN),
+            (200, RUNNING_QUESTION),
+            (500, "{}"),
+            (200, "[]"),
+            (200, "[]"),
+            (200, RUNNING_QUESTION),
+            (200, REVIEW_TASK),
+            (200, FAILED_QUESTION_RUN),
+        ])
+        .await;
+        let mut daemon = test_daemon(&url);
+        daemon.reconcile().await;
+
+        reconcile_running_question_poll(&mut daemon).await;
+        assert_terminal_patch_retried(&requests, 9);
+    }
+
+    #[tokio::test]
+    async fn aborted_question_finish_failure_is_retried_by_running_poll() {
+        let (url, requests) = spawn_recording_mock_backend(vec![
+            (200, REVIEW_TASK),
+            (200, RUNNING_QUESTION_RUN),
+            (500, "{}"),
+            (200, "[]"),
+            (200, "[]"),
+            (200, RUNNING_QUESTION),
+            (200, REVIEW_TASK),
+            (200, FAILED_QUESTION_RUN),
+        ])
+        .await;
+        let mut daemon = test_daemon(&url);
+        let mut entry = running_run_kind(RunKind::Question, Some(Instant::now() - Duration::from_secs(10)));
+        entry.question_id = Some(9);
+        daemon.running.insert(7, entry);
+
+        daemon.housekeeping().await;
+        assert!(!daemon.running.contains_key(&7));
+        reconcile_running_question_poll(&mut daemon).await;
+        assert_terminal_patch_retried(&requests, 8);
+    }
+
+    #[tokio::test]
+    async fn running_poll_leaves_a_locally_active_question_alone() {
+        let (url, requests) = spawn_recording_mock_backend(Vec::new()).await;
+        let mut daemon = test_daemon(&url);
+        let mut entry = running_run_kind(RunKind::Question, None);
+        entry.question_id = Some(9);
+        let question = crate::client::AgentQuestionDto {
+            id: 9,
+            task_id: 7,
+            body: "q".to_string(),
+            status: "running".to_string(),
+            answer: None,
+            error: None,
+            run_id: Some(42),
+            source_run_id: Some(4),
+            created_at: None,
+        };
+        daemon.running.insert(7, entry);
+
+        daemon.reconcile_orphan_question(question).await;
+        assert!(daemon.running.contains_key(&7));
+        assert!(requests.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -42,6 +42,7 @@ pub struct QuestionTrigger {
 pub struct QuestionPoll {
     pub pending: Vec<QuestionTrigger>,
     pub cancellations: Vec<AgentQuestionDto>,
+    pub running: Vec<AgentQuestionDto>,
 }
 
 #[derive(Default)]
@@ -67,7 +68,7 @@ impl Questioner {
             }
             Err(e) => {
                 tracing::warn!(error = %e, "question: could not list pending queue");
-                return QuestionPoll::default();
+                Vec::new()
             }
         };
         let cancellations = match client.agent_question_queue("cancel_requested").await {
@@ -75,10 +76,22 @@ impl Questioner {
             Err(e) if unsupported_endpoint(&e) => {
                 self.unsupported_backend = true;
                 tracing::info!("agent questions are not supported by this backend; question polling disabled");
-                Vec::new()
+                return QuestionPoll::default();
             }
             Err(e) => {
                 tracing::warn!(error = %e, "question: could not list cancellation queue");
+                Vec::new()
+            }
+        };
+        let running = match client.agent_question_queue("running").await {
+            Ok(q) => q,
+            Err(e) if unsupported_endpoint(&e) => {
+                self.unsupported_backend = true;
+                tracing::info!("agent questions are not supported by this backend; question polling disabled");
+                return QuestionPoll::default();
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "question: could not list running queue");
                 Vec::new()
             }
         };
@@ -90,6 +103,7 @@ impl Questioner {
                 return QuestionPoll {
                     pending: Vec::new(),
                     cancellations,
+                    running,
                 };
             }
         };
@@ -103,7 +117,30 @@ impl Questioner {
                     .then_some(QuestionTrigger { question, task })
             })
             .collect();
-        QuestionPoll { pending, cancellations }
+        QuestionPoll {
+            pending,
+            cancellations,
+            running,
+        }
+    }
+}
+
+pub async fn reconcile_orphan(client: &RemoterClient, question: &AgentQuestionDto) {
+    let Some(run_id) = question.run_id else {
+        return;
+    };
+    let body = if question.status == "cancel_requested" {
+        FinishRunBody::failed("cancelled by user".to_string())
+    } else {
+        FinishRunBody::failed("question run has no active daemon task".to_string())
+    };
+    if let Err(e) = client.finish_run(run_id, &body).await {
+        tracing::warn!(
+            question_id = question.id,
+            run_id,
+            error = %e,
+            "question: orphan reconciliation failed; a later poll will retry"
+        );
     }
 }
 
@@ -857,6 +894,7 @@ mod tests {
         let (url, _) = spawn_backend(vec![
             (200, pending.to_string()),
             (200, "[]".to_string()),
+            (200, "[]".to_string()),
             (200, tasks.to_string()),
         ])
         .await;
@@ -1248,6 +1286,49 @@ mod tests {
         assert_eq!(calls[2], "GET /api/v1/tasks/7/agent-questions HTTP/1.1");
         assert_eq!(calls[3], "GET /api/v1/tasks/7/agent-runs HTTP/1.1");
         assert_eq!(calls[4], "PATCH /api/v1/agent-runs/40 HTTP/1.1");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn committed_start_is_closed_by_a_later_running_poll_after_recovery_also_fails() {
+        let root = std::env::temp_dir().join(format!("remoter-question-start-repoll-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let current = question_json(4, "running", Some(40));
+        let task = serde_json::json!([{
+            "id":7,"projectId":1,"projectName":"p","featureId":1,"featureDescription":"f",
+            "title":"seven","description":"d","taskStatus":"review","actionsTotal":0,
+            "actionsCompleted":0,"timeSpent":0,"blocked":false
+        }]);
+        let (url, requests) = spawn_backend(vec![
+            (200, current.to_string()),
+            (500, "{}".to_string()),
+            (500, "{}".to_string()),
+            (200, "[]".to_string()),
+            (200, "[]".to_string()),
+            (200, serde_json::json!([current]).to_string()),
+            (200, task.to_string()),
+            (200, run_json(40, "question", "failed", None).to_string()),
+        ])
+        .await;
+        let mut pending = question(4, "pending", None);
+        pending.source_run_id = Some(10);
+        execute(test_context(&url, &root, pending)).await;
+
+        let client = RemoterClient::new(&url, "tok", None);
+        let poll = Questioner::new().poll(&client).await;
+        assert!(poll.pending.is_empty());
+        assert_eq!(poll.running.len(), 1);
+        assert_eq!(poll.running[0].run_id, Some(40));
+        reconcile_orphan(&client, &poll.running[0]).await;
+
+        let calls = requests.lock().unwrap().clone();
+        assert_eq!(calls.len(), 8, "{calls:?}");
+        assert!(calls[0].starts_with("POST /api/v1/agent-questions/4/run "));
+        assert_eq!(calls[1], "GET /api/v1/tasks/7/agent-runs HTTP/1.1");
+        assert_eq!(calls[2], "GET /api/v1/tasks/7/agent-questions HTTP/1.1");
+        assert!(calls[3].starts_with("GET /api/v1/agent-questions?assignee=me&status=pending "));
+        assert!(calls[5].starts_with("GET /api/v1/agent-questions?assignee=me&status=running "));
+        assert!(calls[7].starts_with("PATCH /api/v1/agent-runs/40 HTTP/1.1"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
