@@ -1047,28 +1047,34 @@ fn run_env(rc: &RunContext) -> Vec<(String, String)> {
     match rc.config.execution.mode {
         ExecutionMode::Container => container::container_env(rc.task.id),
         ExecutionMode::Bwrap => crate::bwrap::run_env(rc.task.id),
-        ExecutionMode::Host => {
-            let mut env = vec![
-                ("CI".to_string(), "1".to_string()),
-                ("REMOTER_AGENT_TASK_ID".to_string(), rc.task.id.to_string()),
-            ];
-            if let Some(block) = &rc.port_block {
-                env.push(("REMOTER_AGENT_PORT_BASE".to_string(), block.base().to_string()));
-            }
-            if rc.config.driver.kind == "kimi-acp" {
-                env.push((
-                    "KIMI_CODE_HOME".to_string(),
-                    rc.config
-                        .execution
-                        .agent_home(&rc.config.workspace_root)
-                        .join(".kimi-code")
-                        .to_string_lossy()
-                        .into_owned(),
-                ));
-            }
-            env
-        }
+        ExecutionMode::Host => host_run_env(&rc.config, rc.task.id, rc.port_block.as_ref()),
     }
+}
+
+pub(crate) fn host_run_env(
+    config: &Config,
+    task_id: i32,
+    port_block: Option<&crate::ports::PortBlock>,
+) -> Vec<(String, String)> {
+    let mut env = vec![
+        ("CI".to_string(), "1".to_string()),
+        ("REMOTER_AGENT_TASK_ID".to_string(), task_id.to_string()),
+    ];
+    if let Some(block) = port_block {
+        env.push(("REMOTER_AGENT_PORT_BASE".to_string(), block.base().to_string()));
+    }
+    if config.driver.kind == "kimi-acp" {
+        env.push((
+            "KIMI_CODE_HOME".to_string(),
+            config
+                .execution
+                .agent_home(&config.workspace_root)
+                .join(".kimi-code")
+                .to_string_lossy()
+                .into_owned(),
+        ));
+    }
+    env
 }
 
 fn sessions_dir(config: &Config) -> std::path::PathBuf {
@@ -1521,8 +1527,9 @@ fn attachments_section(base_url: &str, attachments: &[AttachmentDto]) -> String 
 /// conversation) plus per-kind instructions (spec §5.6). The conversation
 /// thread is what makes a `review → implement` bounce steer the next run,
 /// and — with the approved plan text — fully seeds a fresh session when no
-/// resume is possible (§5.4). `current_run_id` is excluded from Prior runs:
-/// the live run row (status `running`, no outcome) would be prompt noise.
+/// resume is possible (§5.4). `current_run_id` and question runs are excluded
+/// from Prior runs: the live row would be prompt noise, and Q&A must stay out
+/// of the source plan/implement conversation.
 async fn build_prompt(
     rc: &RunContext,
     plan: Option<&str>,
@@ -1761,11 +1768,15 @@ fn render_prompt(
         }
     }
     // Earlier plans/summaries/errors, newest first, capped (spec §5.6). The
-    // live run's own row is filtered out (see the doc comment above). Each
-    // outcome is quoted truncated: run rows written before the write-side cap
-    // (or by hand) may carry unbounded error text.
+    // live run's own row and isolated Q&A runs are filtered out. Each outcome
+    // is quoted truncated: run rows written before the write-side cap (or by
+    // hand) may carry unbounded error text.
     if let Some(runs) = detail.runs.as_ref().filter(|r| !r.is_empty()) {
-        let prior: Vec<_> = runs.iter().filter(|r| r.id != current_run_id).take(5).collect();
+        let prior: Vec<_> = runs
+            .iter()
+            .filter(|r| r.id != current_run_id && r.kind != "question")
+            .take(5)
+            .collect();
         if !prior.is_empty() {
             p.push_str("## Prior runs\n");
             for r in prior {
@@ -2778,6 +2789,27 @@ mod tests {
             completed_at: None,
             supervision_enabled: true,
             goal_id: None,
+        }
+    }
+
+    #[test]
+    fn prior_runs_exclude_question_answers_from_main_sessions() {
+        let mut runs: Vec<_> = (10..15)
+            .map(|id| {
+                let mut run = run_row(id, "question", "succeeded", Some(format!("fork-{id}")), None);
+                run.summary = Some(format!("PRIVATE_QA_ANSWER_{id}"));
+                run
+            })
+            .collect();
+        let mut implement = run_row(2, "implement", "succeeded", Some("source".to_string()), None);
+        implement.summary = Some("implementation summary".to_string());
+        runs.push(implement);
+
+        for kind in [RunKind::Plan, RunKind::Implement] {
+            let prompt = render_prompt(kind, &detail(vec![], runs.clone()), None, 999, "http://api", &[], "");
+            assert!(!prompt.contains("PRIVATE_QA_ANSWER"), "{kind:?}: {prompt}");
+            assert!(!prompt.contains("question run #"), "{kind:?}: {prompt}");
+            assert!(prompt.contains("implementation summary"), "{kind:?}: {prompt}");
         }
     }
 

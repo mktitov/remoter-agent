@@ -284,7 +284,17 @@ async fn current_artifacts(qc: &QuestionContext, detail: &TaskDetail, runs: &[Ag
         .as_deref()
         .map(|r| run::truncate_with_marker(r, MAX_ARTIFACT_BYTES));
     let cwd = question_cwd(qc);
-    let base = match qc.project.base_branch.as_deref() {
+    let configured_base = match qc.project.base_branch.clone() {
+        Some(base) => Some(base),
+        None => match workspace::remote_default_branch(&cwd).await {
+            Ok(base) => Some(base),
+            Err(e) => {
+                tracing::warn!(error = %e, "question: could not resolve the remote default branch");
+                None
+            }
+        },
+    };
+    let base = match configured_base.as_deref() {
         Some(base) if workspace::local_branch_exists(&cwd, base).await => Some(base.to_string()),
         Some(base) if workspace::remote_tracking_branch_exists(&cwd, base).await => Some(format!("origin/{base}")),
         Some(_) | None => None,
@@ -470,14 +480,7 @@ fn question_env(qc: &QuestionContext) -> Vec<(String, String)> {
     if qc.config.execution.is_bwrap() {
         return crate::bwrap::run_env(qc.trigger.task.id);
     }
-    let mut env = vec![
-        ("CI".to_string(), "1".to_string()),
-        ("REMOTER_AGENT_TASK_ID".to_string(), qc.trigger.task.id.to_string()),
-    ];
-    if let Some(block) = &qc.port_block {
-        env.push(("REMOTER_AGENT_PORT_BASE".to_string(), block.base().to_string()));
-    }
-    env
+    run::host_run_env(&qc.config, qc.trigger.task.id, qc.port_block.as_ref())
 }
 
 async fn finish_failure(qc: &QuestionContext, started: &StartedQuestion, error: String, failure: Option<&RunFailure>) {
@@ -501,7 +504,7 @@ async fn finish_cancelled(qc: &QuestionContext, started: &StartedQuestion, failu
         .and_then(|questions| questions.into_iter().find(|q| q.id == started.question.id))
         .is_some_and(|q| q.status == "cancel_requested");
     let mut body = if requested {
-        FinishRunBody::cancelled("cancelled by user".to_string())
+        FinishRunBody::failed("cancelled by user".to_string())
     } else {
         FinishRunBody::failed("cancelled (human intervention or daemon shutdown)".to_string())
     };
@@ -868,6 +871,74 @@ mod tests {
         }
     }
 
+    #[test]
+    fn host_question_uses_the_same_kimi_home_as_main_runs() {
+        let root = std::env::temp_dir().join(format!("remoter-question-kimi-home-{}", std::process::id()));
+        let mut qc = test_context("http://127.0.0.1:9", &root, question(4, "pending", None));
+        let toml = format!(
+            "api_url = \"http://127.0.0.1:9\"\nworkspace_root = \"{}\"\n[execution]\nagent_home = \"{}\"\n[driver]\nkind = \"kimi-acp\"\n",
+            root.display(),
+            root.join("daemon-home").display()
+        );
+        qc.config = Arc::new(Config::from_toml_str(&toml, Some("tok".to_string())).unwrap());
+
+        let env = question_env(&qc);
+        let expected_home = root.join("daemon-home/.kimi-code").to_string_lossy().into_owned();
+        assert_eq!(
+            env.iter().find(|(key, _)| key == "KIMI_CODE_HOME"),
+            Some(&("KIMI_CODE_HOME".to_string(), expected_home))
+        );
+        assert_eq!(env, run::host_run_env(&qc.config, 7, None));
+    }
+
+    #[tokio::test]
+    async fn default_base_diff_includes_committed_pr_changes() {
+        let root = std::env::temp_dir().join(format!("remoter-question-default-base-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let worktree = workspace::worktree_dir(&root, 1, 7);
+        init_repo(&worktree);
+        let origin = root.join("origin.git");
+        let git = |dir: &Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&root, &["init", "--bare", "-q", origin.to_str().unwrap()]);
+        git(&worktree, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(&worktree, &["push", "-q", "origin", "HEAD:main"]);
+        git(&worktree, &["remote", "set-head", "origin", "main"]);
+        git(&worktree, &["checkout", "-q", "-b", "agent/task-7"]);
+        std::fs::write(worktree.join("tracked.txt"), "committed after\n").unwrap();
+        git(&worktree, &["add", "tracked.txt"]);
+        git(
+            &worktree,
+            &[
+                "-c",
+                "user.email=test@remoter",
+                "-c",
+                "user.name=test",
+                "commit",
+                "-qm",
+                "PR change",
+            ],
+        );
+        assert!(workspace::diff(&worktree, "HEAD").await.unwrap().is_empty());
+
+        let qc = test_context("http://127.0.0.1:9", &root, question(4, "pending", None));
+        let detail: TaskDetail = serde_json::from_value(serde_json::json!({
+            "id":7,"projectId":1,"projectName":"p","featureId":1,"featureDescription":"f",
+            "title":"seven","description":"d","taskStatus":"review"
+        }))
+        .unwrap();
+        let artifacts = current_artifacts(&qc, &detail, &[]).await;
+        assert!(artifacts.diff.contains("tracked.txt"), "{}", artifacts.diff);
+        assert!(artifacts.diff.contains("+committed after"), "{}", artifacts.diff);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn stub_question_finishes_without_side_effect_calls_or_worktree_changes() {
         let root = std::env::temp_dir().join(format!("remoter-question-e2e-{}", std::process::id()));
@@ -880,17 +951,14 @@ mod tests {
             "id":7,"projectId":1,"projectName":"p","featureId":1,"featureDescription":"f",
             "title":"seven","description":"d","taskStatus":"review","report":"implementation report"
         });
-        let start = serde_json::json!({
-            "question": current,
-            "run": run_json(40, "question", "running", None),
-            "sourceRun": run_json(10, "implement", "succeeded", Some("source-session"))
-        });
         let runs = serde_json::json!([
             run_json(40, "question", "running", None),
             run_json(10, "implement", "succeeded", Some("source-session"))
         ]);
         let (url, requests) = spawn_backend(vec![
-            (200, start.to_string()),
+            (200, current.to_string()),
+            (200, runs.to_string()),
+            (200, runs.to_string()),
             (200, detail.to_string()),
             (200, serde_json::json!([current]).to_string()),
             (200, runs.to_string()),
@@ -906,12 +974,14 @@ mod tests {
 
         assert_eq!(before, WorktreeSnapshot::capture(&worktree).await.unwrap());
         let calls = requests.lock().unwrap().clone();
-        assert_eq!(calls.len(), 5, "{calls:?}");
+        assert_eq!(calls.len(), 7, "{calls:?}");
         assert!(calls[0].starts_with("POST /api/v1/agent-questions/4/run "));
-        assert!(calls[1].starts_with("GET /api/v1/tasks/7?include="));
-        assert_eq!(calls[2], "GET /api/v1/tasks/7/agent-questions HTTP/1.1");
-        assert_eq!(calls[3], "GET /api/v1/tasks/7/agent-runs HTTP/1.1");
-        assert_eq!(calls[4], "PATCH /api/v1/agent-runs/40 HTTP/1.1");
+        assert_eq!(calls[1], "GET /api/v1/tasks/7/agent-runs HTTP/1.1");
+        assert_eq!(calls[2], "GET /api/v1/tasks/7/agent-runs HTTP/1.1");
+        assert!(calls[3].starts_with("GET /api/v1/tasks/7?include="));
+        assert_eq!(calls[4], "GET /api/v1/tasks/7/agent-questions HTTP/1.1");
+        assert_eq!(calls[5], "GET /api/v1/tasks/7/agent-runs HTTP/1.1");
+        assert_eq!(calls[6], "PATCH /api/v1/agent-runs/40 HTTP/1.1");
         assert!(
             calls
                 .iter()

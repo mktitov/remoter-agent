@@ -488,13 +488,6 @@ impl FinishRunBody {
             thinking: None,
         }
     }
-
-    pub fn cancelled(error: String) -> Self {
-        Self {
-            status: "cancelled",
-            ..Self::failed(error)
-        }
-    }
 }
 
 #[derive(Clone)]

@@ -253,7 +253,7 @@ impl Daemon {
                         .and_then(|questions| questions.into_iter().find(|q| q.run_id == Some(r.id)))
                         .is_some_and(|q| q.status == "cancel_requested");
                     if cancel_requested {
-                        crate::client::FinishRunBody::cancelled("cancelled by user during daemon restart".to_string())
+                        crate::client::FinishRunBody::failed("cancelled by user during daemon restart".to_string())
                     } else {
                         crate::client::FinishRunBody::failed("daemon restart".to_string())
                     }
@@ -878,7 +878,7 @@ impl Daemon {
         // Restart/cancel race reconciliation: there is no local driver left to
         // stop, but the server still has a running question-run to close.
         if let Some(run_id) = question.run_id {
-            let body = crate::client::FinishRunBody::cancelled("cancelled by user".to_string());
+            let body = crate::client::FinishRunBody::failed("cancelled by user".to_string());
             if let Err(e) = self.client.finish_run(run_id, &body).await {
                 tracing::warn!(question_id = question.id, run_id, error = %e, "question: cancellation reconciliation failed");
             }
@@ -923,15 +923,36 @@ mod tests {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
                 let mut chunk = [0u8; 1024];
-                loop {
-                    match socket.read(&mut chunk).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            request.extend_from_slice(&chunk[..n]);
-                            if request.windows(4).any(|w| w == b"\r\n\r\n") {
-                                break;
-                            }
-                        }
+                let body_start = loop {
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "client closed before sending request headers");
+                    request.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..body_start]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                while request.len() < body_start + content_length {
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "client closed before sending the full request body");
+                    request.extend_from_slice(&chunk[..n]);
+                }
+                if request.starts_with(b"PATCH /api/v1/agent-runs/") && content_length > 0 {
+                    let payload: serde_json::Value =
+                        serde_json::from_slice(&request[body_start..body_start + content_length]).unwrap();
+                    if let Some(status) = payload.get("status").and_then(|s| s.as_str()) {
+                        assert!(
+                            matches!(status, "running" | "succeeded" | "failed"),
+                            "backend rejects agent-run status {status}"
+                        );
                     }
                 }
                 let response = format!(
@@ -1128,12 +1149,12 @@ kind = "stub"
     }
 
     #[tokio::test]
-    async fn restart_reconciliation_closes_cancel_requested_question_as_cancelled() {
+    async fn restart_reconciliation_finishes_cancel_requested_question_as_failed() {
         let url = spawn_mock_backend(vec![
             (200, r#"[{"id":7,"projectId":1,"projectName":"proj","featureId":1,"featureDescription":"feat","title":"t","description":"d","taskStatus":"review","actionsTotal":0,"actionsCompleted":0,"timeSpent":0,"blocked":false}]"#),
             (200, r#"[{"id":42,"task_id":7,"agent_user_id":2,"kind":"question","status":"running","session_id":"fork","branch":null,"plan":null,"summary":null,"error":null,"pr_url":null,"pr_error":null,"input_tokens":null,"output_tokens":null,"attempt":1}]"#),
             (200, r#"[{"id":9,"taskId":7,"body":"q","status":"cancel_requested","runId":42,"sourceRunId":4}]"#),
-            (200, r#"{"id":42,"task_id":7,"agent_user_id":2,"kind":"question","status":"cancelled","session_id":"fork","branch":null,"plan":null,"summary":null,"error":"cancelled","pr_url":null,"pr_error":null,"input_tokens":null,"output_tokens":null,"attempt":1}"#),
+            (200, r#"{"id":42,"task_id":7,"agent_user_id":2,"kind":"question","status":"failed","session_id":"fork","branch":null,"plan":null,"summary":null,"error":"cancelled by user during daemon restart","pr_url":null,"pr_error":null,"input_tokens":null,"output_tokens":null,"attempt":1}"#),
         ])
         .await;
         let daemon = test_daemon(&url);
