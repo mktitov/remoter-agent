@@ -164,6 +164,7 @@ pub struct DriverFactory {
     workspace_id: Option<i32>,
     stall_idle_secs: u64,
     stall_grace_secs: u64,
+    injected_driver: Option<std::sync::Arc<dyn AgentDriver>>,
 }
 
 impl DriverFactory {
@@ -174,10 +175,20 @@ impl DriverFactory {
             workspace_id: config.workspace_id,
             stall_idle_secs: config.stall_idle_secs,
             stall_grace_secs: config.stall_grace_secs,
+            injected_driver: None,
         }
     }
 
+    /// Returns a factory that always builds `driver`, ignoring the configured driver kind.
+    pub fn with_driver(mut self, driver: std::sync::Arc<dyn AgentDriver>) -> Self {
+        self.injected_driver = Some(driver);
+        self
+    }
+
     pub fn build(&self, cfg: &DriverConfig) -> anyhow::Result<std::sync::Arc<dyn AgentDriver>> {
+        if let Some(driver) = &self.injected_driver {
+            return Ok(driver.clone());
+        }
         match cfg.kind.as_str() {
             "stub" => Ok(std::sync::Arc::new(stub::StubDriver::new(
                 cfg.simulate_delay_ms,
@@ -206,9 +217,8 @@ impl DriverFactory {
 mod tests {
     use super::*;
 
-    #[test]
-    fn factory_builds_existing_kinds_and_rejects_unknown_ones() {
-        let config = crate::config::Config::from_toml_str(
+    fn config() -> crate::config::Config {
+        crate::config::Config::from_toml_str(
             r#"
 api_url = "http://localhost:8181"
 workspace_root = "/tmp/remoter-driver-factory-test"
@@ -218,7 +228,12 @@ kind = "stub"
 "#,
             Some("tok".to_string()),
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    #[test]
+    fn factory_builds_existing_kinds_and_rejects_unknown_ones() {
+        let config = config();
         let factory = DriverFactory::new(&config);
         for kind in ["stub", "kimi-acp", "opencode-acp"] {
             let mut driver = config.driver.clone();
@@ -229,5 +244,19 @@ kind = "stub"
         driver.kind = "unknown".to_string();
         let error = factory.validate(&driver).unwrap_err().to_string();
         assert!(error.contains("unknown driver kind"), "{error}");
+    }
+
+    #[test]
+    fn factory_returns_injected_driver_for_every_driver_config() {
+        let config = config();
+        let injected: std::sync::Arc<dyn AgentDriver> = std::sync::Arc::new(stub::StubDriver::new(0, false));
+        let factory = DriverFactory::new(&config).with_driver(injected.clone());
+
+        for kind in ["stub", "kimi-acp", "opencode-acp", "unknown"] {
+            let mut driver = config.driver.clone();
+            driver.kind = kind.to_string();
+            let built = factory.build(&driver).unwrap();
+            assert!(std::sync::Arc::ptr_eq(&injected, &built), "{kind}");
+        }
     }
 }
