@@ -22,7 +22,7 @@ use remoter_agent::driver::{AgentDriver, RunSpec};
 
 /// The only kimi version the ACP driver is validated against (spec §5.5).
 /// Bump deliberately: re-run this test, then update.
-const PINNED_KIMI_VERSION: &str = "0.36.1";
+const PINNED_KIMI_VERSION: &str = "0.41.0";
 
 fn spec(
     dir: PathBuf,
@@ -38,6 +38,8 @@ fn spec(
         prompt: prompt.to_string(),
         kind,
         resume_session: resume,
+        fork_session: None,
+        fallback_prompt: None,
         branch: "agent/task-0-conformance".to_string(),
         env: vec![],
         exec: remoter_agent::workspace::ExecEnv::host(false),
@@ -75,14 +77,15 @@ async fn kimi_acp_conformance() {
         plan_model: Some("kimi-code/k3".to_string()),
         plan_thinking: Some("max".to_string()),
         implement_model: Some("kimi-code/kimi-for-coding".to_string()),
-        // kimi-for-coding accepts only `on` for thinking (its console shows
-        // On / Off (unsupported)); the driver validates it against the option
-        // set refreshed by the model switch.
-        implement_thinking: Some("on".to_string()),
+        // kimi 0.41 exposes low/high/max for this model; the driver validates
+        // the value against the options refreshed by the model switch.
+        implement_thinking: Some("high".to_string()),
         supervise_model: None,
         supervise_thinking: None,
         review_model: None,
         review_thinking: None,
+        question_model: None,
+        question_thinking: None,
         sessions_dir: None,
     };
     let driver = AcpDriver::new(&cfg, "http://localhost:8181", "unused-in-this-test", None, 300, 30);
@@ -133,9 +136,8 @@ async fn kimi_acp_conformance() {
         second.text
     );
 
-    // The implement pairing (spec §5.1): K2.7 Coding with thinking `on` — the
-    // only thinking value kimi accepts for that model. The run succeeding at
-    // all proves the agent took both `set_config_option` calls.
+    // The implement pairing: K2.7 Coding with high thinking. The run succeeding
+    // proves the agent took both `set_config_option` calls.
     let third = driver
         .run(spec(
             dir.clone(),
@@ -152,7 +154,7 @@ async fn kimi_acp_conformance() {
         third.text
     );
     assert_eq!(third.model.as_deref(), Some("kimi-code/kimi-for-coding"));
-    assert_eq!(third.thinking.as_deref(), Some("on"));
+    assert_eq!(third.thinking.as_deref(), Some("high"));
 
     std::fs::remove_dir_all(&dir).ok();
 }

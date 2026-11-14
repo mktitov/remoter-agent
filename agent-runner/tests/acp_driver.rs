@@ -40,6 +40,8 @@ fn driver_with_stall(stall_idle_secs: u64, stall_grace_secs: u64) -> AcpDriver {
         supervise_thinking: None,
         review_model: None,
         review_thinking: None,
+        question_model: None,
+        question_thinking: None,
         sessions_dir: None,
     };
     AcpDriver::new(&cfg, "http://api.test", "tok", None, stall_idle_secs, stall_grace_secs)
@@ -62,6 +64,8 @@ fn driver_with_config() -> AcpDriver {
         supervise_thinking: None,
         review_model: None,
         review_thinking: None,
+        question_model: None,
+        question_thinking: None,
         sessions_dir: None,
     };
     AcpDriver::new(&cfg, "http://api.test", "tok", None, 300, 30)
@@ -81,6 +85,8 @@ fn spec(
         prompt: "test prompt".to_string(),
         kind,
         resume_session: resume,
+        fork_session: None,
+        fallback_prompt: None,
         branch: "agent/task-1-test".to_string(),
         env,
         exec: remoter_agent::workspace::ExecEnv::host(false),
@@ -88,6 +94,20 @@ fn spec(
         logger: remoter_agent::session_log::SessionLogger::noop(),
         phase_tx: None,
     }
+}
+
+fn question_spec(
+    dir: &Path,
+    prompt: &str,
+    fork: Option<String>,
+    fallback: &str,
+    env: Vec<(String, String)>,
+) -> RunSpec {
+    let mut spec = spec(dir, "question", None, env, vec![]);
+    spec.prompt = prompt.to_string();
+    spec.fork_session = fork;
+    spec.fallback_prompt = Some(fallback.to_string());
+    spec
 }
 
 fn read_capture(path: &Path) -> Vec<serde_json::Value> {
@@ -453,6 +473,8 @@ async fn missing_agent_binary_is_permanent() {
         supervise_thinking: None,
         review_model: None,
         review_thinking: None,
+        question_model: None,
+        question_thinking: None,
         sessions_dir: None,
     };
     let driver = AcpDriver::new(&cfg, "http://api.test", "tok", None, 300, 30);
@@ -764,6 +786,160 @@ async fn dropped_run_future_kills_the_agent_process() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn question_fork_inherits_context_and_followup_forks_the_fork() {
+    let dir = test_dir("question-fork");
+    let capture = dir.join("capture.jsonl");
+    let env = vec![
+        ("FAKE_AGENT_CAPTURE".to_string(), capture.to_string_lossy().to_string()),
+        ("FAKE_AGENT_ECHO_CONTEXT".to_string(), "1".to_string()),
+        (
+            "FAKE_AGENT_STATE".to_string(),
+            dir.join("state.json").to_string_lossy().to_string(),
+        ),
+    ];
+    let driver = driver();
+    let mut source_spec = spec(&dir, "implement", None, env.clone(), vec![]);
+    source_spec.prompt = "Remember SECRET-FORK-123 and reply with it.".to_string();
+    let source = driver.run(source_spec).await.expect("source turn");
+    let source_id = source.session_id.unwrap();
+
+    let first = driver
+        .run(question_spec(
+            &dir,
+            "Repeat the secret token from context; do not ask for it.",
+            Some(source_id.clone()),
+            "fallback must not be used",
+            env.clone(),
+        ))
+        .await
+        .expect("fork question");
+    let first_id = first.session_id.unwrap();
+    assert_ne!(first_id, source_id);
+    assert!(first.text.contains("SECRET-FORK-123"), "{}", first.text);
+
+    let followup = driver
+        .run(question_spec(
+            &dir,
+            "Repeat the secret token again without any new context.",
+            Some(first_id.clone()),
+            "fallback must not be used",
+            env,
+        ))
+        .await
+        .expect("follow-up fork");
+    assert_ne!(followup.session_id.as_deref(), Some(first_id.as_str()));
+    assert!(followup.text.contains("SECRET-FORK-123"));
+
+    let events = read_capture(&capture);
+    let forks: Vec<&serde_json::Value> = events.iter().filter_map(|e| e.get("session_fork")).collect();
+    assert_eq!(forks.len(), 2, "{events:?}");
+    assert_eq!(forks[0]["source"], serde_json::json!(source_id));
+    assert_eq!(forks[1]["source"], serde_json::json!(first_id));
+    let source_prompts: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["sessionId"] == serde_json::json!(source_id) && e.get("prompt").is_some())
+        .collect();
+    assert!(
+        source_prompts
+            .iter()
+            .all(|p| !p.to_string().contains("Repeat the secret token again")),
+        "Q&A leaked into source history: {source_prompts:?}"
+    );
+    let cancelled: Vec<&serde_json::Value> = events
+        .iter()
+        .filter_map(|e| e.get("permission"))
+        .filter(|p| p.to_string().contains("cancelled"))
+        .collect();
+    assert_eq!(cancelled.len(), 2, "question permissions must be denied: {events:?}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn question_without_fork_capability_uses_self_contained_fallback() {
+    let dir = test_dir("question-fallback");
+    let capture = dir.join("capture.jsonl");
+    let env = vec![
+        ("FAKE_AGENT_CAPTURE".to_string(), capture.to_string_lossy().to_string()),
+        ("FAKE_AGENT_ECHO_CONTEXT".to_string(), "1".to_string()),
+        ("FAKE_AGENT_NO_FORK".to_string(), "1".to_string()),
+    ];
+    let mut source_spec = spec(&dir, "implement", None, env.clone(), vec![]);
+    source_spec.prompt = "Remember SECRET-FALLBACK-456 and reply with it.".to_string();
+    let source = driver().run(source_spec).await.expect("source turn");
+
+    let outcome = driver()
+        .run(question_spec(
+            &dir,
+            "question prompt without the marker",
+            source.session_id,
+            "Fallback context: SECRET-FALLBACK-456. Answer the question read-only.",
+            env,
+        ))
+        .await
+        .expect("fallback question");
+    assert!(outcome.text.contains("SECRET-FALLBACK-456"), "{}", outcome.text);
+
+    let events = read_capture(&capture);
+    assert!(events.iter().all(|e| e.get("session_fork").is_none()));
+    assert!(events.iter().all(|e| e.get("session_resume").is_none()));
+    let prompts: Vec<&serde_json::Value> = events.iter().filter_map(|e| e.get("prompt")).collect();
+    assert!(prompts.last().unwrap().to_string().contains("Fallback context"));
+    let permission = events.iter().filter_map(|e| e.get("permission")).next_back().unwrap();
+    assert!(permission.to_string().contains("cancelled"), "{permission}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn question_fork_failure_uses_self_contained_fallback() {
+    let dir = test_dir("question-fork-error-fallback");
+    let capture = dir.join("capture.jsonl");
+    let env = vec![
+        ("FAKE_AGENT_CAPTURE".to_string(), capture.to_string_lossy().to_string()),
+        ("FAKE_AGENT_ECHO_CONTEXT".to_string(), "1".to_string()),
+        (
+            "FAKE_AGENT_STATE".to_string(),
+            dir.join("state.json").to_string_lossy().to_string(),
+        ),
+    ];
+
+    let outcome = driver()
+        .run(question_spec(
+            &dir,
+            "question prompt without the marker",
+            Some("missing-source".to_string()),
+            "Fallback after fork error: SECRET-FORK-ERROR-789. Answer read-only.",
+            env,
+        ))
+        .await
+        .expect("fork failure should use a fresh fallback session");
+    assert!(outcome.text.contains("SECRET-FORK-ERROR-789"), "{}", outcome.text);
+    assert_ne!(outcome.session_id.as_deref(), Some("missing-source"));
+
+    let events = read_capture(&capture);
+    assert!(
+        events
+            .iter()
+            .filter_map(|e| e.get("session_fork"))
+            .any(|fork| fork["source"] == serde_json::json!("missing-source")),
+        "{events:?}"
+    );
+    assert!(events.iter().any(|e| e.get("session_new").is_some()), "{events:?}");
+    assert!(events.iter().all(|e| e.get("session_resume").is_none()), "{events:?}");
+    let prompts: Vec<&serde_json::Value> = events.iter().filter_map(|e| e.get("prompt")).collect();
+    assert!(
+        prompts
+            .last()
+            .unwrap()
+            .to_string()
+            .contains("Fallback after fork error")
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }

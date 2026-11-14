@@ -67,7 +67,13 @@ child process by the MCP client) plus one optional flag:
 | `REMOTER_PROJECT_ID` | Bind this repository to one project (optional). Validated at startup via `GET /api/v1/projects/{id}`; `current_project` reports the binding and tools with an optional `projectId` default to it in standalone mode only. Daemon mode (`REMOTER_AGENT_TASK_ID`) never applies the binding implicitly | `7` |
 | `REMOTER_AGENT_TASK_ID` | Current ticket id when spawned by `remoter-agent` (daemon mode); scopes task creation and supervise-role discovery | `42` |
 | `REMOTER_MCP_NAME` | Server name reported in MCP `initialize` (optional) | `remoter` |
-| `--role <role>` | Runtime role: `full`, `dev-agent-plan`, `dev-agent-implement`, `dev-agent-supervise`, `dev-agent-review` | `--role dev-agent-implement` |
+| `--role <role>` | Runtime role: `full`, `dev-agent-plan`, `dev-agent-implement`, `dev-agent-supervise`, `dev-agent-review`, `dev-agent-question` | `--role dev-agent-implement` |
+
+`dev-agent-question` is the daemon's read-only Q&A role. It exposes ticket,
+thread, attachment, and discovery reads but gates every mutation, including
+review verdicts and question edits. Kimi inherits the source session's MCP
+configuration on fork, so this role and the daemon's permission/snapshot guards
+are complementary to the backend's independent question-run mutation guard.
 
 On startup the server validates the token with one `GET /auth/me` call,
 resolves the effective workspace, validates `REMOTER_PROJECT_ID` when set

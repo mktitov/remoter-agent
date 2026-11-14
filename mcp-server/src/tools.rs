@@ -1892,6 +1892,7 @@ mod tests {
             Role::DevAgentImplement,
             Role::DevAgentSupervise,
             Role::DevAgentReview,
+            Role::DevAgentQuestion,
         ] {
             assert!(
                 !role.is_gated("get_project_setup_guide"),
@@ -1929,6 +1930,7 @@ mod tests {
                 Role::DevAgentImplement,
                 Role::DevAgentSupervise,
                 Role::DevAgentReview,
+                Role::DevAgentQuestion,
             ] {
                 assert!(!role.is_gated(name), "`{name}` must be available in {role} mode");
             }

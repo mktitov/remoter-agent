@@ -65,11 +65,15 @@ stall_grace_secs    = 30
 # and CAP_FOWNER make the non-setuid bwrap binary reject startup.
 
 [driver]
-kind = "kimi-acp"    # dry-run = "stub"; real ACP agents = "kimi-acp" or "opencode-acp"
+kind = "kimi-acp"    # "stub" | "kimi-acp" | "opencode-acp" | generic "acp"
+# Generic adapters need an explicit program/args and inherit no Kimi defaults:
+# agent_program = "claude-agent-acp"   # or "codex-acp"
+# agent_args = []
 # simulate_delay_ms = 0          # stub only: artificial run duration
 # ACP drivers (defaults shown for kimi-acp):
 # agent_program = "kimi"        # opencode-acp defaults to "opencode"
-# agent_args = ["acp"]
+# agent_args = ["acp"]         # omitted key defaults to ["acp"] for Kimi/OpenCode;
+#                              # explicit agent_args = [] stays empty for wrappers
 # kimi_config = "~/.config/remoter-agent/kimi-config.toml"
 # Daemon-owned Kimi provider/model/thinking config for host, container, and
 # bwrap. It is rendered into <agent_home>/.kimi-code/config.toml at every run;
@@ -82,12 +86,14 @@ kind = "kimi-acp"    # dry-run = "stub"; real ACP agents = "kimi-acp" or "openco
 # leave the agent's default in place. The ids are the catalog keys from
 # kimi_config. Recommended pairing for cost/speed:
 #   plan = K3 + max reasoning, implement = K2.7 Coding.
-# Note: kimi's thinking values are model-dependent — kimi-for-coding accepts
-# only "on" (Thinking On / Off (unsupported) in the console).
+# Note: kimi's thinking values are model/version-dependent and validated against
+# the options refreshed by the model switch. Kimi 0.41 offers low/high/max here.
 # plan_model = "kimi-code/k3"
 # plan_thinking = "max"
 # implement_model = "kimi-code/kimi-for-coding"
-# implement_thinking = "on"
+# implement_thinking = "high"
+# question_model = "kimi-code/k3"       # optional Q&A override
+# question_thinking = "max"            # generic/OpenCode sends this as "effort"
 # remoter_mcp_command = "remoter-mcp"   # injected into every session (spec §5.6); a bare name
                                        # is resolved against the daemon's PATH at startup
 # sessions_dir = "~/.local/share/remoter-agent/agent-home/.kimi-code/sessions"
