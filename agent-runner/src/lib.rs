@@ -24,6 +24,7 @@ pub mod logs;
 pub mod logstore;
 pub mod logstream;
 pub mod ports;
+pub mod project;
 pub mod review;
 pub mod run;
 pub mod session_log;

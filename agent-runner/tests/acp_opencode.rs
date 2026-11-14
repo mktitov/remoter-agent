@@ -22,7 +22,7 @@ fn spec(dir: PathBuf) -> RunSpec {
         resume_session: None,
         branch: "agent/task-0-opencode-conformance".to_string(),
         env: vec![],
-        exec: remoter_agent::workspace::ExecEnv::host(false),
+        exec: remoter_agent::workspace::ExecEnv::host(Vec::new()),
         config_options: vec![],
         logger: remoter_agent::session_log::SessionLogger::noop(),
         phase_tx: None,

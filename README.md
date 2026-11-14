@@ -82,8 +82,8 @@ tools at run time (install them yourself, they are not bundled):
 - **`kimi` or `opencode` CLI** — the ACP dev-agent that actually works on
   tickets (`remoter-agent` only);
 - **`git`** — the daemon clones project repos and manages ticket worktrees;
-- **`devenv`** — project services (Postgres, …) are brought up/down per run
-  via `devenv up`;
+- **`devenv`** — the legacy-default project environment and service lifecycle;
+  projects can replace or disable these commands in `.remoter/agent.toml`;
 - **`docker`** — only for `[execution] mode = "container"`, where every run
   executes inside a per-run container with postgres/minio sidecars;
 - **`bubblewrap` + `slirp4netns`** — only for `[execution] mode = "bwrap"` on
@@ -105,6 +105,8 @@ tickets in container mode:
   profile (`remoter-mcp` built from this repo's own flake, nodejs);
 - `agent-init.sh` — installs that profile plus the pinned kimi CLI once per
   image build;
+- `agent.toml` — optional project execution configuration for every mode and
+  the image build (see [Configuration](#configuration));
 - `check-image.sh` — per-turn freshness hook: marks the image stale when
   `main` moved since the image was baked;
 - `seed-nix-cache.sh` — optional host-side seeding hook for the daemon's
@@ -121,9 +123,44 @@ there rebuilds the image automatically on the next run.
 - `remoter-agent` reads `remoter-agent.toml` (see the annotated
   [`agent-runner/remoter-agent.toml`](agent-runner/remoter-agent.toml)); the
   agent token comes from `REMOTER_AGENT_TOKEN` or the `token` key.
+- Each project may version `.remoter/agent.toml` to override the daemon's
+  driver kind (`stub`, `kimi-acp`, or `opencode-acp`) and define argv-only
+  environment, service lifecycle, and image initialization commands. Missing
+  fields inherit legacy behavior independently; `[]` explicitly disables a
+  command. The daemon reads the file from the synced central clone and applies
+  it to plan/implement/supervise/review and image builds. Invalid TOML, unknown
+  fields or drivers, and invalid argv are permanent errors; never put secrets
+  in this file. See the [full contract, inheritance table, examples, and
+  execution order](agent-runner/README.md#project-execution-configuration-remoteragenttoml).
 - `remoter-mcp` is configured purely through environment variables
   (`REMOTER_API_URL`, `REMOTER_TOKEN`, optional `REMOTER_WORKSPACE_ID`) — see
   [`mcp-server/README.md`](mcp-server/README.md).
+
+### Project execution overrides
+
+A partial `.remoter/agent.toml` changes only the fields it declares:
+
+```toml
+[commands]
+services_up = ["just", "db-up"]
+services_wait = []
+```
+
+Here `just db-up` also performs the readiness check. Every other field keeps its
+legacy default independently; an empty array disables only that step.
+
+| Missing field | Legacy inheritance |
+|---|---|
+| `driver` | Daemon `[driver].kind`. |
+| `env_wrap` | Auto-detected devenv shell for the selected host/container/bwrap mode, or direct execution without devenv. |
+| `services_up` | Host/bwrap: `devenv up -d` when processes are configured. Container: `just db-up` for a devenv project with a justfile. |
+| `services_wait` | Host/bwrap: `devenv processes wait --timeout 120` when processes are configured. Container: no separate wait. |
+| `services_down` | Best-effort `devenv processes down` on host/bwrap. |
+| `image_init` | Legacy devenv shell plus `agent-init.sh` when present, otherwise a devenv warm with `true`. |
+
+The [full contract and mode-specific execution
+order](agent-runner/README.md#project-execution-configuration-remoteragenttoml)
+includes the complete argv example and bwrap pre-warm rules.
 
 ## Relationship to Remoter
 

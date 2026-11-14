@@ -455,47 +455,14 @@ impl Config {
             ),
             Err(_) => file.workspace_id,
         };
-        let mut driver = file.driver;
-        // Keep the existing Kimi defaults while making the more specific
-        // OpenCode kind useful without requiring redundant program settings.
-        if driver.kind == "opencode-acp"
-            && driver.agent_program == default_agent_program()
-            && driver.agent_args == default_agent_args()
-        {
-            driver.agent_program = "opencode".to_string();
-        }
-        let container_mode = file.execution.mode == ExecutionMode::Container;
-        // The stub driver never touches MCP — skip resolution so dry-run
-        // setups don't need the binary on the host. Container mode reduces
-        // both program values to bare names instead: the agent and
-        // `remoter-mcp` are spawned *inside* the run container and resolve
-        // against the image's PATH — a host-absolute path (e.g. a NixOS
-        // `/run/current-system/sw/bin/kimi`) does not exist there.
-        if container_mode {
-            driver.agent_program = bare_program_name(&driver.agent_program, "agent_program");
-            driver.remoter_mcp_command = bare_program_name(&driver.remoter_mcp_command, "remoter_mcp_command");
-        } else if driver.kind != "stub" {
-            driver.remoter_mcp_command = resolve_mcp_command(&driver.remoter_mcp_command)?;
-        }
-        driver.kimi_config = expand_tilde_path(&driver.kimi_config);
+        let driver = file.driver;
         let workspace_root = expand_tilde(&file.workspace_root);
         let execution = ExecutionConfig {
             agent_home: file.execution.agent_home.as_deref().map(expand_tilde_path),
             nix_binary_cache_dir: file.execution.nix_binary_cache_dir.as_deref().map(expand_tilde_path),
             ..file.execution
         };
-        let agent_home = execution.agent_home(&workspace_root);
-        if driver.kind == "kimi-acp" {
-            driver.sessions_dir = Some(
-                driver
-                    .sessions_dir
-                    .as_deref()
-                    .map(expand_tilde_path)
-                    .unwrap_or_else(|| agent_home.join(".kimi-code/sessions")),
-            );
-        } else {
-            driver.sessions_dir = None;
-        }
+        let driver = normalize_driver(driver, &execution, &workspace_root)?;
         let logs_dir = file
             .logs
             .dir
@@ -525,6 +492,30 @@ impl Config {
             driver,
             execution,
         })
+    }
+
+    /// Applies a project's optional driver selection and recomputes all
+    /// kind-dependent defaults for the selected execution mode.
+    pub fn with_project_driver(&self, kind: Option<&str>) -> anyhow::Result<Self> {
+        let mut effective = self.clone();
+        if let Some(kind) = kind {
+            if effective.driver.kind != kind {
+                effective.driver.agent_program = default_agent_program();
+                effective.driver.agent_args = default_agent_args();
+                effective.driver.plan_model = None;
+                effective.driver.plan_thinking = None;
+                effective.driver.implement_model = None;
+                effective.driver.implement_thinking = None;
+                effective.driver.supervise_model = None;
+                effective.driver.supervise_thinking = None;
+                effective.driver.review_model = None;
+                effective.driver.review_thinking = None;
+                effective.driver.sessions_dir = None;
+            }
+            effective.driver.kind = kind.to_string();
+        }
+        effective.driver = normalize_driver(effective.driver, &effective.execution, &effective.workspace_root)?;
+        Ok(effective)
     }
 
     /// Validate daemon-owned agent configuration and the selected execution
@@ -573,6 +564,45 @@ impl Config {
         }
         Ok(())
     }
+}
+
+fn normalize_driver(
+    mut driver: DriverConfig,
+    execution: &ExecutionConfig,
+    workspace_root: &Path,
+) -> anyhow::Result<DriverConfig> {
+    if !matches!(driver.kind.as_str(), "stub" | "kimi-acp" | "opencode-acp") {
+        anyhow::bail!(
+            "unknown driver kind {:?} (expected \"stub\", \"kimi-acp\", or \"opencode-acp\")",
+            driver.kind
+        );
+    }
+    if driver.kind == "opencode-acp"
+        && driver.agent_program == default_agent_program()
+        && driver.agent_args == default_agent_args()
+    {
+        driver.agent_program = "opencode".to_string();
+    }
+    if execution.mode == ExecutionMode::Container {
+        driver.agent_program = bare_program_name(&driver.agent_program, "agent_program");
+        driver.remoter_mcp_command = bare_program_name(&driver.remoter_mcp_command, "remoter_mcp_command");
+    } else if driver.kind != "stub" {
+        driver.remoter_mcp_command = resolve_mcp_command(&driver.remoter_mcp_command)?;
+    }
+    driver.kimi_config = expand_tilde_path(&driver.kimi_config);
+    let agent_home = execution.agent_home(workspace_root);
+    driver.sessions_dir = if driver.kind == "kimi-acp" {
+        Some(
+            driver
+                .sessions_dir
+                .as_deref()
+                .map(expand_tilde_path)
+                .unwrap_or_else(|| agent_home.join(".kimi-code/sessions")),
+        )
+    } else {
+        None
+    };
+    Ok(driver)
 }
 
 /// The token is a secret: a config file carrying it must be owner-only.
@@ -1131,6 +1161,61 @@ review_model = "kimi-code/k3-reasoning""#,
         assert_eq!(cfg.driver.agent_program, "opencode");
         assert_eq!(cfg.driver.agent_args, vec!["acp"]);
         assert_eq!(cfg.driver.sessions_dir, None);
+    }
+
+    #[test]
+    fn project_driver_override_recomputes_kind_defaults() {
+        let toml = TOML.replace(
+            "[driver]\nkind = \"stub\"",
+            r#"[driver]
+kind = "kimi-acp"
+agent_program = "/opt/kimi-custom"
+agent_args = ["acp", "--kimi-only"]
+remoter_mcp_command = "/opt/remoter-mcp"
+plan_model = "kimi-code/k3"
+plan_thinking = "max""#,
+        );
+        let cfg = Config::from_toml_str(&toml, Some("tok".to_string())).unwrap();
+        let unchanged = cfg.with_project_driver(None).unwrap();
+        assert_eq!(unchanged.driver.kind, "kimi-acp");
+        assert_eq!(unchanged.driver.agent_program, "/opt/kimi-custom");
+        assert_eq!(unchanged.driver.agent_args, vec!["acp", "--kimi-only"]);
+        assert_eq!(unchanged.driver.plan_model.as_deref(), Some("kimi-code/k3"));
+
+        let opencode = cfg.with_project_driver(Some("opencode-acp")).unwrap();
+        assert_eq!(opencode.driver.kind, "opencode-acp");
+        assert_eq!(opencode.driver.agent_program, "opencode");
+        assert_eq!(opencode.driver.agent_args, vec!["acp"]);
+        assert_eq!(opencode.driver.remoter_mcp_command, "/opt/remoter-mcp");
+        assert_eq!(opencode.driver.sessions_dir, None);
+        assert!(opencode.driver.config_options_for("plan").is_empty());
+        assert!(opencode.driver.plan_model.is_none());
+        assert!(opencode.driver.implement_model.is_none());
+        assert!(opencode.driver.supervise_model.is_none());
+        assert!(opencode.driver.review_model.is_none());
+
+        let kimi = opencode.with_project_driver(Some("kimi-acp")).unwrap();
+        assert_eq!(kimi.driver.kind, "kimi-acp");
+        assert_eq!(kimi.driver.agent_program, "kimi");
+        assert_eq!(kimi.driver.agent_args, vec!["acp"]);
+        assert_eq!(
+            kimi.driver.sessions_dir.as_deref(),
+            Some(
+                kimi.execution
+                    .agent_home(&kimi.workspace_root)
+                    .join(".kimi-code/sessions")
+                    .as_path()
+            )
+        );
+    }
+
+    #[test]
+    fn unknown_driver_kinds_are_rejected() {
+        let toml = TOML.replace("kind = \"stub\"", "kind = \"unknown\"");
+        assert!(Config::from_toml_str(&toml, Some("tok".to_string())).is_err());
+        let cfg = Config::from_toml_str(TOML, Some("tok".to_string())).unwrap();
+        let error = cfg.with_project_driver(Some("unknown")).unwrap_err().to_string();
+        assert!(error.contains("unknown driver kind"), "{error}");
     }
 
     #[test]
