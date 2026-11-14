@@ -172,8 +172,10 @@ the commit and symbolic HEAD plus tracked, untracked, and ignored worktree state
 before and after. Any unexpected change, including a branch switch at the same
 commit, fails the answer. Terminal run updates retry transient backend failures,
 and a committed question start is recovered and closed if resolving its run
-history fails. Q&A never performs status transitions, workflow comments,
-outcome/report writes, pushes, forge calls, or PR creation. The common history
+history fails. If cancellation or a timeout happens before the driver returns a
+fork ID, the terminal run omits `sessionId` instead of recording the source
+session. Q&A never performs status transitions, workflow comments, outcome/report
+writes, pushes, forge calls, or PR creation. The common history
 prefix can make a provider prompt-cache
 hit possible, but cache reuse is **not guaranteed or asserted** without provider
 usage metrics.

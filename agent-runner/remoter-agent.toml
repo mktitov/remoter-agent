@@ -72,7 +72,8 @@ kind = "kimi-acp"    # "stub" | "kimi-acp" | "opencode-acp" | generic "acp"
 # simulate_delay_ms = 0          # stub only: artificial run duration
 # ACP drivers (defaults shown for kimi-acp):
 # agent_program = "kimi"        # opencode-acp defaults to "opencode"
-# agent_args = ["acp"]
+# agent_args = ["acp"]         # omitted key defaults to ["acp"] for Kimi/OpenCode;
+#                              # explicit agent_args = [] stays empty for wrappers
 # kimi_config = "~/.config/remoter-agent/kimi-config.toml"
 # Daemon-owned Kimi provider/model/thinking config for host, container, and
 # bwrap. It is rendered into <agent_home>/.kimi-code/config.toml at every run;

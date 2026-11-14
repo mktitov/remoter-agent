@@ -493,12 +493,12 @@ async fn run_attempt(
     tokio::select! {
         _ = qc.cancel.cancelled() => Err(RunFailure::new(
             DriverError::Transient("question cancelled".to_string()),
-            prepared.fork_session.clone(),
+            None,
         )),
         result = tokio::time::timeout(timeout, qc.driver.run(spec)) => {
             result.unwrap_or_else(|_| Err(RunFailure::new(
                 DriverError::Transient(format!("timeout after {} minutes", qc.config.run_timeout_minutes)),
-                prepared.fork_session.clone(),
+                None,
             )))
         }
     }
@@ -732,6 +732,17 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn spawn_backend(responses: Vec<(u16, String)>) -> (String, Arc<Mutex<Vec<String>>>) {
+        spawn_backend_impl(responses, false).await
+    }
+
+    async fn spawn_full_backend(responses: Vec<(u16, String)>) -> (String, Arc<Mutex<Vec<String>>>) {
+        spawn_backend_impl(responses, true).await
+    }
+
+    async fn spawn_backend_impl(
+        responses: Vec<(u16, String)>,
+        full_requests: bool,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -742,22 +753,32 @@ mod tests {
                 let mut request = Vec::new();
                 let mut chunk = [0u8; 2048];
                 loop {
+                    let header_end = request.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4);
+                    let content_length = header_end
+                        .and_then(|end| {
+                            String::from_utf8_lossy(&request[..end]).lines().find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                        })
+                        .unwrap_or(0);
+                    if header_end.is_some_and(|end| request.len() >= end + content_length) {
+                        break;
+                    }
                     match socket.read(&mut chunk).await {
                         Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            request.extend_from_slice(&chunk[..n]);
-                            if request.windows(4).any(|w| w == b"\r\n\r\n") {
-                                break;
-                            }
-                        }
+                        Ok(n) => request.extend_from_slice(&chunk[..n]),
                     }
                 }
-                let first_line = String::from_utf8_lossy(&request)
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-                    .to_string();
-                recorded.lock().unwrap().push(first_line);
+                let request = String::from_utf8_lossy(&request).into_owned();
+                let entry = if full_requests {
+                    request
+                } else {
+                    request.lines().next().unwrap_or_default().to_string()
+                };
+                recorded.lock().unwrap().push(entry);
                 let response = format!(
                     "HTTP/1.1 {status} Reason\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
@@ -965,6 +986,16 @@ mod tests {
         }
     }
 
+    struct PendingDriver;
+
+    #[async_trait::async_trait]
+    impl AgentDriver for PendingDriver {
+        async fn run(&self, _spec: RunSpec) -> Result<RunOutcome, RunFailure> {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    }
+
     #[tokio::test]
     async fn bwrap_question_run_uses_bwrap_exec_instead_of_host() {
         let root = std::env::temp_dir().join(format!("remoter-question-bwrap-exec-{}", std::process::id()));
@@ -1118,6 +1149,75 @@ mod tests {
                 .all(|c| !c.contains("/status") && !c.contains("/comments") && !c.contains("forge"))
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    async fn assert_terminal_patch_omits_source_session(cancel: bool) {
+        let mode = if cancel { "cancel" } else { "timeout" };
+        let root = std::env::temp_dir().join(format!("remoter-question-{mode}-session-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let worktree = workspace::worktree_dir(&root, 1, 7);
+        init_repo(&worktree);
+        let current = question_json(4, "running", Some(40));
+        let detail = serde_json::json!({
+            "id":7,"projectId":1,"projectName":"p","featureId":1,"featureDescription":"f",
+            "title":"seven","description":"d","taskStatus":"review"
+        });
+        let runs = serde_json::json!([
+            run_json(40, "question", "running", None),
+            run_json(10, "implement", "succeeded", Some("source-session"))
+        ]);
+        let mut responses = vec![
+            (200, current.to_string()),
+            (200, runs.to_string()),
+            (200, runs.to_string()),
+            (200, detail.to_string()),
+            (200, serde_json::json!([current]).to_string()),
+            (200, runs.to_string()),
+        ];
+        if cancel {
+            responses.push((
+                200,
+                serde_json::json!([question_json(4, "cancel_requested", Some(40))]).to_string(),
+            ));
+        }
+        responses.push((200, run_json(40, "question", "failed", None).to_string()));
+        let (url, requests) = spawn_full_backend(responses).await;
+        let mut pending = question(4, "pending", None);
+        pending.source_run_id = Some(10);
+        let mut qc = test_context(&url, &root, pending);
+        qc.driver = Arc::new(PendingDriver);
+        if cancel {
+            qc.cancel.cancel();
+        } else {
+            let toml = format!(
+                "api_url = \"{url}\"\nworkspace_root = \"{}\"\nrun_timeout_minutes = 0\n[driver]\nkind = \"stub\"\n",
+                root.display()
+            );
+            qc.config = Arc::new(Config::from_toml_str(&toml, Some("tok".to_string())).unwrap());
+        }
+
+        execute(qc).await;
+
+        let calls = requests.lock().unwrap().clone();
+        assert_eq!(calls.len(), if cancel { 8 } else { 7 }, "{calls:?}");
+        let patch = calls.last().unwrap();
+        assert!(patch.starts_with("PATCH /api/v1/agent-runs/40 "), "{patch}");
+        let body = patch.split_once("\r\n\r\n").unwrap().1;
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(json["status"], "failed");
+        assert!(json.get("sessionId").is_none(), "{json}");
+        assert!(!body.contains("source-session"), "{body}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn cancelled_question_patch_omits_source_session_id() {
+        assert_terminal_patch_omits_source_session(true).await;
+    }
+
+    #[tokio::test]
+    async fn timed_out_question_patch_omits_source_session_id() {
+        assert_terminal_patch_omits_source_session(false).await;
     }
 
     #[tokio::test]

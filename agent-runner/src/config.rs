@@ -316,6 +316,17 @@ impl DriverConfig {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct FileDriverConfig {
+    /// Presence is significant: an explicit empty list disables wrapper args,
+    /// while an omitted key receives the driver-specific default below.
+    #[serde(default)]
+    agent_args: Option<Vec<String>>,
+    #[serde(flatten)]
+    rest: DriverConfig,
+}
+
 /// Raw TOML shape; `Config` adds the env-sourced values on top.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -353,7 +364,7 @@ struct FileConfig {
     cancel_grace_secs: u64,
     #[serde(default)]
     logs: LogsConfig,
-    driver: DriverConfig,
+    driver: FileDriverConfig,
     #[serde(default)]
     execution: ExecutionConfig,
 }
@@ -462,12 +473,17 @@ impl Config {
             ),
             Err(_) => file.workspace_id,
         };
-        let mut driver = file.driver;
-        // Generic ACP takes its arguments verbatim, including an explicit
-        // ["acp"]. Kimi/OpenCode retain their historical subcommand default.
-        if driver.kind != "acp" && driver.agent_args.is_empty() {
-            driver.agent_args = default_agent_args();
-        }
+        let FileDriverConfig { agent_args, rest } = file.driver;
+        let mut driver = rest;
+        // Generic ACP defaults to no arguments. Kimi/OpenCode default to their
+        // subcommand only when the key is absent; an explicit [] stays empty.
+        driver.agent_args = agent_args.unwrap_or_else(|| {
+            if driver.kind == "acp" {
+                Vec::new()
+            } else {
+                default_agent_args()
+            }
+        });
         if driver.kind == "opencode-acp"
             && driver.agent_program == default_agent_program()
             && driver.agent_args == default_agent_args()
@@ -1147,6 +1163,22 @@ review_model = "kimi-code/k3-reasoning""#,
     }
 
     #[test]
+    fn kimi_and_opencode_preserve_explicit_empty_agent_args() {
+        for kind in ["kimi-acp", "opencode-acp"] {
+            let omitted = TOML.replace(
+                "[driver]\nkind = \"stub\"",
+                &format!("[driver]\nkind = \"{kind}\"\nremoter_mcp_command = \"/opt/remoter-mcp\""),
+            );
+            let cfg = Config::from_toml_str(&omitted, Some("tok".to_string())).unwrap();
+            assert_eq!(cfg.driver.agent_args, vec!["acp"], "{kind} omitted args");
+
+            let explicit = omitted.replace("remoter_mcp_command", "agent_args = []\nremoter_mcp_command");
+            let cfg = Config::from_toml_str(&explicit, Some("tok".to_string())).unwrap();
+            assert!(cfg.driver.agent_args.is_empty(), "{kind} explicit empty args");
+        }
+    }
+
+    #[test]
     fn opencode_driver_maps_thinking_settings_to_effort() {
         // SAFETY: single-threaded test process env tweak; removed immediately.
         unsafe { std::env::remove_var(API_URL_ENV) };
@@ -1188,6 +1220,10 @@ review_model = "kimi-code/k3-reasoning""#,
             ]
         );
         cfg.validate_execution().unwrap();
+
+        let omitted_args = toml.replace("agent_args = []\n", "");
+        let cfg = Config::from_toml_str(&omitted_args, Some("tok".to_string())).unwrap();
+        assert!(cfg.driver.agent_args.is_empty());
 
         let explicit_args = toml.replace("agent_args = []", "agent_args = [\"acp\"]");
         let cfg = Config::from_toml_str(&explicit_args, Some("tok".to_string())).unwrap();
