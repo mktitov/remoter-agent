@@ -978,12 +978,16 @@ mod tests {
                         );
                     }
                 }
+                let request = String::from_utf8_lossy(&request);
+                let unsupported_queue = request.lines().next().is_some_and(|line| {
+                    line.starts_with("GET /api/v1/agent-questions?assignee=me&status=")
+                        && !line.starts_with("GET /api/v1/agent-questions?assignee=me&status=pending ")
+                        && !line.starts_with("GET /api/v1/agent-questions?assignee=me&status=cancel_requested ")
+                });
                 if let Some(recorded) = &recorded {
-                    recorded
-                        .lock()
-                        .unwrap()
-                        .push(String::from_utf8_lossy(&request).into_owned());
+                    recorded.lock().unwrap().push(request.as_ref().to_string());
                 }
+                let (status, body) = if unsupported_queue { (400, "{}") } else { (status, body) };
                 let response = format!(
                     "HTTP/1.1 {status} Reason\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
@@ -1227,8 +1231,9 @@ kind = "stub"
             (500, "{}"),
             (200, "[]"),
             (200, "[]"),
-            (200, RUNNING_QUESTION),
             (200, REVIEW_TASK),
+            (200, RUNNING_QUESTION),
+            (200, RUNNING_QUESTION_RUN),
             (200, FAILED_QUESTION_RUN),
         ])
         .await;
@@ -1236,7 +1241,14 @@ kind = "stub"
         daemon.reconcile().await;
 
         reconcile_running_question_poll(&mut daemon).await;
-        assert_terminal_patch_retried(&requests, 9);
+        assert_terminal_patch_retried(&requests, 10);
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|call| !call.contains("status=running"))
+        );
     }
 
     #[tokio::test]
@@ -1247,8 +1259,9 @@ kind = "stub"
             (500, "{}"),
             (200, "[]"),
             (200, "[]"),
-            (200, RUNNING_QUESTION),
             (200, REVIEW_TASK),
+            (200, RUNNING_QUESTION),
+            (200, RUNNING_QUESTION_RUN),
             (200, FAILED_QUESTION_RUN),
         ])
         .await;
@@ -1260,7 +1273,14 @@ kind = "stub"
         daemon.housekeeping().await;
         assert!(!daemon.running.contains_key(&7));
         reconcile_running_question_poll(&mut daemon).await;
-        assert_terminal_patch_retried(&requests, 8);
+        assert_terminal_patch_retried(&requests, 9);
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|call| !call.contains("status=running"))
+        );
     }
 
     #[tokio::test]

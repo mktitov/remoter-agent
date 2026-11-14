@@ -172,8 +172,9 @@ the commit and symbolic HEAD plus tracked, untracked, and ignored worktree state
 before and after. Any unexpected change, including a branch switch at the same
 commit, fails the answer. Terminal run updates retry transient backend failures.
 Every poll also reconciles server-side `running` questions that have no matching
-live local task, so a committed start, restart, or aborted run is still closed
-after transient run-history or terminal-update failures. If cancellation or a
+live local task by reading each review ticket's question history and run rows,
+so a committed start, restart, or aborted run is still closed after transient
+run-history or terminal-update failures. If cancellation or a
 timeout happens before the driver returns a
 fork ID, the terminal run omits `sessionId` instead of recording the source
 session. Q&A never performs status transitions, workflow comments, outcome/report
