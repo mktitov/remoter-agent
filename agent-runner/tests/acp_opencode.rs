@@ -20,6 +20,8 @@ fn spec(dir: PathBuf) -> RunSpec {
         prompt: "Reply with exactly: REMOTER_OPENCODE_OK".to_string(),
         kind: "implement",
         resume_session: None,
+        fork_session: None,
+        fallback_prompt: None,
         branch: "agent/task-0-opencode-conformance".to_string(),
         env: vec![],
         exec: remoter_agent::workspace::ExecEnv::host(false),
@@ -57,6 +59,8 @@ async fn opencode_acp_conformance() {
         supervise_thinking: None,
         review_model: None,
         review_thinking: None,
+        question_model: None,
+        question_thinking: None,
         sessions_dir: None,
     };
     let driver = AcpDriver::new(&cfg, "http://localhost:8181", "unused-in-this-test", None, 300, 30);

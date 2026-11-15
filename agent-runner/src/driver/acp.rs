@@ -7,9 +7,10 @@
 //! bounce/re-plan runs, §5.4 — with an in-attempt fallback to a fresh session
 //! when the resumed session's first prompt fails) → `session/prompt` with
 //! streaming capture. Every
-//! `session/request_permission` is auto-approved and every elicitation is
-//! declined — this is what guarantees "the agent must not ask questions"
-//! (§5.5). End-turn token usage is recorded when the agent reports it (§4.1).
+//! `session/request_permission` is auto-approved for implementation runs and
+//! denied for read-only question runs; every elicitation is declined — this is
+//! what guarantees "the agent must not ask questions" (§5.5). End-turn token
+//! usage is recorded when the agent reports it (§4.1).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -19,7 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, CreateElicitationRequest, CreateElicitationResponse, ElicitationAction,
-    InitializeRequest, McpServer, NewSessionRequest, PermissionOptionKind, Plan, PromptRequest,
+    ForkSessionRequest, InitializeRequest, McpServer, NewSessionRequest, PermissionOptionKind, Plan, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
     SelectedPermissionOutcome, SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionValue,
     SessionConfigSelectOptions, SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
@@ -109,6 +110,7 @@ impl AgentDriver for AcpDriver {
             "plan" => RunKind::Plan,
             "supervise" => RunKind::Supervise,
             "review" => RunKind::Review,
+            "question" => RunKind::Question,
             _ => RunKind::Implement,
         };
         let mcp_servers = mcp::merged_mcp_servers(
@@ -137,7 +139,10 @@ impl AgentDriver for AcpDriver {
             workspace::ExecEnv::Bwrap(_) | workspace::ExecEnv::Host { .. } => spec.cwd.clone(),
         };
         let prompt = spec.prompt.clone();
+        let fallback_prompt = spec.fallback_prompt.clone();
         let resume = spec.resume_session.clone();
+        let fork = spec.fork_session.clone();
+        let read_only = kind == RunKind::Question;
         let logger = spec.logger.clone();
         let config_options = spec.config_options.clone();
         // Isolated modes persist wire files in the shared agent home.
@@ -164,8 +169,13 @@ impl AgentDriver for AcpDriver {
         let activity_for_permission = activity.clone();
         let activity_for_elicitation = activity.clone();
 
-        // Log the outgoing prompt before any session setup can fail.
+        // Log both forms before setup can fail; only one is sent, depending on
+        // the fork capability negotiated below.
         spec.logger.log_prompt(&spec.prompt);
+        if let Some(fallback) = spec.fallback_prompt.as_deref() {
+            spec.logger
+                .log_prompt(format!("[read-only fallback context]\n{fallback}"));
+        }
 
         let conn = Client
             .builder()
@@ -181,10 +191,15 @@ impl AgentDriver for AcpDriver {
             .on_receive_request(
                 async move |request: RequestPermissionRequest, responder, _cx| {
                     activity_for_permission.store(now_secs(), Ordering::Relaxed);
-                    // Auto-approve every permission request (spec §5.5) — but only
-                    // via an allow option. An agent that offers none gets the
-                    // request cancelled; blindly picking the first option could
-                    // select a reject and silently stall the run.
+                    // Question turns are answer-only. Deny every tool
+                    // permission, including reads whose arguments could hide a
+                    // mutation; other run kinds keep the existing allow-option
+                    // policy.
+                    if read_only {
+                        return responder.respond(RequestPermissionResponse::new(
+                            RequestPermissionOutcome::Cancelled,
+                        ));
+                    }
                     let option = request
                         .options
                         .iter()
@@ -215,28 +230,69 @@ impl AgentDriver for AcpDriver {
             )
             .connect_with(transport, move |cx: ConnectionTo<Agent>| async move {
                 *conn_handle_for_cx.lock().expect("conn handle poisoned") = Some(cx.clone());
-                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                let initialize = cx
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
                     .block_task()
                     .await?;
 
                 // Bounce/re-plan runs resume the previous session of the same
-                // kind (spec §5.4); a gone session falls back to a fresh one —
-                // the prompt already carries the plan text and the thread, so
-                // the ticket is self-contained.
+                // kind. Question runs instead fork the source when the agent
+                // advertises session.fork; without fork, a source session, or a
+                // successful fork request they use a fresh session with the
+                // self-contained read-only prompt.
                 let mut resumed = false;
-                let (mut session_id, advertised) = match resume {
-                    Some(id) => match resume_session(&cx, &id, &cwd, &mcp_servers).await {
-                        Ok(adv) => {
-                            tracing::info!(session_id = %id, "resumed previous session");
-                            resumed = true;
-                            (SessionId::from(id), adv)
+                let mut used_fallback = false;
+                let (mut session_id, advertised) = if read_only {
+                    match fork {
+                        Some(id)
+                            if initialize
+                                .agent_capabilities
+                                .session_capabilities
+                                .fork
+                                .is_some() =>
+                        {
+                            tracing::info!(session_id = %id, "forking source session for question");
+                            match fork_session(&cx, &id, &cwd, &mcp_servers).await {
+                                Ok((forked, _)) if forked.0.as_ref() == id => {
+                                    return Err(agent_client_protocol::Error::new(
+                                        -32603,
+                                        "permanent driver error: session/fork returned the source session id",
+                                    ));
+                                }
+                                Ok(forked) => forked,
+                                Err(e) => {
+                                    tracing::warn!(session_id = %id, error = %e,
+                                        "session fork failed; using question fallback");
+                                    used_fallback = true;
+                                    new_session(&cx, &cwd, &mcp_servers).await?
+                                }
+                            }
                         }
-                        Err(e) => {
-                            tracing::warn!(session_id = %id, error = %e, "session resume failed; starting fresh");
+                        Some(id) => {
+                            tracing::info!(session_id = %id, "agent has no session.fork capability; using question fallback");
+                            used_fallback = true;
                             new_session(&cx, &cwd, &mcp_servers).await?
                         }
-                    },
-                    None => new_session(&cx, &cwd, &mcp_servers).await?,
+                        None => {
+                            used_fallback = true;
+                            new_session(&cx, &cwd, &mcp_servers).await?
+                        }
+                    }
+                } else {
+                    match resume {
+                        Some(id) => match resume_session(&cx, &id, &cwd, &mcp_servers).await {
+                            Ok(adv) => {
+                                tracing::info!(session_id = %id, "resumed previous session");
+                                resumed = true;
+                                (SessionId::from(id), adv)
+                            }
+                            Err(e) => {
+                                tracing::warn!(session_id = %id, error = %e, "session resume failed; starting fresh");
+                                new_session(&cx, &cwd, &mcp_servers).await?
+                            }
+                        },
+                        None => new_session(&cx, &cwd, &mcp_servers).await?,
+                    }
                 };
 
                 // Apply per-kind model/effort config via the standard ACP
@@ -258,6 +314,11 @@ impl AgentDriver for AcpDriver {
                     .map(|d| kimi_usage::usage_line_count(d, &sid))
                     .unwrap_or(0);
 
+                let prompt = if used_fallback {
+                    fallback_prompt.unwrap_or(prompt)
+                } else {
+                    prompt
+                };
                 let prompt_request = |session_id: SessionId| {
                     PromptRequest::new(session_id, vec![ContentBlock::Text(TextContent::new(prompt.clone()))])
                 };
@@ -569,6 +630,21 @@ async fn new_session(
     Ok((resp.session_id, resp.config_options.unwrap_or_default()))
 }
 
+async fn fork_session(
+    cx: &ConnectionTo<Agent>,
+    session_id: &str,
+    cwd: &std::path::Path,
+    mcp_servers: &[McpServer],
+) -> Result<(SessionId, Vec<SessionConfigOption>), agent_client_protocol::Error> {
+    let resp = cx
+        .send_request(
+            ForkSessionRequest::new(session_id.to_string(), cwd.to_path_buf()).mcp_servers(mcp_servers.to_vec()),
+        )
+        .block_task()
+        .await?;
+    Ok((resp.session_id, resp.config_options.unwrap_or_default()))
+}
+
 async fn resume_session(
     cx: &ConnectionTo<Agent>,
     session_id: &str,
@@ -695,7 +771,7 @@ fn outcome_model_thinking(options: &[(String, String)]) -> (Option<String>, Opti
     for (id, value) in options {
         match id.as_str() {
             "model" => model = Some(value.clone()),
-            "thinking" => thinking = Some(value.clone()),
+            "thinking" | "effort" => thinking = Some(value.clone()),
             _ => {}
         }
     }

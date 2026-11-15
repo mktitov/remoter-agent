@@ -490,6 +490,8 @@ async fn run_attempt(
         prompt: prompt.to_string(),
         kind: REVIEW_RUN_KIND,
         resume_session: None,
+        fork_session: None,
+        fallback_prompt: None,
         branch: env.branch.to_string(),
         env: env_vars,
         exec,

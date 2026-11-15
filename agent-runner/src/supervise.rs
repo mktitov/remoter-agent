@@ -79,7 +79,7 @@ fn latest_run_failed(child: &TaskDetail) -> bool {
     child
         .runs
         .as_deref()
-        .and_then(|runs| runs.first())
+        .and_then(|runs| runs.iter().find(|r| r.kind != "question"))
         .is_some_and(|r| r.status == "failed")
 }
 
@@ -944,6 +944,8 @@ async fn run_attempt(
         prompt: prompt.to_string(),
         kind: SUPERVISE_RUN_KIND,
         resume_session,
+        fork_session: None,
+        fallback_prompt: None,
         branch: env.branch.to_string(),
         env: env_vars,
         exec,
@@ -2963,6 +2965,17 @@ mod tests {
             !circuit_broken(&c),
             "a successful finish is supervisable however many cycles came before"
         );
+    }
+
+    #[test]
+    fn latest_run_failed_ignores_question_runs() {
+        let mut child = child(42, "review", false, None, Some(7));
+        let mut question = run_row("failed");
+        question.kind = "question".to_string();
+        child.runs = Some(vec![question, run_row("succeeded")]);
+        assert!(!latest_run_failed(&child));
+        child.runs = Some(vec![run_row("failed")]);
+        assert!(latest_run_failed(&child));
     }
 
     /// Unrelated thread chatter must not count as failure cycles.
