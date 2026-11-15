@@ -71,7 +71,6 @@ fn forget_question_run(config: &Config, question_id: i32) {
 fn owns_question_run(config: &Config, question_id: i32, run_id: i32) -> bool {
     let path = ownership_path(config, question_id);
     match std::fs::read_to_string(&path) {
-        Ok(contents) if contents.trim() == START_PENDING => true,
         Ok(contents) => contents.trim().parse::<i32>().ok() == Some(run_id),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => {
@@ -271,14 +270,20 @@ pub async fn execute(qc: QuestionContext) {
         tracing::warn!(task_id, question_id, error = %e, "question: could not persist run ownership; start deferred");
         return;
     }
-    let started = match qc.client.start_agent_question(&qc.trigger.question).await {
-        Ok(started) => {
-            if let Err(e) = record_question_run(&qc.config, question_id, started.run.id) {
-                tracing::warn!(task_id, question_id, run_id = started.run.id, error = %e,
-                    "question: could not persist started run ID; committed-start marker retained");
+    let ownership_config = qc.config.clone();
+    let mut confirmed_run_id = None;
+    let started = match qc
+        .client
+        .start_agent_question(&qc.trigger.question, |run_id| {
+            confirmed_run_id = Some(run_id);
+            if let Err(e) = record_question_run(&ownership_config, question_id, run_id) {
+                tracing::warn!(task_id, question_id, run_id, error = %e,
+                    "question: could not persist started run ID; recovery disabled for this attempt");
             }
-            started
-        }
+        })
+        .await
+    {
+        Ok(started) => started,
         Err(e) if e.is_conflict() => {
             forget_question_run(&qc.config, question_id);
             tracing::info!(task_id, question_id, "question already started; skipping duplicate");
@@ -286,7 +291,7 @@ pub async fn execute(qc: QuestionContext) {
         }
         Err(e) => {
             tracing::warn!(task_id, question_id, error = %e, "question: could not start run");
-            if e.status.is_some_and(|status| status.is_client_error()) {
+            if confirmed_run_id.is_none() && e.status.is_some_and(|status| status.is_client_error()) {
                 forget_question_run(&qc.config, question_id);
                 return;
             }
@@ -1410,7 +1415,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn other_daemon_poll_does_not_finish_active_question_and_owner_succeeds() {
+    async fn other_daemon_start_failure_and_poll_do_not_finish_active_question_and_owner_succeeds() {
         let root_a = std::env::temp_dir().join(format!("remoter-question-daemon-a-{}", std::process::id()));
         let root_b = std::env::temp_dir().join(format!("remoter-question-daemon-b-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root_a);
@@ -1437,6 +1442,8 @@ mod tests {
             (200, detail.to_string()),
             (200, serde_json::json!([current]).to_string()),
             (200, runs.to_string()),
+            (500, "{}".to_string()),
+            (200, serde_json::json!([current]).to_string()),
             (200, "[]".to_string()),
             (200, "[]".to_string()),
             (200, task.to_string()),
@@ -1457,12 +1464,19 @@ mod tests {
             .await
             .expect("daemon A must claim and start its driver");
 
+        execute(test_context(&url, &root_b, question(4, "pending", None))).await;
         let daemon_b = test_context(&url, &root_b, question(4, "pending", None));
+        assert!(!owns_question_run(&daemon_b.config, 4, 40));
         let poll = Questioner::new().poll(&daemon_b.client).await;
         assert_eq!(poll.running.len(), 1);
         reconcile_orphan(&daemon_b.client, &daemon_b.config, &poll.running[0]).await;
         let calls = requests.lock().unwrap().clone();
-        assert_eq!(calls.len(), 11, "{calls:?}");
+        assert_eq!(calls.len(), 13, "{calls:?}");
+        assert!(calls[6].starts_with("POST /api/v1/agent-questions/4/run "), "{calls:?}");
+        assert_eq!(
+            calls[7].lines().next().unwrap(),
+            "GET /api/v1/tasks/7/agent-questions HTTP/1.1"
+        );
         assert!(calls.iter().all(|call| !call.starts_with("PATCH ")), "{calls:?}");
 
         driver.release.notify_one();
@@ -1471,7 +1485,7 @@ mod tests {
             .expect("daemon A must finish")
             .unwrap();
         let calls = requests.lock().unwrap().clone();
-        assert_eq!(calls.len(), 12, "{calls:?}");
+        assert_eq!(calls.len(), 14, "{calls:?}");
         let patch = calls.last().unwrap();
         assert!(patch.starts_with("PATCH /api/v1/agent-runs/40 "), "{patch}");
         let body: serde_json::Value = serde_json::from_str(patch.split_once("\r\n\r\n").unwrap().1).unwrap();

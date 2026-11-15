@@ -740,8 +740,14 @@ impl RemoterClient {
     /// Atomically claims a pending question and resolves both the new
     /// question-run and the backend-selected source run. The backend may
     /// return either the updated question or an object embedding `question`,
-    /// `run`, and `sourceRun`; older shapes are normalized here.
-    pub async fn start_agent_question(&self, pending: &AgentQuestionDto) -> Result<StartedQuestion, ClientError> {
+    /// `run`, and `sourceRun`; older shapes are normalized here. `on_run_id`
+    /// fires before any fallible history resolution so the caller can persist
+    /// ownership of a start whose response was received successfully.
+    pub async fn start_agent_question(
+        &self,
+        pending: &AgentQuestionDto,
+        mut on_run_id: impl FnMut(i32),
+    ) -> Result<StartedQuestion, ClientError> {
         let resp = self
             .auth_request(
                 self.http
@@ -761,6 +767,14 @@ impl RemoterClient {
                 .filter(|kind| *kind == "question")
                 .map(|_| value.clone())
         });
+        let response_run_id = embedded_run
+            .as_ref()
+            .and_then(|run| run.get("id")?.as_i64())
+            .and_then(|id| i32::try_from(id).ok())
+            .or(question.run_id);
+        if let Some(run_id) = response_run_id {
+            on_run_id(run_id);
+        }
         let run = match embedded_run {
             Some(v) => serde_json::from_value::<AgentRunDto>(v).map_err(|e| ClientError {
                 status: None,
