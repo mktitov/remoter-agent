@@ -171,10 +171,14 @@ use the `dev-agent-question` MCP role, deny all permission requests, and compare
 the commit and symbolic HEAD plus tracked, untracked, and ignored worktree state
 before and after. Any unexpected change, including a branch switch at the same
 commit, fails the answer. Terminal run updates retry transient backend failures.
-Every poll also reconciles server-side `running` questions that have no matching
-live local task by reading each review ticket's question history and run rows,
-so a committed start, restart, or aborted run is still closed after transient
-run-history or terminal-update failures. If cancellation or a
+Every poll reads each review ticket's question history and run rows, but reconciles
+only server-side `running` questions owned by this daemon. Ownership is persisted
+under `<workspace_root>/question-ownership`: a committed-start marker is written
+before the atomic start request and resolved to the run ID after it returns. The
+record survives restart and is removed after a confirmed terminal update or a lost
+claim. Thus a committed start, restart, or aborted run is still closed after
+transient run-history or terminal-update failures, while another daemon with the
+same agent identity never closes an active run it does not own. If cancellation or a
 timeout happens before the driver returns a
 fork ID, the terminal run omits `sessionId` instead of recording the source
 session. Q&A never performs status transitions, workflow comments, outcome/report

@@ -244,22 +244,11 @@ impl Daemon {
             let mut orphans = 0;
             for r in runs.into_iter().filter(|r| r.status == "running") {
                 orphans += 1;
-                let body = if r.kind == "question" {
-                    let cancel_requested = self
-                        .client
-                        .task_agent_questions(task.id)
-                        .await
-                        .ok()
-                        .and_then(|questions| questions.into_iter().find(|q| q.run_id == Some(r.id)))
-                        .is_some_and(|q| q.status == "cancel_requested");
-                    if cancel_requested {
-                        crate::client::FinishRunBody::failed("cancelled by user during daemon restart".to_string())
-                    } else {
-                        crate::client::FinishRunBody::failed("daemon restart".to_string())
-                    }
-                } else {
-                    crate::client::FinishRunBody::failed("daemon restart".to_string())
-                };
+                if r.kind == crate::question::QUESTION_RUN_KIND {
+                    crate::question::reconcile_run(&self.client, &self.config, task.id, r.id).await;
+                    continue;
+                }
+                let body = crate::client::FinishRunBody::failed("daemon restart".to_string());
                 self.client
                     .finish_run(r.id, &body)
                     .await
@@ -392,11 +381,17 @@ impl Daemon {
     }
 
     /// Finish every run row still marked `running` for this task so a stuck
-    /// ticket is not stranded in a claim status forever.
+    /// ticket is not stranded in a claim status forever. Question runs also
+    /// need a matching local ownership record: another daemon may still be
+    /// answering the question under the same agent identity.
     async fn finish_orphan_running_rows(&self, task_id: i32, reason: &str) {
         match self.client.list_runs(task_id).await {
             Ok(runs) => {
                 for r in runs.into_iter().filter(|r| r.status == "running") {
+                    if r.kind == crate::question::QUESTION_RUN_KIND {
+                        crate::question::reconcile_run(&self.client, &self.config, task_id, r.id).await;
+                        continue;
+                    }
                     let body = crate::client::FinishRunBody::failed(reason.to_string());
                     self.client.finish_run(r.id, &body).await.ok();
                 }
@@ -879,8 +874,9 @@ impl Daemon {
             return;
         }
         // Restart/cancel race reconciliation: there is no local driver left to
-        // stop, but the server still has a running question-run to close.
-        crate::question::reconcile_orphan(&self.client, &question).await;
+        // stop. Only a run recorded by this daemon may be closed; the same
+        // cancel-requested row is visible to every daemon with this identity.
+        crate::question::reconcile_orphan(&self.client, &self.config, &question).await;
     }
 
     async fn reconcile_orphan_question(&self, question: crate::client::AgentQuestionDto) {
@@ -889,7 +885,7 @@ impl Daemon {
             .get(&question.task_id)
             .is_some_and(|entry| entry.kind == RunKind::Question && entry.question_id == Some(question.id));
         if !locally_active {
-            crate::question::reconcile_orphan(&self.client, &question).await;
+            crate::question::reconcile_orphan(&self.client, &self.config, &question).await;
         }
     }
 
@@ -1002,16 +998,20 @@ mod tests {
         // SAFETY: test process env tweak; the env override would otherwise win
         // over the mock URL (spec §5.1).
         unsafe { std::env::remove_var("REMOTER_API_URL") };
+        static NEXT_ROOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT_ROOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("remoter-agent-claim-test-{}-{sequence}", std::process::id()));
         let toml = format!(
             r#"
 api_url = "{api_url}"
-workspace_root = "/tmp/remoter-agent-claim-test"
+workspace_root = "{}"
 retry_backoff_secs = 1
 cancel_grace_secs = 0
 
 [driver]
 kind = "stub"
-"#
+"#,
+            root.display()
         );
         let config = Arc::new(Config::from_toml_str(&toml, Some("tok".to_string())).unwrap());
         let log_store = LogStore::new(&config.logs).unwrap();
@@ -1191,6 +1191,7 @@ kind = "stub"
         ])
         .await;
         let daemon = test_daemon(&url);
+        crate::question::record_question_run(&daemon.config, 9, 42).unwrap();
         daemon.reconcile().await;
     }
 
@@ -1238,6 +1239,7 @@ kind = "stub"
         ])
         .await;
         let mut daemon = test_daemon(&url);
+        crate::question::record_question_run(&daemon.config, 9, 42).unwrap();
         daemon.reconcile().await;
 
         reconcile_running_question_poll(&mut daemon).await;
@@ -1256,6 +1258,7 @@ kind = "stub"
         let (url, requests) = spawn_recording_mock_backend(vec![
             (200, REVIEW_TASK),
             (200, RUNNING_QUESTION_RUN),
+            (200, RUNNING_QUESTION),
             (500, "{}"),
             (200, "[]"),
             (200, "[]"),
@@ -1266,6 +1269,7 @@ kind = "stub"
         ])
         .await;
         let mut daemon = test_daemon(&url);
+        crate::question::record_question_run(&daemon.config, 9, 42).unwrap();
         let mut entry = running_run_kind(RunKind::Question, Some(Instant::now() - Duration::from_secs(10)));
         entry.question_id = Some(9);
         daemon.running.insert(7, entry);
@@ -1273,7 +1277,7 @@ kind = "stub"
         daemon.housekeeping().await;
         assert!(!daemon.running.contains_key(&7));
         reconcile_running_question_poll(&mut daemon).await;
-        assert_terminal_patch_retried(&requests, 9);
+        assert_terminal_patch_retried(&requests, 10);
         assert!(
             requests
                 .lock()

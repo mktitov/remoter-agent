@@ -31,6 +31,55 @@ const MAX_ARTIFACT_BYTES: usize = 16 * 1024;
 const MAX_DIFF_BYTES: usize = 64 * 1024;
 const MAX_SOURCE_LOG_BYTES: usize = 96 * 1024;
 const MAX_HISTORY_BYTES: usize = 32 * 1024;
+const QUESTION_OWNERSHIP_DIR: &str = "question-ownership";
+const START_PENDING: &str = "start-pending";
+
+fn ownership_path(config: &Config, question_id: i32) -> PathBuf {
+    config
+        .workspace_root
+        .join(QUESTION_OWNERSHIP_DIR)
+        .join(format!("{question_id}.run"))
+}
+
+fn write_ownership(config: &Config, question_id: i32, run_id: Option<i32>) -> std::io::Result<()> {
+    let path = ownership_path(config, question_id);
+    let parent = path.parent().expect("ownership path has a parent");
+    std::fs::create_dir_all(parent)?;
+    let temporary = path.with_extension("tmp");
+    let contents = run_id.map_or_else(|| START_PENDING.to_string(), |id| id.to_string());
+    std::fs::write(&temporary, contents)?;
+    std::fs::rename(temporary, path)
+}
+
+fn record_question_start(config: &Config, question_id: i32) -> std::io::Result<()> {
+    write_ownership(config, question_id, None)
+}
+
+pub(crate) fn record_question_run(config: &Config, question_id: i32, run_id: i32) -> std::io::Result<()> {
+    write_ownership(config, question_id, Some(run_id))
+}
+
+fn forget_question_run(config: &Config, question_id: i32) {
+    let path = ownership_path(config, question_id);
+    if let Err(e) = std::fs::remove_file(&path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(question_id, path = %path.display(), error = %e, "question: could not remove ownership record");
+    }
+}
+
+fn owns_question_run(config: &Config, question_id: i32, run_id: i32) -> bool {
+    let path = ownership_path(config, question_id);
+    match std::fs::read_to_string(&path) {
+        Ok(contents) if contents.trim() == START_PENDING => true,
+        Ok(contents) => contents.trim().parse::<i32>().ok() == Some(run_id),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            tracing::warn!(question_id, path = %path.display(), error = %e, "question: could not read ownership record");
+            false
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct QuestionTrigger {
@@ -149,22 +198,46 @@ impl Questioner {
     }
 }
 
-pub async fn reconcile_orphan(client: &RemoterClient, question: &AgentQuestionDto) {
+pub async fn reconcile_orphan(client: &RemoterClient, config: &Config, question: &AgentQuestionDto) {
     let Some(run_id) = question.run_id else {
         return;
     };
+    if !owns_question_run(config, question.id, run_id) {
+        tracing::debug!(
+            question_id = question.id,
+            run_id,
+            "question: skipping run owned by another daemon"
+        );
+        return;
+    }
     let body = if question.status == "cancel_requested" {
         FinishRunBody::failed("cancelled by user".to_string())
     } else {
         FinishRunBody::failed("question run has no active daemon task".to_string())
     };
-    if let Err(e) = client.finish_run(run_id, &body).await {
-        tracing::warn!(
-            question_id = question.id,
-            run_id,
-            error = %e,
-            "question: orphan reconciliation failed; a later poll will retry"
-        );
+    match client.finish_run(run_id, &body).await {
+        Ok(_) => forget_question_run(config, question.id),
+        Err(e) => {
+            tracing::warn!(
+                question_id = question.id,
+                run_id,
+                error = %e,
+                "question: orphan reconciliation failed; a later poll will retry"
+            );
+        }
+    }
+}
+
+pub async fn reconcile_run(client: &RemoterClient, config: &Config, task_id: i32, run_id: i32) {
+    let question = match client.task_agent_questions(task_id).await {
+        Ok(questions) => questions.into_iter().find(|q| q.run_id == Some(run_id)),
+        Err(e) => {
+            tracing::warn!(task_id, run_id, error = %e, "question: could not resolve run ownership");
+            None
+        }
+    };
+    if let Some(question) = question {
+        reconcile_orphan(client, config, &question).await;
     }
 }
 
@@ -194,14 +267,29 @@ pub struct QuestionContext {
 pub async fn execute(qc: QuestionContext) {
     let task_id = qc.trigger.task.id;
     let question_id = qc.trigger.question.id;
+    if let Err(e) = record_question_start(&qc.config, question_id) {
+        tracing::warn!(task_id, question_id, error = %e, "question: could not persist run ownership; start deferred");
+        return;
+    }
     let started = match qc.client.start_agent_question(&qc.trigger.question).await {
-        Ok(started) => started,
+        Ok(started) => {
+            if let Err(e) = record_question_run(&qc.config, question_id, started.run.id) {
+                tracing::warn!(task_id, question_id, run_id = started.run.id, error = %e,
+                    "question: could not persist started run ID; committed-start marker retained");
+            }
+            started
+        }
         Err(e) if e.is_conflict() => {
+            forget_question_run(&qc.config, question_id);
             tracing::info!(task_id, question_id, "question already started; skipping duplicate");
             return;
         }
         Err(e) => {
             tracing::warn!(task_id, question_id, error = %e, "question: could not start run");
+            if e.status.is_some_and(|status| status.is_client_error()) {
+                forget_question_run(&qc.config, question_id);
+                return;
+            }
             if let Some(started) = recover_committed_start(&qc, question_id).await {
                 finish_failure(&qc, &started, format!("question start resolution failed: {e}"), None).await;
             }
@@ -287,6 +375,9 @@ async fn recover_committed_start(qc: &QuestionContext, question_id: i32) -> Opti
         .find(|q| {
             q.id == question_id && q.run_id.is_some() && matches!(q.status.as_str(), "running" | "cancel_requested")
         })?;
+    if !owns_question_run(&qc.config, question_id, question.run_id?) {
+        return None;
+    }
     let runs = qc.client.list_runs(task_id).await.ok()?;
     let run = runs
         .iter()
@@ -583,7 +674,10 @@ async fn finish_run_with_retry(
     let mut backoff = Duration::from_secs(qc.config.retry_backoff_secs.max(1));
     loop {
         match qc.client.finish_run(run_id, body).await {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                forget_question_run(&qc.config, qc.trigger.question.id);
+                return Ok(());
+            }
             Err(e) if e.is_transient() => {
                 tracing::warn!(run_id, error = %e, backoff_secs = backoff.as_secs(),
                     "question: transient finish failure; retrying");
@@ -1069,6 +1163,28 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct GatedDriver {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentDriver for GatedDriver {
+        async fn run(&self, _spec: RunSpec) -> Result<RunOutcome, RunFailure> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(RunOutcome {
+                session_id: Some("question-fork".to_string()),
+                text: "answer from daemon A".to_string(),
+                input_tokens: None,
+                output_tokens: None,
+                model: None,
+                thinking: None,
+            })
+        }
+    }
+
     #[tokio::test]
     async fn bwrap_question_run_uses_bwrap_exec_instead_of_host() {
         let root = std::env::temp_dir().join(format!("remoter-question-bwrap-exec-{}", std::process::id()));
@@ -1294,6 +1410,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn other_daemon_poll_does_not_finish_active_question_and_owner_succeeds() {
+        let root_a = std::env::temp_dir().join(format!("remoter-question-daemon-a-{}", std::process::id()));
+        let root_b = std::env::temp_dir().join(format!("remoter-question-daemon-b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root_a);
+        let _ = std::fs::remove_dir_all(&root_b);
+        init_repo(&workspace::worktree_dir(&root_a, 1, 7));
+        let current = question_json(4, "running", Some(40));
+        let runs = serde_json::json!([
+            run_json(40, "question", "running", None),
+            run_json(10, "implement", "succeeded", Some("source-session"))
+        ]);
+        let detail = serde_json::json!({
+            "id":7,"projectId":1,"projectName":"p","featureId":1,"featureDescription":"f",
+            "title":"seven","description":"d","taskStatus":"review"
+        });
+        let task = serde_json::json!([{
+            "id":7,"projectId":1,"projectName":"p","featureId":1,"featureDescription":"f",
+            "title":"seven","description":"d","taskStatus":"review","actionsTotal":0,
+            "actionsCompleted":0,"timeSpent":0,"blocked":false
+        }]);
+        let (url, requests) = spawn_full_backend(vec![
+            (200, current.to_string()),
+            (200, runs.to_string()),
+            (200, runs.to_string()),
+            (200, detail.to_string()),
+            (200, serde_json::json!([current]).to_string()),
+            (200, runs.to_string()),
+            (200, "[]".to_string()),
+            (200, "[]".to_string()),
+            (200, task.to_string()),
+            (200, serde_json::json!([current]).to_string()),
+            (200, runs.to_string()),
+            (
+                200,
+                run_json(40, "question", "succeeded", Some("question-fork")).to_string(),
+            ),
+        ])
+        .await;
+        let driver = Arc::new(GatedDriver::default());
+        let mut qc_a = test_context(&url, &root_a, question(4, "pending", None));
+        qc_a.driver = driver.clone();
+        let config_a = qc_a.config.clone();
+        let daemon_a = tokio::spawn(execute(qc_a));
+        tokio::time::timeout(Duration::from_secs(5), driver.started.notified())
+            .await
+            .expect("daemon A must claim and start its driver");
+
+        let daemon_b = test_context(&url, &root_b, question(4, "pending", None));
+        let poll = Questioner::new().poll(&daemon_b.client).await;
+        assert_eq!(poll.running.len(), 1);
+        reconcile_orphan(&daemon_b.client, &daemon_b.config, &poll.running[0]).await;
+        let calls = requests.lock().unwrap().clone();
+        assert_eq!(calls.len(), 11, "{calls:?}");
+        assert!(calls.iter().all(|call| !call.starts_with("PATCH ")), "{calls:?}");
+
+        driver.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), daemon_a)
+            .await
+            .expect("daemon A must finish")
+            .unwrap();
+        let calls = requests.lock().unwrap().clone();
+        assert_eq!(calls.len(), 12, "{calls:?}");
+        let patch = calls.last().unwrap();
+        assert!(patch.starts_with("PATCH /api/v1/agent-runs/40 "), "{patch}");
+        let body: serde_json::Value = serde_json::from_str(patch.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["status"], "succeeded");
+        assert_eq!(body["summary"], "answer from daemon A");
+        assert!(!ownership_path(&config_a, 4).exists());
+        let _ = std::fs::remove_dir_all(&root_a);
+        let _ = std::fs::remove_dir_all(&root_b);
+    }
+
+    #[tokio::test]
     async fn committed_start_resolution_failure_finishes_recovered_run() {
         let root = std::env::temp_dir().join(format!("remoter-question-start-recovery-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -1325,7 +1514,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn committed_start_is_recovered_via_task_history_after_recovery_also_fails() {
+    async fn committed_start_is_recovered_after_restart_when_initial_recovery_fails() {
         let root = std::env::temp_dir().join(format!("remoter-question-start-repoll-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let current = question_json(4, "running", Some(40));
@@ -1351,12 +1540,13 @@ mod tests {
         pending.source_run_id = Some(10);
         execute(test_context(&url, &root, pending)).await;
 
-        let client = RemoterClient::new(&url, "tok", None);
+        let restarted = test_context(&url, &root, question(4, "pending", None));
+        let client = restarted.client.clone();
         let poll = Questioner::new().poll(&client).await;
         assert!(poll.pending.is_empty());
         assert_eq!(poll.running.len(), 1);
         assert_eq!(poll.running[0].run_id, Some(40));
-        reconcile_orphan(&client, &poll.running[0]).await;
+        reconcile_orphan(&client, &restarted.config, &poll.running[0]).await;
 
         let calls = requests.lock().unwrap().clone();
         assert_eq!(calls.len(), 9, "{calls:?}");
