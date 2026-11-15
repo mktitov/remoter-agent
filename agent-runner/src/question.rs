@@ -436,7 +436,8 @@ async fn prepare_prompts(qc: &QuestionContext, started: &StartedQuestion) -> Res
         .list_runs(qc.trigger.task.id)
         .await
         .map_err(|e| e.to_string())?;
-    let source = followup_source(&history, &runs).or_else(|| started.source_run.clone());
+    let source =
+        followup_source(&history, &runs, started.question.source_run_id).or_else(|| started.source_run.clone());
     let artifacts = current_artifacts(qc, &detail, &runs).await;
     let prompt = render_answer_prompt(&qc.trigger.question, &artifacts);
     let fallback_prompt = render_fallback_prompt(qc, &detail, &history, source.as_ref(), &artifacts);
@@ -447,10 +448,18 @@ async fn prepare_prompts(qc: &QuestionContext, started: &StartedQuestion) -> Res
     })
 }
 
-/// Follow-ups fork the latest successful Q&A fork, not the original source.
-/// The first question uses the backend-selected plan/implement source run.
-fn followup_source(history: &[AgentQuestionDto], runs: &[AgentRunDto]) -> Option<AgentRunDto> {
-    let mut succeeded: Vec<&AgentQuestionDto> = history.iter().filter(|q| q.status == "succeeded").collect();
+/// Follow-ups fork the latest successful Q&A fork for the same source, not the original source.
+/// The first question for each source uses the backend-selected plan/implement run.
+fn followup_source(
+    history: &[AgentQuestionDto],
+    runs: &[AgentRunDto],
+    source_run_id: Option<i32>,
+) -> Option<AgentRunDto> {
+    let source_run_id = source_run_id?;
+    let mut succeeded: Vec<&AgentQuestionDto> = history
+        .iter()
+        .filter(|q| q.status == "succeeded" && q.source_run_id == Some(source_run_id))
+        .collect();
     succeeded.sort_by_key(|q| q.id);
     succeeded.into_iter().rev().find_map(|question| {
         let run_id = question.run_id?;
@@ -845,13 +854,20 @@ mod tests {
         }
     }
 
+    fn question_for_source(id: i32, status: &str, run_id: Option<i32>, source_run_id: i32) -> AgentQuestionDto {
+        AgentQuestionDto {
+            source_run_id: Some(source_run_id),
+            ..question(id, status, run_id)
+        }
+    }
+
     #[test]
     fn followup_forks_latest_successful_question() {
         let history = vec![
-            question(1, "succeeded", Some(10)),
-            question(2, "failed", Some(11)),
-            question(3, "succeeded", Some(12)),
-            question(4, "pending", None),
+            question_for_source(1, "succeeded", Some(10), 1),
+            question_for_source(2, "failed", Some(11), 1),
+            question_for_source(3, "succeeded", Some(12), 1),
+            question_for_source(4, "pending", None, 1),
         ];
         let runs = vec![
             run(12, "question", Some("fork-two")),
@@ -860,14 +876,21 @@ mod tests {
             run(1, "implement", Some("source")),
         ];
         assert_eq!(
-            followup_source(&history, &runs).and_then(|r| r.session_id),
+            followup_source(&history, &runs, Some(1)).and_then(|r| r.session_id),
             Some("fork-two".to_string())
         );
     }
 
     #[test]
     fn first_question_has_no_followup_source() {
-        assert!(followup_source(&[question(1, "pending", None)], &[run(1, "implement", Some("source"))]).is_none());
+        assert!(
+            followup_source(
+                &[question_for_source(1, "pending", None, 1)],
+                &[run(1, "implement", Some("source"))],
+                Some(1),
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1136,6 +1159,97 @@ mod tests {
             cancel: CancellationToken::new(),
             log_store,
         }
+    }
+
+    async fn prepared_fork_session(
+        root: &Path,
+        current: AgentQuestionDto,
+        source_run: AgentRunDto,
+        history: Vec<AgentQuestionDto>,
+        runs: serde_json::Value,
+    ) -> Option<String> {
+        let detail = serde_json::json!({
+            "id":7,"projectId":1,"projectName":"p","featureId":1,"featureDescription":"f",
+            "title":"seven","description":"d","taskStatus":"review"
+        });
+        let history = serde_json::to_value(history).unwrap();
+        let (url, _) = spawn_backend(vec![
+            (200, detail.to_string()),
+            (200, history.to_string()),
+            (200, runs.to_string()),
+        ])
+        .await;
+        let started = StartedQuestion {
+            run: run(current.run_id.unwrap(), QUESTION_RUN_KIND, None),
+            question: current.clone(),
+            source_run: Some(source_run),
+        };
+        let qc = test_context(&url, root, current);
+        prepare_prompts(&qc, &started).await.unwrap().fork_session
+    }
+
+    #[tokio::test]
+    async fn pr_questions_fork_implement_then_their_own_question_session() {
+        let root = std::env::temp_dir().join(format!("remoter-question-source-transition-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let plan_qa = question_for_source(1, "succeeded", Some(11), 10);
+        let mut first_pr = question_for_source(2, "running", Some(30), 20);
+        let first_fork = prepared_fork_session(
+            &root,
+            first_pr.clone(),
+            run(20, "implement", Some("implement-session")),
+            vec![plan_qa.clone(), first_pr.clone()],
+            serde_json::json!([
+                run_json(30, "question", "running", None),
+                run_json(20, "implement", "succeeded", Some("implement-session")),
+                run_json(11, "question", "succeeded", Some("plan-qa-session")),
+                run_json(10, "plan", "succeeded", Some("plan-session"))
+            ]),
+        )
+        .await;
+        assert_eq!(first_fork.as_deref(), Some("implement-session"));
+
+        first_pr.status = "succeeded".to_string();
+        let second_pr = question_for_source(3, "running", Some(31), 20);
+        let second_fork = prepared_fork_session(
+            &root,
+            second_pr.clone(),
+            run(20, "implement", Some("implement-session")),
+            vec![plan_qa, first_pr, second_pr],
+            serde_json::json!([
+                run_json(31, "question", "running", None),
+                run_json(30, "question", "succeeded", Some("first-pr-qa-session")),
+                run_json(20, "implement", "succeeded", Some("implement-session")),
+                run_json(11, "question", "succeeded", Some("plan-qa-session")),
+                run_json(10, "plan", "succeeded", Some("plan-session"))
+            ]),
+        )
+        .await;
+        assert_eq!(second_fork.as_deref(), Some("first-pr-qa-session"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn replan_question_does_not_fork_previous_plan_question_session() {
+        let root = std::env::temp_dir().join(format!("remoter-question-replan-source-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let old_plan_qa = question_for_source(1, "succeeded", Some(11), 10);
+        let new_plan_question = question_for_source(2, "running", Some(30), 20);
+        let fork = prepared_fork_session(
+            &root,
+            new_plan_question.clone(),
+            run(20, "plan", Some("new-plan-session")),
+            vec![old_plan_qa, new_plan_question],
+            serde_json::json!([
+                run_json(30, "question", "running", None),
+                run_json(20, "plan", "succeeded", Some("new-plan-session")),
+                run_json(11, "question", "succeeded", Some("old-plan-qa-session")),
+                run_json(10, "plan", "succeeded", Some("old-plan-session"))
+            ]),
+        )
+        .await;
+        assert_eq!(fork.as_deref(), Some("new-plan-session"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[derive(Default)]
