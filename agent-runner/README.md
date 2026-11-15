@@ -157,9 +157,11 @@ spawn error; the daemon does not silently select another agent.
 While a ticket is in `plan_review` or `review`, the daemon polls the backend's
 agent-question FIFO and runs one question at a time per ticket within the usual
 global/per-project concurrency limits. If `initialize` advertises
-`sessionCapabilities.fork`, the first answer uses `session/fork` on the selected
-plan/implement session. A follow-up forks the latest successful Q&A session and
-the new fork ID is stored on the question-run. The driver never substitutes a
+`sessionCapabilities.fork`, the first answer for each backend-selected
+plan/implement source run uses `session/fork` on that run's session. A follow-up
+forks the latest successful Q&A session with the same `sourceRunId`; Q&A sessions
+are not carried across source runs after implementation or re-planning. The new
+fork ID is stored on the question-run. The driver never substitutes a
 source-session resume for a fork.
 
 If fork or a source session is unavailable, or the `session/fork` request fails,
