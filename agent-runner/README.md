@@ -169,10 +169,16 @@ a fresh read-only session receives a bounded fallback prompt: the original run
 prompt/log, current plan/diff/report, and previous Q&A. A fork that returns the
 source session ID remains an error. Question turns use the selected host,
 container, or bwrap runtime without falling back to another execution mode. They
-use the `dev-agent-question` MCP role, deny all permission requests, and compare
-the commit and symbolic HEAD plus tracked, untracked, and ignored worktree state
-before and after. Any unexpected change, including a branch switch at the same
-commit, fails the answer. Terminal run updates retry transient backend failures.
+use the `dev-agent-question` MCP role and deny all permission requests. Before
+starting the agent, the daemon snapshots the commit, symbolic HEAD, local branch
+refs, staged and unstaged tracked changes, and byte-for-byte untracked and
+ignored file contents (the rollback backup lives outside the worktree). After
+the driver exits, any unexpected change fails the answer and is rolled back
+before the terminal run update. The same guard runs after cancellation and
+cooperative daemon-shutdown cancellation, and restores the original branch and
+pre-existing dirty/index state rather than merely cleaning to `HEAD`. A rollback
+failure fails the question with both the rollback diagnostic and the original
+agent result. Terminal run updates retry transient backend failures.
 Every poll reads each review ticket's question history and run rows, but reconciles
 only server-side `running` questions owned by this daemon. Ownership is persisted
 under `<workspace_root>/question-ownership`: a start-attempt marker is written

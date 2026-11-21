@@ -332,17 +332,42 @@ pub async fn execute(qc: QuestionContext) {
 
     let result = run_attempt(&qc, &started, &prepared, &cwd, &logger).await;
     let after = WorktreeSnapshot::capture(&cwd).await;
+    let changed = !after.as_ref().is_ok_and(|after| before == *after);
+    if changed && let Err(rollback) = before.restore(&cwd).await {
+        let original = if qc.cancel.is_cancelled() {
+            "question cancelled".to_string()
+        } else {
+            match &result {
+                Ok(_) => "question completed".to_string(),
+                Err(failure) => failure.to_string(),
+            }
+        };
+        let failure = RunFailure::new(
+            DriverError::Permanent(format!(
+                "question worktree rollback failed: {rollback}; original question result: {original}"
+            )),
+            result.as_ref().ok().and_then(|o| o.session_id.clone()),
+        );
+        finish_failure(&qc, &started, failure.to_string(), Some(&failure)).await;
+        return;
+    }
     if qc.cancel.is_cancelled() {
         finish_cancelled(&qc, &started, result.err()).await;
         return;
     }
-    if !after.as_ref().is_ok_and(|after| before == *after) {
+    if changed {
         let detail = match after {
-            Ok(_) => "HEAD or worktree changed".to_string(),
-            Err(e) => format!("worktree snapshot after question failed: {e}"),
+            Ok(_) => "HEAD, branch refs, or worktree changed; changes were rolled back".to_string(),
+            Err(e) => {
+                format!("worktree snapshot after question failed: {e}; state was restored from the initial snapshot")
+            }
+        };
+        let message = match &result {
+            Ok(_) => format!("question run modified the worktree unexpectedly: {detail}"),
+            Err(original) => format!("{original}; question run also modified the worktree unexpectedly: {detail}"),
         };
         let failure = RunFailure::new(
-            DriverError::Permanent(format!("question run modified the worktree unexpectedly: {detail}")),
+            DriverError::Permanent(message),
             result.as_ref().ok().and_then(|o| o.session_id.clone()),
         );
         finish_failure(&qc, &started, failure.to_string(), Some(&failure)).await;
@@ -738,52 +763,198 @@ async fn finish_cancelled(qc: &QuestionContext, started: &StartedQuestion, failu
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct WorktreeSnapshot {
     head: String,
     symbolic_head: Vec<u8>,
+    local_refs: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
     status: Vec<u8>,
+    staged_diff: Vec<u8>,
     diff: Vec<u8>,
-    untracked: Vec<(Vec<u8>, [u8; 32])>,
+    untracked: Vec<WorktreeFile>,
+    backup: SnapshotBackup,
 }
+
+#[derive(Debug)]
+struct SnapshotBackup {
+    path: PathBuf,
+}
+
+impl SnapshotBackup {
+    fn create() -> Result<Self, String> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        loop {
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("remoter-question-backup-{}-{id}", std::process::id()));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("create snapshot backup {}: {e}", path.display())),
+            }
+        }
+    }
+}
+
+impl Drop for SnapshotBackup {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %self.path.display(), error = %e, "question: could not remove snapshot backup");
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct WorktreeFile {
+    name: Vec<u8>,
+    hash: [u8; 32],
+    symlink: bool,
+}
+
+impl PartialEq for WorktreeSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.head == other.head
+            && self.symbolic_head == other.symbolic_head
+            && self.local_refs == other.local_refs
+            && self.status == other.status
+            && self.staged_diff == other.staged_diff
+            && self.diff == other.diff
+            && self.untracked == other.untracked
+    }
+}
+
+impl Eq for WorktreeSnapshot {}
 
 impl WorktreeSnapshot {
     pub async fn capture(cwd: &Path) -> Result<Self, String> {
         use sha2::{Digest, Sha256};
 
+        let backup = SnapshotBackup::create()?;
         let head = git_output(cwd, &["rev-parse", "HEAD"]).await?;
         let symbolic_head = git_output(cwd, &["symbolic-ref", "--quiet", "HEAD"])
             .await
             .unwrap_or_default();
+        let local_refs = local_branch_refs(cwd).await?;
         let status = git_output(cwd, &["status", "--porcelain=v1", "-z", "--untracked-files=all"]).await?;
-        let diff = git_output(cwd, &["diff", "--binary", "HEAD"]).await?;
+        let staged_diff = git_output(cwd, &["diff", "--binary", "--cached", "HEAD"]).await?;
+        let diff = git_output(cwd, &["diff", "--binary"]).await?;
         let names = git_output(cwd, &["ls-files", "--others", "-z"]).await?;
         let mut untracked = Vec::new();
         for name in names.split(|b| *b == 0).filter(|name| !name.is_empty()) {
             let path = cwd.join(path_from_git_name(name));
             let metadata =
                 std::fs::symlink_metadata(&path).map_err(|e| format!("stat untracked file {}: {e}", path.display()))?;
-            let contents = if metadata.file_type().is_symlink() {
-                std::fs::read_link(&path)
-                    .map_err(|e| format!("read untracked symlink {}: {e}", path.display()))?
-                    .to_string_lossy()
-                    .as_bytes()
-                    .to_vec()
+            let symlink = metadata.file_type().is_symlink();
+            let contents = if symlink {
+                path_to_bytes(
+                    &std::fs::read_link(&path)
+                        .map_err(|e| format!("read untracked symlink {}: {e}", path.display()))?,
+                )
             } else {
                 tokio::fs::read(&path)
                     .await
                     .map_err(|e| format!("read untracked file {}: {e}", path.display()))?
             };
-            untracked.push((name.to_vec(), Sha256::digest(contents).into()));
+            tokio::fs::write(backup.path.join(untracked.len().to_string()), &contents)
+                .await
+                .map_err(|e| format!("back up untracked file {}: {e}", path.display()))?;
+            untracked.push(WorktreeFile {
+                name: name.to_vec(),
+                hash: Sha256::digest(&contents).into(),
+                symlink,
+            });
         }
         Ok(Self {
             head: String::from_utf8_lossy(&head).trim().to_string(),
             symbolic_head,
+            local_refs,
             status,
+            staged_diff,
             diff,
             untracked,
+            backup,
         })
     }
+
+    pub async fn restore(&self, cwd: &Path) -> Result<(), String> {
+        let symbolic_head = std::str::from_utf8(&self.symbolic_head)
+            .map_err(|e| format!("original symbolic HEAD is not UTF-8: {e}"))?
+            .trim();
+        if symbolic_head.is_empty() {
+            git_output(cwd, &["update-ref", "--no-deref", "HEAD", &self.head]).await?;
+        } else {
+            git_output(cwd, &["update-ref", symbolic_head, &self.head]).await?;
+            git_output(cwd, &["symbolic-ref", "HEAD", symbolic_head]).await?;
+        }
+
+        let current_refs = local_branch_refs(cwd).await?;
+        for name in current_refs.keys() {
+            if !self.local_refs.contains_key(name) {
+                let name = ref_name(name)?;
+                git_output(cwd, &["update-ref", "-d", name]).await?;
+            }
+        }
+        for (name, commit) in &self.local_refs {
+            let name = ref_name(name)?;
+            let commit = std::str::from_utf8(commit).map_err(|e| format!("branch {name} commit is not UTF-8: {e}"))?;
+            git_output(cwd, &["update-ref", name, commit]).await?;
+        }
+
+        git_output(cwd, &["reset", "--hard", &self.head]).await?;
+        git_output(cwd, &["clean", "-ffdx"]).await?;
+        if !self.staged_diff.is_empty() {
+            git_apply(cwd, &["apply", "--index", "--binary", "-"], &self.staged_diff).await?;
+        }
+        if !self.diff.is_empty() {
+            git_apply(cwd, &["apply", "--binary", "-"], &self.diff).await?;
+        }
+        for (index, file) in self.untracked.iter().enumerate() {
+            let path = cwd.join(path_from_git_name(&file.name));
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| format!("create parent for {}: {e}", path.display()))?;
+            }
+            let contents = tokio::fs::read(self.backup.path.join(index.to_string()))
+                .await
+                .map_err(|e| format!("read backup for {}: {e}", path.display()))?;
+            restore_untracked_file(&path, &contents, file.symlink)?;
+        }
+
+        let restored = Self::capture(cwd).await?;
+        if restored != *self {
+            return Err(
+                "restored HEAD, branch refs, index, or worktree differs from the original snapshot".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+async fn local_branch_refs(cwd: &Path) -> Result<std::collections::BTreeMap<Vec<u8>, Vec<u8>>, String> {
+    let output = git_output(
+        cwd,
+        &["for-each-ref", "--format=%(refname)%00%(objectname)", "refs/heads"],
+    )
+    .await?;
+    let mut refs = std::collections::BTreeMap::new();
+    for line in output.split(|b| *b == b'\n').filter(|line| !line.is_empty()) {
+        let separator = line
+            .iter()
+            .position(|b| *b == 0)
+            .ok_or_else(|| "git for-each-ref returned a malformed local branch".to_string())?;
+        let (name, commit) = line.split_at(separator);
+        let commit = &commit[1..];
+        refs.insert(name.to_vec(), commit.to_vec());
+    }
+    Ok(refs)
+}
+
+fn ref_name(name: &[u8]) -> Result<&str, String> {
+    std::str::from_utf8(name).map_err(|e| format!("local branch name is not UTF-8: {e}"))
 }
 
 #[cfg(unix)]
@@ -795,6 +966,39 @@ fn path_from_git_name(name: &[u8]) -> PathBuf {
 #[cfg(not(unix))]
 fn path_from_git_name(name: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(name).into_owned())
+}
+
+#[cfg(unix)]
+fn path_to_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn path_to_bytes(path: &Path) -> Vec<u8> {
+    path.to_string_lossy().as_bytes().to_vec()
+}
+
+#[cfg(unix)]
+fn restore_untracked_file(path: &Path, contents: &[u8], symlink: bool) -> Result<(), String> {
+    if symlink {
+        std::os::unix::fs::symlink(path_from_git_name(contents), path)
+            .map_err(|e| format!("restore untracked symlink {}: {e}", path.display()))
+    } else {
+        std::fs::write(path, contents).map_err(|e| format!("restore untracked file {}: {e}", path.display()))
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_untracked_file(path: &Path, contents: &[u8], symlink: bool) -> Result<(), String> {
+    if symlink {
+        Err(format!(
+            "cannot restore untracked symlink {} on this platform",
+            path.display()
+        ))
+    } else {
+        std::fs::write(path, contents).map_err(|e| format!("restore untracked file {}: {e}", path.display()))
+    }
 }
 
 async fn git_output(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
@@ -812,6 +1016,35 @@ async fn git_output(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
         ));
     }
     Ok(output.stdout)
+}
+
+async fn git_apply(cwd: &Path, args: &[&str], input: &[u8]) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut child = tokio::process::Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+    let mut stdin = child.stdin.take().expect("piped git stdin");
+    let write = async move {
+        stdin.write_all(input).await?;
+        stdin.shutdown().await
+    };
+    let (write_result, output) = tokio::join!(write, child.wait_with_output());
+    write_result.map_err(|e| format!("git {} stdin: {e}", args.join(" ")))?;
+    let output = output.map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1132,6 +1365,99 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn snapshot_restores_dirty_worktree_commit_and_branch_byte_for_byte() {
+        let dir = std::env::temp_dir().join(format!("remoter-question-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        init_repo(&dir);
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&dir)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        std::fs::write(dir.join(".gitignore"), ".cache/\n").unwrap();
+        git(&["add", ".gitignore"]);
+        git(&[
+            "-c",
+            "user.email=test@remoter",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-qm",
+            "ignore cache",
+        ]);
+        std::fs::write(dir.join("tracked.txt"), "staged before\n").unwrap();
+        git(&["add", "tracked.txt"]);
+        std::fs::write(dir.join("tracked.txt"), "unstaged before\n").unwrap();
+        std::fs::write(dir.join("untracked.txt"), "untracked before\0bytes\n").unwrap();
+        std::fs::create_dir(dir.join(".cache")).unwrap();
+        std::fs::write(dir.join(".cache/answer.tmp"), "ignored before\0bytes\n").unwrap();
+        let before = WorktreeSnapshot::capture(&dir).await.unwrap();
+
+        std::fs::write(dir.join("tracked.txt"), "question commit\n").unwrap();
+        std::fs::write(dir.join("untracked.txt"), "question changed\n").unwrap();
+        std::fs::write(dir.join("new-untracked.txt"), "question created\n").unwrap();
+        std::fs::write(dir.join(".cache/answer.tmp"), "question changed\n").unwrap();
+        std::fs::write(dir.join(".cache/new.tmp"), "question created\n").unwrap();
+        git(&["checkout", "-q", "-b", "question-side-effect"]);
+        git(&["add", "tracked.txt"]);
+        git(&[
+            "-c",
+            "user.email=test@remoter",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-qm",
+            "question side effect",
+        ]);
+
+        before.restore(&dir).await.unwrap();
+
+        assert_eq!(before, WorktreeSnapshot::capture(&dir).await.unwrap());
+        assert_eq!(std::fs::read(dir.join("tracked.txt")).unwrap(), b"unstaged before\n");
+        assert_eq!(
+            std::fs::read(dir.join("untracked.txt")).unwrap(),
+            b"untracked before\0bytes\n"
+        );
+        assert_eq!(
+            std::fs::read(dir.join(".cache/answer.tmp")).unwrap(),
+            b"ignored before\0bytes\n"
+        );
+        assert!(!dir.join("new-untracked.txt").exists());
+        assert!(!dir.join(".cache/new.tmp").exists());
+        let staged = std::process::Command::new("git")
+            .current_dir(&dir)
+            .args(["show", ":tracked.txt"])
+            .output()
+            .unwrap();
+        assert!(staged.status.success());
+        assert_eq!(staged.stdout, b"staged before\n");
+        let branch = std::process::Command::new("git")
+            .current_dir(&dir)
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(branch.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&branch.stdout).trim(),
+            String::from_utf8_lossy(&before.symbolic_head)
+                .trim()
+                .trim_start_matches("refs/heads/")
+        );
+        assert!(
+            !std::process::Command::new("git")
+                .current_dir(&dir)
+                .args(["show-ref", "--verify", "--quiet", "refs/heads/question-side-effect"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn test_context(api_url: &str, root: &Path, question: AgentQuestionDto) -> QuestionContext {
         let toml = format!(
             "api_url = \"{api_url}\"\nworkspace_root = \"{}\"\n[driver]\nkind = \"stub\"\n",
@@ -1261,6 +1587,67 @@ mod tests {
     impl AgentDriver for CaptureDriver {
         async fn run(&self, spec: RunSpec) -> Result<RunOutcome, RunFailure> {
             self.spec.lock().unwrap().replace(spec);
+            Ok(RunOutcome {
+                session_id: Some("question-fork".to_string()),
+                text: "answer".to_string(),
+                input_tokens: None,
+                output_tokens: None,
+                model: None,
+                thinking: None,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct MutatingDriver {
+        pending: bool,
+        fail: bool,
+        mutated: tokio::sync::Notify,
+    }
+
+    impl MutatingDriver {
+        fn mutate(cwd: &Path) {
+            std::fs::write(cwd.join("tracked.txt"), "question write\n").unwrap();
+            std::fs::write(cwd.join("untracked.txt"), "question untracked\n").unwrap();
+            std::fs::create_dir_all(cwd.join(".cache")).unwrap();
+            std::fs::write(cwd.join(".cache/question.tmp"), "question ignored\n").unwrap();
+            for args in [
+                vec!["checkout", "-q", "-b", "question-side-effect"],
+                vec!["add", "tracked.txt"],
+                vec![
+                    "-c",
+                    "user.email=test@remoter",
+                    "-c",
+                    "user.name=test",
+                    "commit",
+                    "-qm",
+                    "question commit",
+                ],
+            ] {
+                let status = std::process::Command::new("git")
+                    .current_dir(cwd)
+                    .args(args)
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentDriver for MutatingDriver {
+        async fn run(&self, spec: RunSpec) -> Result<RunOutcome, RunFailure> {
+            Self::mutate(&spec.cwd);
+            self.mutated.notify_one();
+            if self.pending {
+                std::future::pending::<()>().await;
+            }
+            if self.fail {
+                return Err(RunFailure::new(
+                    DriverError::Permanent("agent exploded".to_string()),
+                    None,
+                ));
+            }
             Ok(RunOutcome {
                 session_id: Some("question-fork".to_string()),
                 text: "answer".to_string(),
@@ -1457,6 +1844,120 @@ mod tests {
                 .all(|c| !c.contains("/status") && !c.contains("/comments") && !c.contains("forge"))
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    async fn assert_mutating_question_rolls_back(cancelled: bool, agent_fails: bool) {
+        let mode = if cancelled {
+            "cancel"
+        } else if agent_fails {
+            "failure"
+        } else {
+            "success"
+        };
+        let root = std::env::temp_dir().join(format!("remoter-question-rollback-{mode}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let worktree = workspace::worktree_dir(&root, 1, 7);
+        init_repo(&worktree);
+        std::fs::write(worktree.join(".gitignore"), ".cache/\n").unwrap();
+        for args in [
+            vec!["add", ".gitignore"],
+            vec![
+                "-c",
+                "user.email=test@remoter",
+                "-c",
+                "user.name=test",
+                "commit",
+                "-qm",
+                "ignore cache",
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .current_dir(&worktree)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let before = WorktreeSnapshot::capture(&worktree).await.unwrap();
+        let current = question_json(4, "running", Some(40));
+        let detail = serde_json::json!({
+            "id":7,"projectId":1,"projectName":"p","featureId":1,"featureDescription":"f",
+            "title":"seven","description":"d","taskStatus":"review"
+        });
+        let runs = serde_json::json!([
+            run_json(40, "question", "running", None),
+            run_json(10, "implement", "succeeded", Some("source-session"))
+        ]);
+        let mut responses = vec![
+            (200, current.to_string()),
+            (200, runs.to_string()),
+            (200, runs.to_string()),
+            (200, detail.to_string()),
+            (200, serde_json::json!([current]).to_string()),
+            (200, runs.to_string()),
+        ];
+        if cancelled {
+            responses.push((
+                200,
+                serde_json::json!([question_json(4, "cancel_requested", Some(40))]).to_string(),
+            ));
+        }
+        responses.push((200, run_json(40, "question", "failed", None).to_string()));
+        let (url, requests) = spawn_full_backend(responses).await;
+        let driver = Arc::new(MutatingDriver {
+            pending: cancelled,
+            fail: agent_fails,
+            mutated: tokio::sync::Notify::new(),
+        });
+        let mut qc = test_context(&url, &root, question(4, "pending", None));
+        qc.driver = driver.clone();
+
+        if cancelled {
+            let cancel = qc.cancel.clone();
+            let task = tokio::spawn(execute(qc));
+            tokio::time::timeout(Duration::from_secs(5), driver.mutated.notified())
+                .await
+                .expect("question driver must mutate the worktree");
+            cancel.cancel();
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("cancelled question must roll back and finish")
+                .unwrap();
+        } else {
+            execute(qc).await;
+        }
+
+        assert_eq!(before, WorktreeSnapshot::capture(&worktree).await.unwrap());
+        let calls = requests.lock().unwrap().clone();
+        let patch = calls.last().unwrap();
+        assert!(patch.starts_with("PATCH /api/v1/agent-runs/40 "), "{patch}");
+        let body = patch.split_once("\r\n\r\n").unwrap().1;
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(json["status"], "failed");
+        if cancelled {
+            assert!(body.contains("cancelled by user"), "{body}");
+        } else {
+            assert!(body.contains("changes were rolled back"), "{body}");
+        }
+        if agent_fails {
+            assert!(body.contains("agent exploded"), "{body}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn successful_question_with_write_commit_and_branch_changes_is_failed_and_rolled_back() {
+        assert_mutating_question_rolls_back(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn failed_question_rolls_back_without_hiding_agent_error() {
+        assert_mutating_question_rolls_back(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_question_rolls_back_write_commit_and_branch_changes() {
+        assert_mutating_question_rolls_back(true, false).await;
     }
 
     async fn assert_terminal_patch_omits_source_session(cancel: bool) {
