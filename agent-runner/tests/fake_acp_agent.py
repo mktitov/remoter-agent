@@ -34,6 +34,8 @@ Env knobs:
   FAKE_AGENT_EMPTY=1  — end the turn with no streamed text (zero-output tests).
   FAKE_AGENT_NO_ALLOW=1 — offer only a reject permission option (the driver
                         must cancel the request, not pick the reject).
+  FAKE_AGENT_MUTATE_WORKTREE=1 — write tracked/untracked/ignored files, switch
+                        branch, and commit before answering session/prompt.
   FAKE_AGENT_FAIL_PROMPT_ON_SESSION — comma-separated session ids whose
                         session/prompt gets a JSON-RPC error ("total message
                         size exceeds limit", the provider context-limit
@@ -58,6 +60,7 @@ empty = os.environ.get("FAKE_AGENT_EMPTY") == "1"
 no_allow = os.environ.get("FAKE_AGENT_NO_ALLOW") == "1"
 no_fork = os.environ.get("FAKE_AGENT_NO_FORK") == "1"
 echo_context = os.environ.get("FAKE_AGENT_ECHO_CONTEXT") == "1"
+mutate_worktree = os.environ.get("FAKE_AGENT_MUTATE_WORKTREE") == "1"
 fail_prompt_on_session = [
     s for s in os.environ.get("FAKE_AGENT_FAIL_PROMPT_ON_SESSION", "").split(",") if s
 ]
@@ -138,7 +141,27 @@ def prompt_text(prompt_msg):
     )
 
 
+def mutate_question_worktree():
+    if not mutate_worktree:
+        return
+    with open("tracked.txt", "w") as f:
+        f.write("container question write\n")
+    with open("untracked.txt", "w") as f:
+        f.write("container question untracked\n")
+    os.makedirs(".cache", exist_ok=True)
+    with open(".cache/question.tmp", "w") as f:
+        f.write("container question ignored\n")
+    subprocess.run(["git", "checkout", "-q", "-b", "question-side-effect"], check=True)
+    subprocess.run(["git", "add", "tracked.txt"], check=True)
+    subprocess.run([
+        "git", "-c", "user.email=test@remoter", "-c", "user.name=test",
+        "commit", "-qm", "container question commit",
+    ], check=True)
+    record({"worktree_mutated": True})
+
+
 def finish_turn(prompt_msg):
+    mutate_question_worktree()
     sid = prompt_msg["params"]["sessionId"]
     reply = "world"
     if echo_context:
