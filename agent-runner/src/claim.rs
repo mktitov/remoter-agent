@@ -291,6 +291,11 @@ impl Daemon {
         &self.supervisor
     }
 
+    #[cfg(test)]
+    pub fn supervisor_mut(&mut self) -> &mut Supervisor {
+        &mut self.supervisor
+    }
+
     /// The review-loop state (test/observability hook).
     pub fn reviewer(&self) -> &Reviewer {
         &self.reviewer

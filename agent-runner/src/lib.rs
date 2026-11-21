@@ -13,6 +13,8 @@ pub mod bwrap;
 #[path = "bwrap_unsupported.rs"]
 pub mod bwrap;
 pub mod claim;
+#[cfg(test)]
+mod claim_waiting_tests;
 pub mod client;
 pub mod config;
 pub mod container;
