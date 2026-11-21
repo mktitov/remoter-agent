@@ -20,7 +20,7 @@ pub const FLUSH_INTERVAL_MS: u64 = 200;
 
 /// Commands the backend sends to the daemon over the agent-events WebSocket.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum AcpLogCommand {
     /// Start (or resume) streaming a run's log.
     AcpLogSubscribe {
@@ -38,7 +38,7 @@ pub enum AcpLogCommand {
 
 /// Responses the daemon sends back to the backend over the agent-events WebSocket.
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum AcpLogResponse {
     /// One batch of historical or live entries.
     AcpLogEntries {
@@ -63,6 +63,8 @@ struct Subscription {
     run_id: i32,
     /// Next sequence number expected from the file or live broadcast.
     next_seq: i64,
+    /// Whether the file still has entries to ship or must recover a live gap.
+    backfill_pending: bool,
     /// `Some` while the run is still active in this daemon process.
     live: Option<broadcast::Receiver<LogEntry>>,
     /// Set when `AcpLogEnd` has been emitted.
@@ -83,10 +85,8 @@ impl LogStreamManager {
         }
     }
 
-    /// Handles one incoming command.  Returns all response frames that should be
-    /// sent immediately: the first backlog batch when the run already has
-    /// persisted entries, and possibly an `AcpLogEnd` for an unknown or already
-    /// finished run.
+    /// Handles one incoming command. Returns an immediate backlog batch, an
+    /// empty readiness frame for a live run without entries, or an `AcpLogEnd`.
     pub fn handle_command(&mut self, cmd: AcpLogCommand) -> Vec<AcpLogResponse> {
         match cmd {
             AcpLogCommand::AcpLogUnsubscribe { subscription_id } => {
@@ -124,11 +124,19 @@ impl LogStreamManager {
                     task_id,
                     run_id,
                     next_seq: start_seq,
+                    backfill_pending: true,
                     live,
                     ended: false,
                 };
                 self.subs.insert(subscription_id.clone(), sub);
-                self.drain_subscription(&subscription_id)
+                let mut responses = self.drain_subscription(&subscription_id);
+                if responses.is_empty() {
+                    responses.push(AcpLogResponse::AcpLogEntries {
+                        subscription_id,
+                        entries: Vec::new(),
+                    });
+                }
+                responses
             }
         }
     }
@@ -153,28 +161,26 @@ impl LogStreamManager {
                 return out;
             }
 
-            // Backfill persisted entries first.  The JSONL file is the source
-            // of truth: everything the live broadcast carries is written to
-            // the file before it is broadcast, so this covers both the
-            // historical backlog a fresh subscription is owed (spec §4.5:
-            // stream "from `fromSeq` or the last `tail` entries" — live runs
-            // included) and any entries a lagging broadcast receiver missed.
-            // It also guarantees an immediate first frame on subscribe, which
-            // the backend requires within its first-frame timeout.
-            let (entries, has_more) = read_batch(&self.store, sub.task_id, sub.run_id, sub.next_seq);
-            if let Some(last) = entries.last() {
-                sub.next_seq = last.seq + 1;
-            }
-            if !entries.is_empty() {
-                out.push(AcpLogResponse::AcpLogEntries {
-                    subscription_id: subscription_id.to_string(),
-                    entries,
-                });
+            // The JSONL file is the source of truth for the initial backlog and
+            // for recovery after a broadcast gap. Once caught up, idle ticks use
+            // only the broadcast instead of repeatedly rescanning the file.
+            if sub.backfill_pending {
+                let (entries, has_more) = read_batch(&self.store, sub.task_id, sub.run_id, sub.next_seq);
+                sub.backfill_pending = has_more;
+                if let Some(last) = entries.last() {
+                    sub.next_seq = last.seq + 1;
+                }
+                if !entries.is_empty() {
+                    out.push(AcpLogResponse::AcpLogEntries {
+                        subscription_id: subscription_id.to_string(),
+                        entries,
+                    });
+                }
             }
 
             // Drain the live broadcast only once the backlog is caught up;
             // entries already shipped from the file are skipped by sequence.
-            if !has_more && sub.live.is_some() {
+            if !sub.backfill_pending && sub.live.is_some() {
                 let mut batch = Vec::new();
                 let mut closed = false;
                 {
@@ -186,24 +192,22 @@ impl LogStreamManager {
                                     continue; // already shipped from the file
                                 }
                                 if entry.seq > sub.next_seq {
-                                    // Gap (e.g. after a lag): the entry and
-                                    // everything missing before it are in the
-                                    // file; the next tick's backfill resends
-                                    // them in order.
+                                    // The file contains both the missing entries
+                                    // and this entry, which was already consumed.
+                                    sub.backfill_pending = true;
                                     break;
                                 }
                                 let seq = entry.seq;
                                 if !push_entry(&mut batch, entry) {
-                                    // Batch full — keep `next_seq` so the file
-                                    // backfill resends this entry next tick.
+                                    // Batch full — the file resends this entry.
+                                    sub.backfill_pending = true;
                                     break;
                                 }
                                 sub.next_seq = seq + 1;
                             }
                             Err(broadcast::error::TryRecvError::Empty) => break,
                             Err(broadcast::error::TryRecvError::Lagged(_)) => {
-                                // Missed entries are in the file; the next
-                                // tick's backfill closes the gap.
+                                sub.backfill_pending = true;
                                 break;
                             }
                             Err(broadcast::error::TryRecvError::Closed) => {
@@ -225,7 +229,7 @@ impl LogStreamManager {
             }
 
             // A run whose broadcast closed and whose backlog is exhausted is done.
-            if sub.live.is_none() && !has_more {
+            if sub.live.is_none() && !sub.backfill_pending {
                 sub.ended = true;
                 out.push(AcpLogResponse::end(subscription_id, "finished"));
                 remove = true;
@@ -317,6 +321,81 @@ mod tests {
             AcpLogResponse::AcpLogEnd { reason, .. } => Some(reason.as_str()),
             _ => None,
         })
+    }
+
+    #[test]
+    fn empty_live_subscription_gets_immediate_readiness_frame() {
+        let store = temp_store();
+        let logger = store.open_run(1, 1).unwrap();
+        let mut manager = LogStreamManager::new(store);
+
+        let frames = manager.handle_command(subscribe(Some(0), None));
+        assert!(matches!(
+            frames.as_slice(),
+            [AcpLogResponse::AcpLogEntries { entries, .. }] if entries.is_empty()
+        ));
+        assert!(end_reason(&frames).is_none());
+
+        logger.log(NewLogEntry::message("first"));
+        let frames = manager.tick();
+        let got = entries(&frames);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].seq, 0);
+        assert_eq!(got[0].text.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn empty_finished_run_ends_without_readiness_frame() {
+        let store = temp_store();
+        let logger = store.open_run(1, 1).unwrap();
+        store.close_run(1, 1);
+        drop(logger);
+        let mut manager = LogStreamManager::new(store);
+
+        let frames = manager.handle_command(subscribe(Some(0), None));
+        assert!(matches!(frames.as_slice(), [AcpLogResponse::AcpLogEnd { .. }]));
+        assert_eq!(end_reason(&frames), Some("finished"));
+    }
+
+    #[test]
+    fn caught_up_live_subscription_disables_file_backfill() {
+        let store = temp_store();
+        let logger = store.open_run(1, 1).unwrap();
+        logger.log(NewLogEntry::prompt("p"));
+        let mut manager = LogStreamManager::new(store);
+        manager.handle_command(subscribe(Some(0), None));
+
+        assert!(!manager.subs.get("s").unwrap().backfill_pending);
+        assert!(manager.tick().is_empty());
+        assert!(!manager.subs.get("s").unwrap().backfill_pending);
+    }
+
+    #[test]
+    fn broadcast_lag_recovers_from_file_in_order() {
+        let store = temp_store();
+        let logger = store.open_run(1, 1).unwrap();
+        let mut manager = LogStreamManager::new(store);
+        manager.handle_command(subscribe(Some(0), None));
+        assert!(!manager.subs.get("s").unwrap().backfill_pending);
+
+        for i in 0..1025 {
+            logger.log(NewLogEntry::message(format!("m{i}")));
+        }
+        assert!(manager.tick().is_empty());
+        assert!(manager.subs.get("s").unwrap().backfill_pending);
+
+        let mut got = Vec::new();
+        for _ in 0..11 {
+            let frames = manager.tick();
+            got.extend(entries(&frames).into_iter().cloned());
+        }
+        assert_eq!(got.len(), 1025);
+        for (seq, entry) in got.iter().enumerate() {
+            assert_eq!(entry.seq, seq as i64);
+            assert_eq!(entry.text.as_deref(), Some(format!("m{seq}").as_str()));
+        }
+        assert!(!manager.subs.get("s").unwrap().backfill_pending);
+        assert!(manager.tick().is_empty());
     }
 
     /// Regression: a fresh subscription on a *live* run must immediately
