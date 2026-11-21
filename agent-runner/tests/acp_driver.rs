@@ -821,13 +821,19 @@ async fn container_question_uses_question_role_and_rolls_back_recording_writes_a
         assert!(status.success());
     }
 
+    let python = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|path| path.join("python3"))
+        .find(|path| path.is_file())
+        .expect("python3 on PATH");
     let docker = dir.join("recording-docker.py");
     std::fs::write(
         &docker,
-        r#"#!/usr/bin/env python3
+        format!(
+            r#"#!{}
 import os
 import sys
 
+host_python = sys.executable
 args = sys.argv[1:]
 assert args[0] == "exec"
 i = 1
@@ -847,8 +853,12 @@ if args[i] == "-u":
     i += 2
 assert worktree == "/work"
 os.chdir(os.environ["FAKE_DOCKER_WORKTREE"])
+if args[i] == "python3":
+    args[i] = host_python
 os.execvpe(args[i], args[i:], os.environ)
 "#,
+            python.display()
+        ),
     )
     .unwrap();
     #[cfg(unix)]

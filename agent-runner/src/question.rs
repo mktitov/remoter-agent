@@ -1730,7 +1730,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("remoter-question-kimi-home-{}", std::process::id()));
         let mut qc = test_context("http://127.0.0.1:9", &root, question(4, "pending", None));
         let toml = format!(
-            "api_url = \"http://127.0.0.1:9\"\nworkspace_root = \"{}\"\n[execution]\nagent_home = \"{}\"\n[driver]\nkind = \"kimi-acp\"\n",
+            "api_url = \"http://127.0.0.1:9\"\nworkspace_root = \"{}\"\n[execution]\nagent_home = \"{}\"\n[driver]\nkind = \"kimi-acp\"\nremoter_mcp_command = \"/opt/remoter-mcp\"\n",
             root.display(),
             root.join("daemon-home").display()
         );
