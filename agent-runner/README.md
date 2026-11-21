@@ -408,12 +408,14 @@ ends in `waiting`:
   sequence even when the reasons were reformulated. A human comment before a
   resumed run resets this reformulated-wait sequence.
 
-A triggered guard leaves the ticket in `waiting` and posts a
-`[waiting-loop-stop]` diagnostic with the ticket id, current and previous run
-ids, the repeated request, and recovery instructions. No new run is claimed
-until the human deliberately resumes or moves the ticket. To continue, verify
-the external state, add a comment with new facts, and click **«Готово —
-продолжить»** or use the normal manual transition.
+A triggered guard leaves the ticket in `waiting` and posts the usual pause note
+plus a `[waiting-loop-stop]` diagnostic with the ticket id, current and previous
+run ids, the repeated request, and recovery instructions. The pause note keeps
+the stopped wait resumable: after another **«Готово — продолжить»**, the next
+prompt still identifies that run, its waiting reason, and the new human comment.
+No new run is claimed until the human deliberately resumes or moves the ticket.
+To continue, verify the external state, add a comment with new facts, and click
+**«Готово — продолжить»** or use the normal manual transition.
 
 **Done does not mean review.** A legitimate pause and a stopped loop both stay
 in `waiting`. Only a normal, non-paused implement outcome moves the ticket to

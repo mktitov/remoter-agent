@@ -1307,9 +1307,10 @@ async fn rollback(rc: &RunContext) {
 /// bounces it back (`review → implement`) once the cause is fixed. A conflict
 /// or forbidden means a human already moved the ticket — leave it there.
 /// The tail of a successful claim-loop run. A paused run stays in `waiting`
-/// without attempting an invalid status transition; its journal note either
-/// records a legitimate pause or stops a no-input waiting loop. Every other
-/// run writes its success status, then an implement run gets a report reminder.
+/// without attempting an invalid status transition and always gets a pause
+/// note for the next resume; a no-input waiting loop also gets a diagnostic.
+/// Every other run writes its success status, then an implement run gets a
+/// report reminder.
 async fn finalize_success(rc: &RunContext, run_id: i32, waiting: bool) {
     let task_id = rc.task.id;
     if waiting {
@@ -1321,6 +1322,12 @@ async fn finalize_success(rc: &RunContext, run_id: i32, waiting: bool) {
             }
         };
         if let Some((previous_run_id, reason)) = loop_stop {
+            note(
+                &rc.client,
+                task_id,
+                format!("run #{run_id} paused: waiting for human action"),
+            )
+            .await;
             let reason = truncate_with_marker(&reason, MAX_ERROR_BYTES);
             note(
                 &rc.client,

@@ -577,6 +577,67 @@ async fn equivalent_wait_after_human_done_stops_the_daemon_resume_loop() {
 }
 
 #[tokio::test]
+async fn waiting_loop_stop_preserves_resume_context_for_the_next_human_done() {
+    let mut harness = harness(
+        "loop-stop-resume",
+        vec![TaskState::new(45, "resume after loop stop", "implement")],
+        vec![
+            Step::Wait("Approve deployment".into()),
+            Step::Wait("Approve deployment".into()),
+            Step::Wait("Approve deployment".into()),
+        ],
+        false,
+    )
+    .await;
+
+    poll_run(&mut harness).await;
+    harness.backend.human_done(45, Some("Approved; continue.")).await;
+    poll_run(&mut harness).await;
+    assert!(
+        harness
+            .backend
+            .comments(45)
+            .await
+            .iter()
+            .any(|comment| { comment.body == "run #2 paused: waiting for human action" })
+    );
+
+    harness
+        .backend
+        .human_done(
+            45,
+            Some("The approval is now recorded externally; verify it and continue."),
+        )
+        .await;
+    poll_run(&mut harness).await;
+
+    let specs = harness.driver.specs().await;
+    assert_eq!(specs.len(), 3);
+    assert_eq!(specs[2].resume_session.as_deref(), Some("session-2"));
+    let resume = specs[2]
+        .prompt
+        .split("## Human action confirmed\n")
+        .nth(1)
+        .expect("resume context after anti-loop stop");
+    assert!(resume.starts_with("Previous implement run #2"), "{resume}");
+    assert!(resume.contains("Approve deployment"), "{resume}");
+    assert!(
+        resume.contains("The approval is now recorded externally; verify it and continue."),
+        "{resume}"
+    );
+
+    let comments = harness.backend.comments(45).await;
+    assert!(comments.iter().any(|comment| {
+        comment.body.contains("[waiting-loop-stop]")
+            && comment.body.contains("run #3")
+            && comment.body.contains("run #2")
+    }));
+    poll_run(&mut harness).await;
+    assert_eq!(harness.backend.run_count(45).await, 3);
+    cleanup(&harness);
+}
+
+#[tokio::test]
 async fn reformulated_waits_without_human_input_are_bounded() {
     let mut harness = harness(
         "reformulated",
