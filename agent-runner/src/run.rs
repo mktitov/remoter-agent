@@ -1554,6 +1554,9 @@ const DEPENDENCY_REPOS_INTRO: &str = "## Dependency repos\nThis feature spans in
      tool with a cross-repo summary: a short summary covering all repositories of the feature — a final \
      run that ends without writing the report silently erases the ticket's existing report.\n\n";
 
+const DEPENDENCY_REPO_TIP_UNKNOWN: &str = "unknown (host-side ls-remote failed; report this daemon/workspace \
+     problem in the ticket thread — do not fetch from the agent sandbox or request Git credentials)";
+
 /// The "## Dependency repos" block (docs/specs/cross-repo-projects.md): only
 /// for the final integration run of a parent with cross-project supervised
 /// children. Each child project's repo collects the children's work on this
@@ -1601,7 +1604,7 @@ async fn dependency_repos_section(rc: &RunContext, detail: &TaskDetail) -> Strin
     for project in &projects {
         let tip = workspace::ls_remote_tip(&rc.config.workspace_root, &project.repo_url, &branch)
             .await
-            .unwrap_or_else(|| "unknown (ls-remote failed — fetch it yourself)".to_string());
+            .unwrap_or_else(|| DEPENDENCY_REPO_TIP_UNKNOWN.to_string());
         s.push_str(&format!(
             "- {} (project #{}), branch `{branch}`, tip `{tip}`\n",
             project.repo_url, project.project_id
@@ -1836,8 +1839,12 @@ fn render_prompt(
                 "## Instructions\nImplement the approved plan. Run the project's checks (e.g. `just lint test` or \
                  the repo's equivalent), keep the ticket's actions up to date via the remoter MCP tools, and \
                  **commit your changes to the current branch** (`git add` + `git commit` with a clear message) \
-                 before finishing — the human reviews the branch. If the ticket is about preparing or \
-                 onboarding a project's repository for remoter, call the `get_project_setup_guide` MCP tool \
+                 before finishing — the human reviews the branch. The daemon fetches from origin on the host \
+                 before the run and pushes after it. Use the existing local `origin/<base>` ref; never run \
+                 `git fetch`, `git pull`, or `git push`, and never request Git credentials. If a required ref \
+                 is missing, report a daemon/workspace problem in the ticket thread instead of waiting for \
+                 credentials. If the ticket is about preparing or onboarding a project's repository for \
+                 remoter, call the `get_project_setup_guide` MCP tool \
                  first and follow its guide. Leave the worktree clean — no uncommitted \
                  or untracked leftovers; the daemon checks `git status` after your turn and sends you back to \
                  finish if it is dirty. Never end your turn with background tasks still running — your \
@@ -2062,7 +2069,7 @@ fn rebase_nudge_prompt(base: &str, branch: &str) -> String {
         "The draft PR for branch `{branch}` is not mergeable into `{base}` because of conflicts.
 \
 \
-Fetch the latest `origin/{base}`, then `git rebase origin/{base}` (or an equivalent merge if the project prefers). Resolve all conflicts, run the project's checks (`just lint` and `just test` or the repo's equivalent), commit everything, and leave the worktree clean (`git status --porcelain` empty). **Do not push** — the daemon pushes the branch after your turn ends."
+The daemon has already refreshed `origin/{base}` on the host. Run `git rebase origin/{base}` (or an equivalent merge if the project prefers). Resolve all conflicts, run the project's checks (`just lint` and `just test` or the repo's equivalent), commit everything, and leave the worktree clean (`git status --porcelain` empty). Never run `git fetch`, `git pull`, or `git push`, and never request Git credentials — the daemon pushes the branch after your turn ends. If `origin/{base}` is missing, report a daemon/workspace problem in the ticket thread instead of fetching or waiting for credentials."
     )
 }
 
@@ -2220,9 +2227,10 @@ async fn ensure_pr_mergeable(
 }
 
 /// The nudge loop of `ensure_pr_mergeable`: up to `MAX_REBASE_NUDGES` rebase
-/// prompts on the resumed session, pushing and rechecking mergeability after
-/// each. The caller brackets it with `services_up`/`services_down`; every
-/// early return here is covered by that trailing down.
+/// prompts on the resumed session. The daemon refreshes origin/<base> on the
+/// host before every prompt, then pushes and rechecks mergeability after each.
+/// The caller brackets it with `services_up`/`services_down`; every early
+/// return here is covered by that trailing down.
 #[allow(clippy::too_many_arguments)]
 async fn rebase_nudge_loop(
     rc: &RunContext,
@@ -2243,6 +2251,19 @@ async fn rebase_nudge_loop(
     let nudge_timeout = Duration::from_secs(rc.config.run_timeout_minutes * 60);
 
     for _nudge in 1..=MAX_REBASE_NUDGES {
+        if let Err(e) = workspace::fetch_branch(wt, base).await {
+            tracing::warn!(task_id, base, error = %e, "rebase nudge: host-side base fetch failed");
+            note(
+                &rc.client,
+                task_id,
+                format!(
+                    "PR is not mergeable into `{base}`: host-side fetch of `origin/{base}` failed ({e}); \
+                     the agent was not started with a stale base — daemon/workspace problem, human help needed"
+                ),
+            )
+            .await;
+            return;
+        }
         let prompt = rebase_nudge_prompt(base, branch);
         let nudge_spec = RunSpec {
             task_id,
@@ -2408,6 +2429,7 @@ pub(crate) async fn finish_reporting(client: &RemoterClient, run_id: i32, body: 
 mod tests {
     use super::*;
     use crate::client::{AgentRunDto, CommentDto};
+    use std::path::PathBuf;
 
     /// The `db-up` contract is keyed on the worktree carrying a justfile:
     /// without one the container-mode `just db-up` step is skipped (it would
@@ -2707,6 +2729,15 @@ mod tests {
             "",
         );
         assert!(!p.contains("Dependency repos"), "{p}");
+    }
+
+    #[test]
+    fn dependency_repo_tip_fallback_reports_host_side_failure() {
+        assert!(DEPENDENCY_REPO_TIP_UNKNOWN.contains("host-side ls-remote failed"));
+        assert!(DEPENDENCY_REPO_TIP_UNKNOWN.contains("daemon/workspace problem"));
+        assert!(DEPENDENCY_REPO_TIP_UNKNOWN.contains("do not fetch from the agent sandbox"));
+        assert!(DEPENDENCY_REPO_TIP_UNKNOWN.contains("request Git credentials"));
+        assert!(!DEPENDENCY_REPO_TIP_UNKNOWN.contains("fetch it yourself"));
     }
 
     fn comment(id: i32, body: String) -> CommentDto {
@@ -3079,19 +3110,22 @@ mod tests {
         );
     }
 
-    /// The rebase nudge prompt names the base branch, instructs the agent to
-    /// rebase onto origin/<base>, run checks, leave the worktree clean, and
-    /// explicitly forbids pushing.
+    /// The daemon refreshes origin/<base> before the nudge; the agent rebases
+    /// from that local ref without contacting origin or requesting credentials.
     #[test]
-    fn rebase_nudge_prompt_contains_required_instructions() {
+    fn rebase_nudge_prompt_contains_host_owned_git_contract() {
         let p = rebase_nudge_prompt("main", "agent/task-42-fix");
         assert!(p.contains("agent/task-42-fix"), "{p}");
-        assert!(p.contains("origin/main"), "{p}");
-        assert!(p.contains("git rebase"), "{p}");
-        assert!(p.contains("Do not push"), "{p}");
+        assert!(p.contains("already refreshed `origin/main` on the host"), "{p}");
+        assert!(p.contains("git rebase origin/main"), "{p}");
+        assert!(p.contains("Never run `git fetch`, `git pull`, or `git push`"), "{p}");
+        assert!(p.contains("never request Git credentials"), "{p}");
+        assert!(p.contains("report a daemon/workspace problem"), "{p}");
         assert!(p.contains("just lint"), "{p}");
         assert!(p.contains("just test"), "{p}");
         assert!(p.contains("worktree clean"), "{p}");
+        assert!(!p.contains("Fetch the latest"), "{p}");
+        assert!(!p.contains("fetch it yourself"), "{p}");
     }
 
     fn action_item(id: i32, description: &str, status: &str) -> crate::client::ActionItem {
@@ -3267,6 +3301,27 @@ mod tests {
         assert!(p.contains("reject_action"), "{p}");
         assert!(p.contains("final state"), "{p}");
         assert!(p.contains("daemon checks"), "{p}");
+    }
+
+    #[test]
+    fn implement_prompt_keeps_origin_operations_on_the_host() {
+        let p = render_prompt(
+            RunKind::Implement,
+            &detail(vec![], vec![]),
+            None,
+            999,
+            "http://api",
+            &[],
+            "",
+        );
+        assert!(p.contains("daemon fetches from origin on the host"), "{p}");
+        assert!(p.contains("pushes after it"), "{p}");
+        assert!(p.contains("existing local `origin/<base>` ref"), "{p}");
+        assert!(p.contains("never run `git fetch`, `git pull`, or `git push`"), "{p}");
+        assert!(p.contains("never request Git credentials"), "{p}");
+        assert!(p.contains("report a daemon/workspace problem"), "{p}");
+        assert!(p.contains("instead of waiting for credentials"), "{p}");
+        assert!(!p.contains("fetch it yourself"), "{p}");
     }
 
     /// The action nudge prompt lists every pending action by id and description.
@@ -3558,6 +3613,171 @@ kind = "stub"
             }
         });
         (format!("http://{addr}"), requests)
+    }
+
+    #[derive(Default)]
+    struct RecordingRebaseDriver {
+        calls: std::sync::atomic::AtomicUsize,
+        origin_main_tips: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentDriver for RecordingRebaseDriver {
+        async fn run(&self, spec: RunSpec) -> Result<RunOutcome, RunFailure> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let out = tokio::process::Command::new("git")
+                .current_dir(&spec.cwd)
+                .args(["rev-parse", "origin/main"])
+                .output()
+                .await
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            self.origin_main_tips
+                .lock()
+                .await
+                .push(String::from_utf8(out.stdout).unwrap().trim().to_string());
+            Err(RunFailure::new(
+                DriverError::Permanent("stop after recording the fetched base".to_string()),
+                None,
+            ))
+        }
+    }
+
+    fn test_git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    async fn rebase_git_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf, workspace::PreparedWorktree) {
+        let base = std::env::temp_dir().join(format!("remoter-rebase-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        test_git(&src, &["init", "-b", "main"]);
+        std::fs::write(src.join("README.md"), "initial\n").unwrap();
+        test_git(&src, &["add", "."]);
+        test_git(
+            &src,
+            &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "initial"],
+        );
+        let origin = base.join("origin.git");
+        test_git(
+            &base,
+            &["clone", "--bare", &src.to_string_lossy(), &origin.to_string_lossy()],
+        );
+        let prepared = workspace::prepare(
+            &base.join("workspace"),
+            1,
+            42,
+            "child ticket",
+            &origin.to_string_lossy(),
+            Some("main"),
+        )
+        .await
+        .unwrap();
+        (base, src, origin, prepared)
+    }
+
+    async fn run_rebase_nudge_for_test(rc: &RunContext, prepared: &workspace::PreparedWorktree) {
+        let mut outcome = RunOutcome {
+            session_id: Some("session-before-rebase".to_string()),
+            text: String::new(),
+            input_tokens: None,
+            output_tokens: None,
+            model: None,
+            thinking: None,
+        };
+        rebase_nudge_loop(
+            rc,
+            99,
+            &SessionLogger::noop(),
+            &prepared.branch,
+            forge::ForgeKind::GitHub,
+            None,
+            "unused",
+            1,
+            "main",
+            &prepared.dir,
+            &[],
+            false,
+            &mut outcome,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rebase_nudge_refreshes_base_on_host_before_calling_driver() {
+        let (url, requests) = spawn_recording_backend(vec![(200, r#"{"id":1}"#)]).await;
+        let (base, src, origin, prepared) = rebase_git_fixture("fresh-base").await;
+        let old_tip = test_git(&prepared.dir, &["rev-parse", "origin/main"]);
+        std::fs::write(src.join("README.md"), "advanced\n").unwrap();
+        test_git(&src, &["add", "."]);
+        test_git(
+            &src,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "advance base",
+            ],
+        );
+        let new_tip = test_git(&src, &["rev-parse", "HEAD"]);
+        assert_ne!(old_tip, new_tip);
+        test_git(&src, &["push", &origin.to_string_lossy(), "main"]);
+
+        let driver = Arc::new(RecordingRebaseDriver::default());
+        let mut rc = test_run_context(&url);
+        rc.driver = driver.clone();
+        run_rebase_nudge_for_test(&rc, &prepared).await;
+
+        assert_eq!(driver.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(*driver.origin_main_tips.lock().await, vec![new_tip]);
+        let reqs = requests.lock().await;
+        assert_eq!(reqs.len(), 1, "{reqs:?}");
+        assert!(reqs[0].contains("stop after recording the fetched base"), "{reqs:?}");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rebase_nudge_failed_host_fetch_skips_driver_and_posts_diagnostic() {
+        let (url, requests) = spawn_recording_backend(vec![(200, r#"{"id":1}"#)]).await;
+        let (base, _src, _origin, prepared) = rebase_git_fixture("failed-fetch").await;
+        test_git(
+            &prepared.dir,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                &base.join("missing.git").to_string_lossy(),
+            ],
+        );
+        let driver = Arc::new(RecordingRebaseDriver::default());
+        let mut rc = test_run_context(&url);
+        rc.driver = driver.clone();
+
+        run_rebase_nudge_for_test(&rc, &prepared).await;
+
+        assert_eq!(driver.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(driver.origin_main_tips.lock().await.is_empty());
+        let reqs = requests.lock().await;
+        assert_eq!(reqs.len(), 1, "{reqs:?}");
+        assert!(reqs[0].starts_with("POST /api/v1/tasks/42/comments"), "{reqs:?}");
+        assert!(reqs[0].contains("host-side fetch of `origin/main` failed"), "{reqs:?}");
+        assert!(reqs[0].contains("agent was not started with a stale base"), "{reqs:?}");
+        assert!(reqs[0].contains("daemon/workspace problem"), "{reqs:?}");
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// remoter#162: a run whose agent paused the ticket via

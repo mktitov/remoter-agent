@@ -205,6 +205,15 @@ pub type HumanNotified = Arc<std::sync::Mutex<HashMap<i32, String>>>;
 /// no longer match once a child leaves `completed`.
 const INTEGRATION_MARKER: &str = "final integration run";
 
+fn integration_note(signature: &str) -> String {
+    format!(
+        "all child tickets completed — starting the final integration run: bring the branch up to date \
+         from the daemon-fetched local `origin/<base>` ref, resolve conflicts, and run the project checks; \
+         never run `git fetch`, `git pull`, or `git push` in the agent sandbox — the daemon pushes the \
+         branch on the host and the PR targets the base branch (cycle: {signature})"
+    )
+}
+
 /// Fingerprint of the children-completed cycle: the completed children's ids
 /// and completion timestamps. Any change (a child bounces out of `completed`
 /// and back, a new completion) yields a different fingerprint.
@@ -372,8 +381,8 @@ impl Supervisor {
         // Final integration run: every child is completed, none awaits review
         // or rollout — bounce the parent `review → implement`; the normal
         // claim loop picks it up and the implement run (resuming the parent's
-        // last session) merges the base branch, runs the checks, and pushes
-        // the PR. Exactly once per children-completed cycle: the fingerprinted
+        // last session) merges the local origin/<base>, runs the checks, and
+        // leaves the host-side push to the daemon. Exactly once per cycle: the fingerprinted
         // in-memory latch plus the marker note on the parent's thread dedup
         // re-polls (the integration run itself lands the parent back in
         // `review`; the fingerprint changes when a child leaves `completed`,
@@ -403,17 +412,7 @@ impl Supervisor {
                 match client.set_task_status(parent.id, "implement").await {
                     Ok(()) => {
                         self.integration_triggered.insert(parent.id, signature.clone());
-                        note(
-                            client,
-                            parent.id,
-                            format!(
-                                "all child tickets completed — starting the final integration run: bring the \
-                                 branch up to date with the project base, resolve conflicts, run the project \
-                                 checks; the daemon pushes the branch and the PR targets the base branch \
-                                 (cycle: {signature})"
-                            ),
-                        )
-                        .await;
+                        note(client, parent.id, integration_note(&signature)).await;
                         tracing::info!(
                             task_id = parent.id,
                             "supervision: all children completed → integration run"
@@ -3035,6 +3034,21 @@ mod tests {
         a.task_status = "implement".into();
         a.completed_at = None;
         assert_ne!(sig, completed_cycle_signature(&[a, b]));
+    }
+
+    #[test]
+    fn integration_note_uses_local_base_and_host_owned_push() {
+        let note = integration_note("1@2026-09-01T10:00:00Z");
+        assert!(note.contains("daemon-fetched local `origin/<base>` ref"), "{note}");
+        assert!(note.contains("resolve conflicts"), "{note}");
+        assert!(note.contains("run the project checks"), "{note}");
+        assert!(
+            note.contains("never run `git fetch`, `git pull`, or `git push`"),
+            "{note}"
+        );
+        assert!(note.contains("daemon pushes the branch on the host"), "{note}");
+        assert!(note.contains("cycle: 1@2026-09-01T10:00:00Z"), "{note}");
+        assert!(!note.contains("fetch it yourself"), "{note}");
     }
 
     // ── supervision gate (`supervision_enabled`) ─────────────────────────────

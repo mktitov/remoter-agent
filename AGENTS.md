@@ -41,8 +41,11 @@ mode:
   `.git` is mounted at its original host path, so plain git works.
 - The daemon's host is reachable as `host.docker.internal` (e.g.
   `REMOTER_API_URL` for remoter-mcp already points there).
-- Git operations that touch origin (fetch/push) are done by the daemon on the
-  host after your turn — never push yourself unless told to.
+- All Git operations that touch origin belong to the daemon on the host: it
+  fetches before your run and pushes after it. Never run `git fetch`, `git
+  pull`, or `git push`, and never request Git credentials. Use the existing
+  local `origin/<base>`; a missing ref is a daemon/workspace problem. The
+  isolated `HOME` contains no SSH keys or other Git credentials.
 
 ### Running inside a remoter-agent Bubblewrap sandbox
 
@@ -59,8 +62,12 @@ not use Docker, images, sidecars, or systemd-nspawn:
   realized through the host Nix daemon (`NIX_REMOTE=daemon`); `/nix/store`
   itself stays read-only in the guest.
 - The daemon's loopback API is reachable as `10.0.2.2`; `REMOTER_API_URL` for
-  remoter-mcp already points there. Git operations that touch origin are done
-  by the daemon on the host after your turn — never push yourself unless told.
+  remoter-mcp already points there. All Git operations that touch origin belong
+  to the daemon on the host: it fetches before your run and pushes after it.
+  Never run `git fetch`, `git pull`, or `git push`, and never request Git
+  credentials. Use the existing local `origin/<base>`; a missing ref is a
+  daemon/workspace problem. The isolated `HOME` contains no SSH keys or other
+  Git credentials.
 
 The opt-in real NixOS suite is
 `devenv shell --no-tui --no-eval-cache -- nix shell nixpkgs#bubblewrap nixpkgs#slirp4netns nixpkgs#flutter -c cargo test --test bwrap_live -- --ignored --nocapture --test-threads=1`.
