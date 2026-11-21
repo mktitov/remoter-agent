@@ -981,6 +981,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_live_log_subscription_gets_immediate_frame() {
+        let store = empty_store();
+        let _logger = store.open_run(1, 1).unwrap();
+        let (response_tx, mut response_rx) = mpsc::channel(1);
+        let url = spawn_ws_server(move |mut ws| async move {
+            let command = serde_json::json!({
+                "type": "acpLogSubscribe",
+                "subscriptionId": "s",
+                "taskId": 1,
+                "runId": 1,
+                "fromSeq": 0
+            });
+            let command = command.to_string();
+            serde_json::from_str::<AcpLogCommand>(&command).unwrap();
+            ws.send(Message::Text(command.into())).await.unwrap();
+            let response = tokio::time::timeout(Duration::from_secs(1), ws.next())
+                .await
+                .expect("timed out waiting for the first log frame")
+                .expect("log stream closed before its first frame")
+                .unwrap();
+            response_tx.send(response.into_text().unwrap()).await.unwrap();
+            let _ = ws.close(None).await;
+            while ws.next().await.is_some() {}
+        })
+        .await;
+        let (tx, _rx) = mpsc::channel(1);
+        let handle = tokio::spawn({
+            let url = url.clone();
+            async move {
+                listen_once(
+                    &url,
+                    "tok",
+                    None,
+                    &tx,
+                    store,
+                    None,
+                    None,
+                    Duration::from_secs(5),
+                    Duration::from_secs(5),
+                )
+                .await
+            }
+        });
+
+        let response = response_rx.recv().await.unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["type"], "acpLogEntries");
+        assert_eq!(response["subscriptionId"], "s");
+        assert_eq!(response["entries"], serde_json::json!([]));
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn silent_handshake_times_out_fast() {
         let url = spawn_silent_tcp_server().await;
         let (tx, _rx) = mpsc::channel(1);
