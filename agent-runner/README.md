@@ -161,6 +161,21 @@ port), so:
 3. Projects that can't parameterize get serialized instead:
    `max_concurrent_runs_per_project = 1` in `remoter-agent.toml`.
 
+## Git remotes and sandbox credentials
+
+The daemon owns every Git operation that touches `origin`. It fetches on the
+host before each run (and before every auto-rebase nudge) and pushes on the
+host after the run. Agents commit to the ticket branch and integrate from the
+existing local `origin/<base>` ref; they must not run `git fetch`, `git pull`,
+or `git push` in a container or bwrap sandbox and must not request Git
+credentials. A missing or stale ref is a daemon/workspace problem to report in
+the ticket thread, not a reason to wait for credentials.
+
+The isolated `HOME`/`agent_home` deliberately contains no host SSH keys or
+other Git credentials. Passing those credentials into the sandbox is not a
+supported workaround; neither is switching to `execution.mode = "host"` to
+avoid the ownership boundary.
+
 ## Container mode (spec remoter-agent-containers.md, Remoter monorepo)
 
 With `[execution] mode = "container"` every attempt runs inside a per-run
