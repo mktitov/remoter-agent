@@ -60,6 +60,8 @@ use crate::client::RemoterClient;
 ///   `set_task_review` (the backend allows the verdict endpoint for the
 ///   assignee while a review run is running); all mutating tools stay
 ///   daemon-owned or out of scope for a reviewer.
+/// - `DevAgentQuestion`: for Q&A fork/fallback sessions. Strictly read-only:
+///   the review role's discovery tools without `set_task_review`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Full,
@@ -67,6 +69,7 @@ pub enum Role {
     DevAgentImplement,
     DevAgentSupervise,
     DevAgentReview,
+    DevAgentQuestion,
 }
 
 impl std::fmt::Display for Role {
@@ -77,6 +80,7 @@ impl std::fmt::Display for Role {
             Role::DevAgentImplement => write!(f, "dev-agent-implement"),
             Role::DevAgentSupervise => write!(f, "dev-agent-supervise"),
             Role::DevAgentReview => write!(f, "dev-agent-review"),
+            Role::DevAgentQuestion => write!(f, "dev-agent-question"),
         }
     }
 }
@@ -151,6 +155,33 @@ impl Role {
                 "set_task_goal",
                 "request_human_action",
             ],
+            // Q&A fork/fallback sessions are strictly read-only, including no
+            // review verdicts.
+            Role::DevAgentQuestion => &[
+                "start_task",
+                "advance_task",
+                "complete_task",
+                "unassign_self",
+                "assign_task",
+                "create_task",
+                "update_task",
+                "start_action",
+                "complete_action",
+                "reject_action",
+                "update_action",
+                "delete_action",
+                "add_action",
+                "add_attachment",
+                "add_task_comment",
+                "set_task_report",
+                "set_task_review",
+                "add_link",
+                "remove_link",
+                "add_task_question",
+                "delete_task_question",
+                "set_task_goal",
+                "request_human_action",
+            ],
             Role::DevAgentPlan => &[
                 "start_task",
                 "advance_task",
@@ -171,7 +202,7 @@ impl Role {
     }
 }
 
-const USAGE: &str = "usage: remoter-mcp [--version] [--role full|dev-agent-plan|dev-agent-implement|dev-agent-supervise|dev-agent-review]";
+const USAGE: &str = "usage: remoter-mcp [--version] [--role full|dev-agent-plan|dev-agent-implement|dev-agent-supervise|dev-agent-review|dev-agent-question]";
 
 /// Parse the optional `--role` CLI argument from an iterator (testable).
 pub(crate) fn parse_role<I>(mut args: I) -> Role
@@ -187,6 +218,7 @@ where
                 Some(v) if v == "dev-agent-implement" => Role::DevAgentImplement,
                 Some(v) if v == "dev-agent-supervise" => Role::DevAgentSupervise,
                 Some(v) if v == "dev-agent-review" => Role::DevAgentReview,
+                Some(v) if v == "dev-agent-question" => Role::DevAgentQuestion,
                 Some(v) => {
                     eprintln!("error: unknown role `{v}`");
                     eprintln!("{USAGE}");
@@ -205,6 +237,7 @@ where
                 "dev-agent-implement" => Role::DevAgentImplement,
                 "dev-agent-supervise" => Role::DevAgentSupervise,
                 "dev-agent-review" => Role::DevAgentReview,
+                "dev-agent-question" => Role::DevAgentQuestion,
                 _ => {
                     eprintln!("error: unknown role `{v}`");
                     eprintln!("{USAGE}");
@@ -603,6 +636,13 @@ impl ServerHandler for RemoterMcp {
                  Then write your verdict: set_task_review(taskId, markdown, verdict) with verdict 'approve' or \
                  'changes_requested'. Everything else is read-only for you — do NOT call any mutating tool \
                  (board transitions, actions, comments, reports, attachments, links)."
+                .into(),
+            Role::DevAgentQuestion => "Remoter Q&A mode for a fork/fallback session. Answer questions by inspecting \
+                 the ticket with get_task, its questions and answers with list_task_questions, its history with \
+                 list_task_comments, and its artifacts with list_attachments/read_attachment. Use list_board, \
+                 list_my_tasks, and search_tasks for surrounding context. This role is strictly read-only: do NOT \
+                 call set_task_review or any other mutating tool (board transitions, tasks, actions, comments, \
+                 reports, attachments, links, or question edits)."
                 .into(),
         };
         ServerInfo {

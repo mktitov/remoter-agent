@@ -34,6 +34,7 @@ async-trait = "0.1"
 agent-client-protocol = { version = "=2.0.0", features = [
     "unstable_end_turn_token_usage",
     "unstable_elicitation",
+    "unstable_session_fork",
 ] }
 # The ACP crate is futures-based (not tokio); we spawn the agent via async-process
 # to keep std::process::Command control (cwd, env, process group) that

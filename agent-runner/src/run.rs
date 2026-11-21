@@ -35,6 +35,7 @@ pub enum RunKind {
     Implement,
     Supervise,
     Review,
+    Question,
 }
 
 impl RunKind {
@@ -44,6 +45,7 @@ impl RunKind {
             RunKind::Implement => "implement",
             RunKind::Supervise => "supervise",
             RunKind::Review => "review",
+            RunKind::Question => "question",
         }
     }
 
@@ -54,8 +56,7 @@ impl RunKind {
         match self {
             RunKind::Plan => "plan_review",
             RunKind::Implement => "review",
-            RunKind::Supervise => "review",
-            RunKind::Review => "review",
+            RunKind::Supervise | RunKind::Review | RunKind::Question => "review",
         }
     }
 
@@ -68,8 +69,7 @@ impl RunKind {
         match self {
             RunKind::Plan => "todo",
             RunKind::Implement => "implement",
-            RunKind::Supervise => "review",
-            RunKind::Review => "review",
+            RunKind::Supervise | RunKind::Review | RunKind::Question => "review",
         }
     }
 
@@ -83,8 +83,7 @@ impl RunKind {
         match self {
             RunKind::Plan => "plan_review",
             RunKind::Implement => "review",
-            RunKind::Supervise => "review",
-            RunKind::Review => "review",
+            RunKind::Supervise | RunKind::Review | RunKind::Question => "review",
         }
     }
 }
@@ -568,7 +567,7 @@ pub async fn execute(rc: RunContext) {
                     }
                     // Supervise and review runs never reach run::execute — they
                     // have their own lifecycles in supervise.rs / review.rs.
-                    RunKind::Supervise | RunKind::Review => {
+                    RunKind::Supervise | RunKind::Review | RunKind::Question => {
                         unreachable!("supervise/review runs use supervise::execute / review::execute")
                     }
                 }
@@ -789,6 +788,8 @@ async fn attempt_run(
         prompt: prompt.to_string(),
         kind: rc.kind.as_str(),
         resume_session: resume_session.clone(),
+        fork_session: None,
+        fallback_prompt: None,
         branch: branch.to_string(),
         env: env.clone(),
         exec: exec_env(&rc.config, run_id, prepared.devenv),
@@ -868,6 +869,8 @@ async fn ensure_clean_worktree(
             prompt: nudge_prompt.clone(),
             kind: rc.kind.as_str(),
             resume_session: merged.session_id.clone(),
+            fork_session: None,
+            fallback_prompt: None,
             branch: branch.to_string(),
             env: env.clone(),
             exec: exec_env(&rc.config, run_id, devenv),
@@ -923,7 +926,9 @@ fn dirty_nudge_prompt(kind: RunKind, status: &str) -> String {
         ),
         // Supervise/review runs never nudge dirty worktrees (their lifecycles
         // live outside run::execute).
-        RunKind::Supervise | RunKind::Review => unreachable!("supervise/review runs never nudge dirty worktrees"),
+        RunKind::Supervise | RunKind::Review | RunKind::Question => {
+            unreachable!("supervise/review runs never nudge dirty worktrees")
+        }
     }
 }
 
@@ -1004,6 +1009,8 @@ async fn ensure_final_actions(
             prompt,
             kind: rc.kind.as_str(),
             resume_session: merged.session_id.clone(),
+            fork_session: None,
+            fallback_prompt: None,
             branch: branch.to_string(),
             env: env.clone(),
             exec: exec_env(&rc.config, run_id, devenv),
@@ -1040,28 +1047,34 @@ fn run_env(rc: &RunContext) -> Vec<(String, String)> {
     match rc.config.execution.mode {
         ExecutionMode::Container => container::container_env(rc.task.id),
         ExecutionMode::Bwrap => crate::bwrap::run_env(rc.task.id),
-        ExecutionMode::Host => {
-            let mut env = vec![
-                ("CI".to_string(), "1".to_string()),
-                ("REMOTER_AGENT_TASK_ID".to_string(), rc.task.id.to_string()),
-            ];
-            if let Some(block) = &rc.port_block {
-                env.push(("REMOTER_AGENT_PORT_BASE".to_string(), block.base().to_string()));
-            }
-            if rc.config.driver.kind == "kimi-acp" {
-                env.push((
-                    "KIMI_CODE_HOME".to_string(),
-                    rc.config
-                        .execution
-                        .agent_home(&rc.config.workspace_root)
-                        .join(".kimi-code")
-                        .to_string_lossy()
-                        .into_owned(),
-                ));
-            }
-            env
-        }
+        ExecutionMode::Host => host_run_env(&rc.config, rc.task.id, rc.port_block.as_ref()),
     }
+}
+
+pub(crate) fn host_run_env(
+    config: &Config,
+    task_id: i32,
+    port_block: Option<&crate::ports::PortBlock>,
+) -> Vec<(String, String)> {
+    let mut env = vec![
+        ("CI".to_string(), "1".to_string()),
+        ("REMOTER_AGENT_TASK_ID".to_string(), task_id.to_string()),
+    ];
+    if let Some(block) = port_block {
+        env.push(("REMOTER_AGENT_PORT_BASE".to_string(), block.base().to_string()));
+    }
+    if config.driver.kind == "kimi-acp" {
+        env.push((
+            "KIMI_CODE_HOME".to_string(),
+            config
+                .execution
+                .agent_home(&config.workspace_root)
+                .join(".kimi-code")
+                .to_string_lossy()
+                .into_owned(),
+        ));
+    }
+    env
 }
 
 fn sessions_dir(config: &Config) -> std::path::PathBuf {
@@ -1395,7 +1408,7 @@ async fn escalate(rc: &RunContext, run_id: i32, reason: &str, attempt: u32) {
 /// run from resuming.
 fn resume_session_for(kind: RunKind, runs: &[crate::client::AgentRunDto]) -> Option<String> {
     runs.iter()
-        .find(|r| r.kind != crate::supervise::SUPERVISE_RUN_KIND)
+        .find(|r| !matches!(r.kind.as_str(), "supervise" | "question"))
         .filter(|r| r.status == "succeeded" && r.kind == kind.as_str())
         .and_then(|r| r.session_id.clone())
 }
@@ -1514,8 +1527,9 @@ fn attachments_section(base_url: &str, attachments: &[AttachmentDto]) -> String 
 /// conversation) plus per-kind instructions (spec §5.6). The conversation
 /// thread is what makes a `review → implement` bounce steer the next run,
 /// and — with the approved plan text — fully seeds a fresh session when no
-/// resume is possible (§5.4). `current_run_id` is excluded from Prior runs:
-/// the live run row (status `running`, no outcome) would be prompt noise.
+/// resume is possible (§5.4). `current_run_id` and question runs are excluded
+/// from Prior runs: the live row would be prompt noise, and Q&A must stay out
+/// of the source plan/implement conversation.
 async fn build_prompt(
     rc: &RunContext,
     plan: Option<&str>,
@@ -1710,7 +1724,7 @@ fn render_prompt(
                     ));
                 }
                 // Supervise/review runs never render through this prompt builder.
-                RunKind::Supervise | RunKind::Review => {}
+                RunKind::Supervise | RunKind::Review | RunKind::Question => {}
             }
         }
         p.push('\n');
@@ -1753,15 +1767,19 @@ fn render_prompt(
             ),
             // Review runs are read-only like supervise: questions are shown
             // for context but the reviewer must not be nudged to edit them.
-            RunKind::Supervise | RunKind::Review => {}
+            RunKind::Supervise | RunKind::Review | RunKind::Question => {}
         }
     }
     // Earlier plans/summaries/errors, newest first, capped (spec §5.6). The
-    // live run's own row is filtered out (see the doc comment above). Each
-    // outcome is quoted truncated: run rows written before the write-side cap
-    // (or by hand) may carry unbounded error text.
+    // live run's own row and isolated Q&A runs are filtered out. Each outcome
+    // is quoted truncated: run rows written before the write-side cap (or by
+    // hand) may carry unbounded error text.
     if let Some(runs) = detail.runs.as_ref().filter(|r| !r.is_empty()) {
-        let prior: Vec<_> = runs.iter().filter(|r| r.id != current_run_id).take(5).collect();
+        let prior: Vec<_> = runs
+            .iter()
+            .filter(|r| r.id != current_run_id && r.kind != "question")
+            .take(5)
+            .collect();
         if !prior.is_empty() {
             p.push_str("## Prior runs\n");
             for r in prior {
@@ -1898,7 +1916,7 @@ fn render_prompt(
         }
         // Supervise/review runs never render through this prompt builder —
         // their prompts are built in supervise.rs / review.rs.
-        RunKind::Supervise | RunKind::Review => {}
+        RunKind::Supervise | RunKind::Review | RunKind::Question => {}
     }
     p
 }
@@ -2272,6 +2290,8 @@ async fn rebase_nudge_loop(
             prompt,
             kind: rc.kind.as_str(),
             resume_session: outcome.session_id.clone(),
+            fork_session: None,
+            fallback_prompt: None,
             branch: branch.to_string(),
             env: env.to_vec(),
             exec: exec_env(&rc.config, run_id, devenv),
@@ -2803,6 +2823,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn prior_runs_exclude_question_answers_from_main_sessions() {
+        let mut runs: Vec<_> = (10..15)
+            .map(|id| {
+                let mut run = run_row(id, "question", "succeeded", Some(format!("fork-{id}")), None);
+                run.summary = Some(format!("PRIVATE_QA_ANSWER_{id}"));
+                run
+            })
+            .collect();
+        let mut implement = run_row(2, "implement", "succeeded", Some("source".to_string()), None);
+        implement.summary = Some("implementation summary".to_string());
+        runs.push(implement);
+
+        for kind in [RunKind::Plan, RunKind::Implement] {
+            let prompt = render_prompt(kind, &detail(vec![], runs.clone()), None, 999, "http://api", &[], "");
+            assert!(!prompt.contains("PRIVATE_QA_ANSWER"), "{kind:?}: {prompt}");
+            assert!(!prompt.contains("question run #"), "{kind:?}: {prompt}");
+            assert!(prompt.contains("implementation summary"), "{kind:?}: {prompt}");
+        }
+    }
+
     /// The Ticket section leads with the task title (the short summary the
     /// branch name and PR title derive from), then the full description body.
     #[test]
@@ -3058,6 +3099,18 @@ mod tests {
 
         let impl_ok = run_row(3, "implement", "succeeded", Some("sess-impl".into()), None);
         assert_eq!(resume_session_for(RunKind::Plan, &[impl_ok]), None);
+    }
+
+    #[test]
+    fn resume_session_ignores_question_runs() {
+        let runs = vec![
+            run_row(4, "question", "succeeded", Some("question-fork".into()), None),
+            run_row(3, "implement", "succeeded", Some("sess-impl".into()), None),
+        ];
+        assert_eq!(
+            resume_session_for(RunKind::Implement, &runs),
+            Some("sess-impl".to_string())
+        );
     }
 
     /// A retry after a failure never resumes: the newest run is failed, even
