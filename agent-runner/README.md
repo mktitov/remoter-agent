@@ -378,6 +378,50 @@ creates no per-project image; compare the Docker mode budget above (~8–16 GB
 per image, plus build time). These are diagnostic measurements, not performance
 guarantees; rerun the suite on the target host.
 
+## Waiting for a human and resuming
+
+`request_human_action` moves the active ticket to `waiting` through the backend's
+`POST /tasks/{id}/wait`. The current run then finishes as a clean pause: the
+daemon sends no dirty-worktree, action-finalization, or rebase nudges, skips
+commit/push/PR finalization, and never attempts a `waiting → review` write.
+
+When the human clicks **«Готово — продолжить»**, the backend moves the ticket to
+`implement` as usual. The next implement run resumes the previous ACP session
+and reconstructs the completed wait from the existing run history and ticket
+thread. Its bounded `Human action confirmed` prompt section contains the
+previous run id, the original waiting reason, an explicit statement that the
+human confirmed completion, and every human comment left between that pause and
+this run (or an explicit no-comment marker). The agent must verify the external
+result and continue the remaining work rather than replaying the old request.
+The reason and the combined resume comments are each capped at 8 KiB.
+
+The daemon also applies a deterministic waiting-loop guard after each run that
+ends in `waiting`:
+
+- An immediately repeated reason equivalent to the previous one stops the loop
+  on its first repeat. Comparison ignores the backend's waiting-comment prefix,
+  letter case, and whitespace differences. A confirmation comment does not make
+  an unchanged repeat productive; the agent must explain changed circumstances
+  in a different request.
+- A different human-only action is allowed. However, the second consecutive
+  resumed run that ends in `waiting` without any new human comment stops the
+  sequence even when the reasons were reformulated. A human comment before a
+  resumed run resets this reformulated-wait sequence.
+
+A triggered guard leaves the ticket in `waiting` and posts the usual pause note
+plus a `[waiting-loop-stop]` diagnostic with the ticket id, current and previous
+run ids, the repeated request, and recovery instructions. The pause note keeps
+the stopped wait resumable: after another **«Готово — продолжить»**, the next
+prompt still identifies that run, its waiting reason, and the new human comment.
+No new run is claimed until the human deliberately resumes or moves the ticket.
+To continue, verify the external state, add a comment with new facts, and click
+**«Готово — продолжить»** or use the normal manual transition.
+
+**Done does not mean review.** A legitimate pause and a stopped loop both stay
+in `waiting`. Only a normal, non-paused implement outcome moves the ticket to
+`review`; a supervised child becomes visible to its parent's supervisor at that
+point, not while it is waiting.
+
 ## Tests
 
 ```sh

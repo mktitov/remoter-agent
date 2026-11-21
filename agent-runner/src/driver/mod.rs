@@ -35,9 +35,9 @@ pub struct RunSpec {
     pub prompt: String,
     /// `plan` or `implement`.
     pub kind: &'static str,
-    /// The ACP session to resume (only bounce review → implement and re-plan
-    /// runs resume — the previous run's session of the same kind, spec §5.4);
-    /// `None` = fresh session.
+    /// The ACP session to resume (review → implement bounces, waiting →
+    /// implement resumes, and re-plans use the previous successful session of
+    /// the same kind, spec §5.4); `None` = fresh session.
     pub resume_session: Option<String>,
     /// Working branch (`agent/task-<id>-<slug>`) — for drivers that need it.
     pub branch: String,

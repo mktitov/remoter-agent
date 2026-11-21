@@ -254,9 +254,11 @@ pub async fn execute(rc: RunContext) {
 
     // Hybrid resume strategy (spec §5.4): resume only where the agent's
     // working memory is worth the most and the session is still young — a
-    // review → implement bounce resumes the succeeded implement run's session
-    // (the agent remembers what it wrote and why, and the human's correction
-    // lands in live context), and a re-plan resumes the succeeded plan run's
+    // review → implement bounce or a waiting → implement resume continues the
+    // succeeded implement run's session (the agent remembers what it wrote and
+    // why, and the human's correction or confirmation lands in live context;
+    // the latter also gets an explicit Human action confirmed prompt section),
+    // and a re-plan resumes the succeeded plan run's
     // session (a fresh, amnesiac session just reports the already-touched
     // worktree as "satisfied" and the human's correction never lands in the
     // plan). Plan → implement and any retry after a failure start fresh: the
@@ -445,7 +447,7 @@ pub async fn execute(rc: RunContext) {
                 // carry no commits), no push/PR, no empty-report nudge (there is
                 // no reviewer yet). Fail-open: a fetch hiccup degrades to the
                 // normal success path.
-                let waiting = matches!(rc.client.task_detail(task_id).await, Ok(d) if d.task_status == "waiting");
+                let mut waiting = matches!(rc.client.task_detail(task_id).await, Ok(d) if d.task_status == "waiting");
                 // Commit guard (spec §5.4 step 5): an implement run the agent
                 // left uncommitted is no success — pushing the empty branch
                 // makes the forge 422 the PR create ("No commits between base
@@ -580,6 +582,7 @@ pub async fn execute(rc: RunContext) {
                 body.session_id = outcome.session_id.clone();
                 body.input_tokens = outcome.input_tokens;
                 body.output_tokens = outcome.output_tokens;
+                waiting = waiting || ticket_is_waiting(&rc).await;
 
                 // Final read-only action check: if actions are still not final,
                 // move to review anyway but note the remaining items on the thread.
@@ -813,7 +816,15 @@ async fn attempt_run(
     result
 }
 
-/// Runs the driver, then ensures the worktree is clean (spec §5.4 step 5).
+/// Waiting is a terminal state for the current agent turn: once the ticket is
+/// paused, no cleanup/finalization nudge may resume the agent automatically.
+/// A detail-fetch failure stays fail-open and preserves the normal gates.
+async fn ticket_is_waiting(rc: &RunContext) -> bool {
+    matches!(rc.client.task_detail(rc.task.id).await, Ok(d) if d.task_status == "waiting")
+}
+
+/// Runs the driver, then ensures the worktree is clean unless the agent paused
+/// the ticket for a human-only step (spec §5.4 step 5).
 async fn run_with_dirty_nudges(
     rc: &RunContext,
     run_id: i32,
@@ -823,6 +834,9 @@ async fn run_with_dirty_nudges(
     logger: &SessionLogger,
 ) -> Result<RunOutcome, RunFailure> {
     let outcome = rc.driver.run(spec).await?;
+    if ticket_is_waiting(rc).await {
+        return Ok(outcome);
+    }
     ensure_clean_worktree(rc, run_id, outcome, branch, dir, logger).await
 }
 
@@ -882,6 +896,9 @@ async fn ensure_clean_worktree(
         }
         merged.input_tokens = sum_tokens(merged.input_tokens, nudge_outcome.input_tokens);
         merged.output_tokens = sum_tokens(merged.output_tokens, nudge_outcome.output_tokens);
+        if ticket_is_waiting(rc).await {
+            return Ok(merged);
+        }
 
         match workspace::dirty_status(dir).await {
             Ok(s) if s.is_empty() => return Ok(merged),
@@ -989,6 +1006,9 @@ async fn ensure_final_actions(
             }
         };
 
+        if detail.task_status == "waiting" {
+            return Ok(merged);
+        }
         let pending: Vec<&crate::client::ActionItem> =
             detail.actions.iter().filter(|a| !is_action_final(&a.status)).collect();
 
@@ -1018,6 +1038,9 @@ async fn ensure_final_actions(
         }
         merged.input_tokens = sum_tokens(merged.input_tokens, nudge_outcome.input_tokens);
         merged.output_tokens = sum_tokens(merged.output_tokens, nudge_outcome.output_tokens);
+        if ticket_is_waiting(rc).await {
+            return Ok(merged);
+        }
     }
 
     // After action nudges, re-run the full dirty-worktree check + nudges: the
@@ -1283,14 +1306,55 @@ async fn rollback(rc: &RunContext) {
 /// successful run's targets) with an explanatory thread note, and a human
 /// bounces it back (`review → implement`) once the cause is fixed. A conflict
 /// or forbidden means a human already moved the ticket — leave it there.
-/// The tail of a successful claim-loop run: write the success status, then
-/// either note the pause when the agent moved the ticket to `waiting` mid-run
-/// (`request_human_action`, spec remoter-agent.md §4.3 — the status write
-/// soft-skips, and the empty-report nudge is skipped: there is no reviewer
-/// while the ticket waits) or, for implement runs, nudge about a missing
-/// report.
+/// The tail of a successful claim-loop run. A paused run stays in `waiting`
+/// without attempting an invalid status transition and always gets a pause
+/// note for the next resume; a no-input waiting loop also gets a diagnostic.
+/// Every other run writes its success status, then an implement run gets a
+/// report reminder.
 async fn finalize_success(rc: &RunContext, run_id: i32, waiting: bool) {
     let task_id = rc.task.id;
+    if waiting {
+        let loop_stop = match rc.client.task_detail(task_id).await {
+            Ok(detail) => waiting_loop_stop(&detail, run_id),
+            Err(e) => {
+                tracing::warn!(task_id, run_id, error = %e, "waiting-loop check failed; recording a normal pause");
+                None
+            }
+        };
+        if let Some((previous_run_id, reason)) = loop_stop {
+            note(
+                &rc.client,
+                task_id,
+                format!("run #{run_id} paused: waiting for human action"),
+            )
+            .await;
+            let reason = truncate_with_marker(&reason, MAX_ERROR_BYTES);
+            note(
+                &rc.client,
+                task_id,
+                format!(
+                    "⚠️ [waiting-loop-stop] Автоматическая работа над тикетом #{task_id} остановлена: \
+                     implement run #{run_id} снова перевёл тикет в `waiting` после подтверждения предыдущего \
+                     ожидания (run #{previous_run_id}): запрос повторился без изменений либо исчерпана серия \
+                     resumed-ожиданий без нового комментария человека. Повторный запрос: {reason}\n\n\
+                     Тикет оставлен в `waiting`; автоматический переход в `review` не выполнялся. Проверьте \
+                     внешнее состояние и добавьте комментарий с новыми фактами, затем нажмите \
+                     **«Готово — продолжить»** или выполните штатный ручной переход для возобновления работы."
+                ),
+            )
+            .await;
+            tracing::warn!(task_id, run_id, previous_run_id, "stopped a no-input waiting loop");
+        } else {
+            note(
+                &rc.client,
+                task_id,
+                format!("run #{run_id} paused: waiting for human action"),
+            )
+            .await;
+            tracing::info!(task_id, run_id, "run succeeded; ticket waits for a human action");
+        }
+        return;
+    }
     match rc.client.set_task_status(task_id, rc.kind.success_status()).await {
         Ok(()) => {
             note(
@@ -1319,16 +1383,6 @@ async fn finalize_success(rc: &RunContext, run_id: i32, waiting: bool) {
             )
         }
         Err(e) => tracing::error!(task_id, error = %e, "run succeeded but status transition failed"),
-    }
-    if waiting {
-        note(
-            &rc.client,
-            task_id,
-            format!("run #{run_id} paused: waiting for human action"),
-        )
-        .await;
-        tracing::info!(task_id, run_id, "run succeeded; ticket waits for a human action");
-        return;
     }
     // Report reminder (ticket decision: the agent writes the
     // report text itself — no auto-copy of the summary — but an
@@ -1508,6 +1562,141 @@ fn attachments_section(base_url: &str, attachments: &[AttachmentDto]) -> String 
          screenshots or other artifacts. You cannot delete attachments.\n\n",
     );
     s
+}
+
+const WAITING_REASON_PREFIX: &str = "⏳ Ожидание действия человека:";
+const PAUSED_RUN_SUFFIX: &str = " paused: waiting for human action";
+const MAX_WAITING_RESUME_BYTES: usize = 8 * 1024;
+const MAX_NO_INPUT_RESUMED_WAITS: usize = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WaitingResume {
+    previous_run_id: i32,
+    reason: String,
+    human_comment: Option<String>,
+    prior_no_input_waits: usize,
+}
+
+fn paused_run_id(body: &str) -> Option<i32> {
+    body.strip_prefix("run #")?
+        .strip_suffix(PAUSED_RUN_SUFFIX)?
+        .parse()
+        .ok()
+}
+
+fn run_start_index(comments: &[crate::client::CommentDto], run_id: i32) -> Option<usize> {
+    let marker = format!("implement run #{run_id} started");
+    comments.iter().position(|c| c.body.starts_with(&marker))
+}
+
+fn waiting_resume_before_run(
+    runs: &[crate::client::AgentRunDto],
+    comments: &[crate::client::CommentDto],
+    current_run_id: i32,
+    agent_id: Option<i32>,
+) -> Option<WaitingResume> {
+    let current_position = runs.iter().position(|r| r.id == current_run_id)?;
+    let previous = runs[current_position + 1..]
+        .iter()
+        .find(|r| r.kind != crate::supervise::SUPERVISE_RUN_KIND)?;
+    if previous.kind != RunKind::Implement.as_str() || previous.status != "succeeded" {
+        return None;
+    }
+    let pause_index = comments
+        .iter()
+        .position(|c| paused_run_id(&c.body) == Some(previous.id))?;
+    let previous_start = run_start_index(comments, previous.id).unwrap_or(0);
+    let reason = comments[previous_start..pause_index]
+        .iter()
+        .rev()
+        .find_map(|c| c.body.strip_prefix(WAITING_REASON_PREFIX))?
+        .trim()
+        .to_string();
+    let current_start = run_start_index(comments, current_run_id).unwrap_or(comments.len());
+    if comments[pause_index + 1..current_start]
+        .iter()
+        .any(|c| c.body.contains(" run #") && c.body.contains(" started (attempt "))
+    {
+        return None;
+    }
+    let human_comment = agent_id.and_then(|agent_id| {
+        comments[pause_index + 1..current_start]
+            .iter()
+            .filter(|c| c.author_id != agent_id && !c.body.trim().is_empty())
+            .map(|c| c.body.trim().to_string())
+            .reduce(|mut all, body| {
+                all.push_str("\n\n");
+                all.push_str(&body);
+                all
+            })
+    });
+    Some(WaitingResume {
+        previous_run_id: previous.id,
+        reason,
+        human_comment,
+        prior_no_input_waits: 0,
+    })
+}
+
+fn waiting_resume_context(kind: RunKind, detail: &TaskDetail, current_run_id: i32) -> Option<WaitingResume> {
+    if kind != RunKind::Implement {
+        return None;
+    }
+    let runs = detail.runs.as_deref()?;
+    let comments = detail.comments.as_deref()?;
+    let mut resume = waiting_resume_before_run(runs, comments, current_run_id, detail.assignee_id)?;
+    let mut run_id = resume.previous_run_id;
+    while let Some(previous) = waiting_resume_before_run(runs, comments, run_id, detail.assignee_id) {
+        if previous.human_comment.is_some() {
+            break;
+        }
+        resume.prior_no_input_waits += 1;
+        run_id = previous.previous_run_id;
+    }
+    Some(resume)
+}
+
+fn normalize_waiting_reason(reason: &str) -> String {
+    reason
+        .strip_prefix(WAITING_REASON_PREFIX)
+        .unwrap_or(reason)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn waiting_loop_stop(detail: &TaskDetail, current_run_id: i32) -> Option<(i32, String)> {
+    let resume = waiting_resume_context(RunKind::Implement, detail, current_run_id)?;
+    let comments = detail.comments.as_deref()?;
+    let start = run_start_index(comments, current_run_id)?;
+    let reason = comments[start + 1..]
+        .iter()
+        .rev()
+        .find_map(|c| c.body.strip_prefix(WAITING_REASON_PREFIX))?
+        .trim();
+    let no_input_waits = resume.prior_no_input_waits + 1;
+    (normalize_waiting_reason(reason) == normalize_waiting_reason(&resume.reason)
+        || (resume.human_comment.is_none() && no_input_waits >= MAX_NO_INPUT_RESUMED_WAITS))
+        .then(|| (resume.previous_run_id, reason.to_string()))
+}
+
+fn waiting_resume_section(resume: &WaitingResume) -> String {
+    let reason = truncate_with_marker(&resume.reason, MAX_WAITING_RESUME_BYTES);
+    let comment = resume.human_comment.as_deref().map_or_else(
+        || "No comment was left when work was resumed.".to_string(),
+        |comment| truncate_with_marker(comment, MAX_WAITING_RESUME_BYTES),
+    );
+    format!(
+        "## Human action confirmed\nPrevious implement run #{} requested this human-only action:\n\n{}\n\n\
+         The human clicked **«Готово — продолжить»** and confirmed that the action was completed.\n\
+         Comment left when work was resumed:\n\n{}\n\n\
+         Treat this confirmation as new information: verify the external result, continue the remaining work, \
+         and do not repeat the previous request merely because it is present in the session history. A new \
+         `request_human_action` is appropriate only for a different action or when new facts justify it; explain \
+         those changed circumstances explicitly.\n\n",
+        resume.previous_run_id, reason, comment
+    )
 }
 
 /// Builds the prompt: the ticket context block (ticket, prior runs,
@@ -1810,6 +1999,9 @@ fn render_prompt(
             p.push_str(&format!("- {}\n", truncate_with_marker(&c.body, MAX_COMMENT_BYTES)));
         }
         p.push('\n');
+    }
+    if let Some(resume) = waiting_resume_context(kind, detail, current_run_id) {
+        p.push_str(&waiting_resume_section(&resume));
     }
     // Language policy (both run kinds): reasoning in English is cheaper
     // (Cyrillic tokenizes ~2-3x worse) and the strongest for the model, but
@@ -2313,6 +2505,9 @@ async fn rebase_nudge_loop(
                 }
             }
         };
+        if ticket_is_waiting(rc).await {
+            return;
+        }
 
         match workspace::dirty_status(wt).await {
             Ok(s) if !s.is_empty() => {
@@ -3027,6 +3222,133 @@ mod tests {
         assert!(s.contains("contentBase64"), "must mention contentBase64 fallback: {s}");
 
         assert!(attachments_section("http://api:8181", &[]).is_empty());
+    }
+
+    fn waiting_journal() -> (Vec<CommentDto>, Vec<AgentRunDto>) {
+        let comments = vec![
+            comment(1, "implement run #1 started (attempt 1)".into()),
+            comment(2, format!("{WAITING_REASON_PREFIX} Approve the deployment")),
+            comment(3, "run #1 paused: waiting for human action".into()),
+            comment(4, "implement run #2 started (attempt 1)".into()),
+            comment(5, format!("{WAITING_REASON_PREFIX} Configure DNS")),
+            comment(6, "run #2 paused: waiting for human action".into()),
+            comment(7, "implement run #3 started (attempt 1)".into()),
+            comment(8, format!("{WAITING_REASON_PREFIX} A different request")),
+        ];
+        let runs = vec![
+            run_row(3, "implement", "running", None, None),
+            run_row(2, "implement", "succeeded", Some("session-2".into()), None),
+            run_row(1, "implement", "succeeded", Some("session-1".into()), None),
+        ];
+        (comments, runs)
+    }
+
+    #[test]
+    fn resumed_prompt_carries_confirmed_action_and_human_comment() {
+        let (mut comments, runs) = waiting_journal();
+        comments.insert(
+            3,
+            CommentDto {
+                id: 30,
+                author_id: 2,
+                ..comment(30, "Deployment approved; continue.".into())
+            },
+        );
+        comments[4].body = "implement run #2 started (attempt 1)".into();
+        comments.retain(|c| c.id != 5 && c.id != 6 && c.id != 8);
+        let mut d = detail(comments, runs);
+        d.assignee_id = Some(1);
+
+        let p = render_prompt(RunKind::Implement, &d, None, 2, "http://api", &[], "");
+
+        assert!(p.contains("## Human action confirmed"), "{p}");
+        assert!(p.contains("Previous implement run #1"), "{p}");
+        assert!(p.contains("Approve the deployment"), "{p}");
+        assert!(p.contains("«Готово — продолжить»"), "{p}");
+        assert!(p.contains("Deployment approved; continue."), "{p}");
+        assert!(p.contains("do not repeat the previous request"), "{p}");
+    }
+
+    #[test]
+    fn waiting_loop_stops_same_reason_or_second_no_input_resume() {
+        let (comments, runs) = waiting_journal();
+        let mut d = detail(comments, runs);
+        d.assignee_id = Some(1);
+
+        let stop = waiting_loop_stop(&d, 3).expect("second no-input resumed wait must stop");
+        assert_eq!(stop.0, 2);
+        assert_eq!(stop.1, "A different request");
+
+        let mut same = detail(
+            vec![
+                comment(1, "implement run #1 started (attempt 1)".into()),
+                comment(2, format!("{WAITING_REASON_PREFIX} Configure DNS")),
+                comment(3, "run #1 paused: waiting for human action".into()),
+                comment(4, "implement run #2 started (attempt 1)".into()),
+                comment(5, format!("{WAITING_REASON_PREFIX}   configure   dns ")),
+            ],
+            vec![
+                run_row(2, "implement", "running", None, None),
+                run_row(1, "implement", "succeeded", Some("session-1".into()), None),
+            ],
+        );
+        same.assignee_id = Some(1);
+        assert_eq!(waiting_loop_stop(&same, 2).map(|s| s.0), Some(1));
+    }
+
+    #[test]
+    fn different_first_resume_wait_is_legitimate_but_equivalent_repeat_stops() {
+        let comments = vec![
+            comment(1, "implement run #1 started (attempt 1)".into()),
+            comment(2, format!("{WAITING_REASON_PREFIX} Configure DNS")),
+            comment(3, "run #1 paused: waiting for human action".into()),
+            comment(4, "implement run #2 started (attempt 1)".into()),
+            comment(5, format!("{WAITING_REASON_PREFIX} Open the firewall")),
+        ];
+        let runs = vec![
+            run_row(2, "implement", "running", None, None),
+            run_row(1, "implement", "succeeded", Some("session-1".into()), None),
+        ];
+        let mut d = detail(comments, runs);
+        d.assignee_id = Some(1);
+        assert!(waiting_loop_stop(&d, 2).is_none(), "one different action remains legal");
+
+        d.comments.as_mut().unwrap()[4].body = format!("{WAITING_REASON_PREFIX} configure dns");
+        assert!(
+            waiting_loop_stop(&d, 2).is_some(),
+            "same reason stops on the first repeat"
+        );
+        d.comments.as_mut().unwrap().insert(
+            3,
+            CommentDto {
+                author_id: 2,
+                ..comment(30, "New facts from the human".into())
+            },
+        );
+        assert!(
+            waiting_loop_stop(&d, 2).is_some(),
+            "a confirmation comment does not permit an equivalent immediate repeat"
+        );
+    }
+
+    #[test]
+    fn waiting_reason_normalization_handles_prefix_case_and_whitespace() {
+        assert_eq!(
+            normalize_waiting_reason(&format!("{WAITING_REASON_PREFIX}  Approve\n THE   deployment")),
+            "approve the deployment"
+        );
+    }
+
+    #[test]
+    fn waiting_resume_section_bounds_reason_and_comment() {
+        let section = waiting_resume_section(&WaitingResume {
+            previous_run_id: 7,
+            reason: "r".repeat(MAX_WAITING_RESUME_BYTES * 2),
+            human_comment: Some("c".repeat(MAX_WAITING_RESUME_BYTES * 2)),
+            prior_no_input_waits: 0,
+        });
+        assert_eq!(section.matches("[truncated,").count(), 2, "{section}");
+        assert!(section.len() < MAX_WAITING_RESUME_BYTES * 2 + 2048, "{section}");
     }
 
     /// Hybrid resume strategy (spec §5.4): the newest run decides. A bounce
@@ -3780,16 +4102,16 @@ kind = "stub"
         std::fs::remove_dir_all(&base).unwrap();
     }
 
-    /// remoter#162: a run whose agent paused the ticket via
-    /// `request_human_action` finishes as a clean pause — the success status
-    /// write soft-skips (`waiting` is not agent-writable, so the PATCH 403s),
-    /// the thread gets the pause note, and the empty-report nudge is NOT
-    /// posted (there is no reviewer while the ticket waits).
+    /// remoter#162: a paused run makes no status write, gets a pause note,
+    /// and skips the empty-report nudge because there is no reviewer yet.
     #[tokio::test]
     async fn finalize_success_notes_pause_and_skips_report_nudge_when_waiting() {
         let (url, requests) = spawn_recording_backend(vec![
-            (403, r#"{"error":"forbidden"}"#), // PATCH /tasks/42/status
-            (200, r#"{"id":1}"#),              // POST /tasks/42/comments
+            (
+                200,
+                r#"{"id":42,"projectId":1,"projectName":"proj","featureId":1,"featureDescription":"feat","title":"t","description":"d","taskStatus":"waiting","assigneeId":null,"assigneeName":null,"comments":[]}"#,
+            ),
+            (200, r#"{"id":1}"#), // POST /tasks/42/comments
         ])
         .await;
         let rc = test_run_context(&url);
@@ -3798,7 +4120,7 @@ kind = "stub"
 
         let reqs = requests.lock().await;
         assert_eq!(reqs.len(), 2, "{reqs:?}");
-        assert!(reqs[0].starts_with("PATCH /api/v1/tasks/42/status"), "{reqs:?}");
+        assert!(reqs[0].starts_with("GET /api/v1/tasks/42"), "{reqs:?}");
         assert!(reqs[1].starts_with("POST /api/v1/tasks/42/comments"), "{reqs:?}");
         assert!(reqs[1].contains("run #99 paused: waiting for human action"), "{reqs:?}");
     }
