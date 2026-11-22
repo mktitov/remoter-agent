@@ -157,9 +157,11 @@ spawn error; the daemon does not silently select another agent.
 While a ticket is in `plan_review` or `review`, the daemon polls the backend's
 agent-question FIFO and runs one question at a time per ticket within the usual
 global/per-project concurrency limits. If `initialize` advertises
-`sessionCapabilities.fork`, the first answer uses `session/fork` on the selected
-plan/implement session. A follow-up forks the latest successful Q&A session and
-the new fork ID is stored on the question-run. The driver never substitutes a
+`sessionCapabilities.fork`, the first answer for each backend-selected
+plan/implement source run uses `session/fork` on that run's session. A follow-up
+forks the latest successful Q&A session with the same `sourceRunId`; Q&A sessions
+are not carried across source runs after implementation or re-planning. The new
+fork ID is stored on the question-run. The driver never substitutes a
 source-session resume for a fork.
 
 If fork or a source session is unavailable, or the `session/fork` request fails,
@@ -167,14 +169,28 @@ a fresh read-only session receives a bounded fallback prompt: the original run
 prompt/log, current plan/diff/report, and previous Q&A. A fork that returns the
 source session ID remains an error. Question turns use the selected host,
 container, or bwrap runtime without falling back to another execution mode. They
-use the `dev-agent-question` MCP role, deny all permission requests, and compare
-the commit and symbolic HEAD plus tracked, untracked, and ignored worktree state
-before and after. Any unexpected change, including a branch switch at the same
-commit, fails the answer. Terminal run updates retry transient backend failures.
-Every poll also reconciles server-side `running` questions that have no matching
-live local task by reading each review ticket's question history and run rows,
-so a committed start, restart, or aborted run is still closed after transient
-run-history or terminal-update failures. If cancellation or a
+use the `dev-agent-question` MCP role and deny all permission requests. Before
+starting the agent, the daemon snapshots the commit, symbolic HEAD, local branch
+refs, staged and unstaged tracked changes, and byte-for-byte untracked and
+ignored file contents (the rollback backup lives outside the worktree). After
+the driver exits, any unexpected change fails the answer and is rolled back
+before the terminal run update. The same guard runs after cancellation and
+cooperative daemon-shutdown cancellation, and restores the original branch and
+pre-existing dirty/index state rather than merely cleaning to `HEAD`. A rollback
+failure fails the question with both the rollback diagnostic and the original
+agent result. Terminal run updates retry transient backend failures.
+Every poll reads each review ticket's question history and run rows, but reconciles
+only server-side `running` questions owned by this daemon. Ownership is persisted
+under `<workspace_root>/question-ownership`: a start-attempt marker is written
+before the atomic start request, and the concrete run ID is persisted immediately
+after a successful start response is decoded, before any fallible history lookup.
+An unresolved marker alone is not ownership: after an ambiguous transport/5xx
+failure without a run ID, the daemon leaves every visible running run untouched.
+The record survives restart and is removed after a confirmed terminal update or a
+lost claim. Thus a committed start with a confirmed run ID, restart, or aborted run
+is still closed after transient run-history or terminal-update failures, while
+another daemon with the same agent identity never closes an active run it does not
+own. If cancellation or a
 timeout happens before the driver returns a
 fork ID, the terminal run omits `sessionId` instead of recording the source
 session. Q&A never performs status transitions, workflow comments, outcome/report

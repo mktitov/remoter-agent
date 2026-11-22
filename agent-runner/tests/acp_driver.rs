@@ -791,6 +791,127 @@ async fn dropped_run_future_kills_the_agent_process() {
 }
 
 #[tokio::test]
+async fn container_question_uses_question_role_and_rolls_back_recording_writes_and_commit() {
+    use remoter_agent::question::WorktreeSnapshot;
+    use remoter_agent::workspace::{ContainerExec, ExecEnv};
+
+    let dir = std::env::temp_dir().join(format!("remoter-acp-test-{}-container-question", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("tracked.txt"), "before\n").unwrap();
+    std::fs::write(dir.join(".gitignore"), ".cache/\n").unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["add", "tracked.txt", ".gitignore"],
+        vec![
+            "-c",
+            "user.email=test@remoter",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-qm",
+            "initial",
+        ],
+    ] {
+        let status = std::process::Command::new("git")
+            .current_dir(&dir)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    let python = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|path| path.join("python3"))
+        .find(|path| path.is_file())
+        .expect("python3 on PATH");
+    let docker = dir.join("recording-docker.py");
+    std::fs::write(
+        &docker,
+        format!(
+            r#"#!{}
+import os
+import sys
+
+host_python = sys.executable
+args = sys.argv[1:]
+assert args[0] == "exec"
+i = 1
+worktree = None
+while args[i] != "env":
+    if args[i] == "-w":
+        worktree = args[i + 1]
+        i += 2
+    elif args[i] == "-e":
+        key, value = args[i + 1].split("=", 1)
+        os.environ[key] = value
+        i += 2
+    else:
+        i += 1
+i += 1
+if args[i] == "-u":
+    i += 2
+assert worktree == "/work"
+os.chdir(os.environ["FAKE_DOCKER_WORKTREE"])
+if args[i] == "python3":
+    args[i] = host_python
+os.execvpe(args[i], args[i:], os.environ)
+"#,
+            python.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&docker).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&docker, permissions).unwrap();
+    }
+
+    let capture = dir.join("capture.jsonl");
+    let env = vec![
+        ("FAKE_AGENT_CAPTURE".to_string(), capture.to_string_lossy().to_string()),
+        ("FAKE_AGENT_MUTATE_WORKTREE".to_string(), "1".to_string()),
+        ("FAKE_DOCKER_WORKTREE".to_string(), dir.to_string_lossy().to_string()),
+    ];
+    let mut question = question_spec(&dir, "answer read-only", None, "fallback", env);
+    question.exec = ExecEnv::Container(ContainerExec {
+        docker: docker.to_string_lossy().to_string(),
+        container: "recording-container".to_string(),
+        work_dir: PathBuf::from("/work"),
+        devenv: false,
+        sessions_dir: dir.join("sessions"),
+        api_url: "http://host.docker.internal:8181".to_string(),
+    });
+    let before = WorktreeSnapshot::capture(&dir).await.unwrap();
+
+    driver().run(question).await.expect("container question turn");
+
+    let events = read_capture(&capture);
+    let new = events.iter().find(|event| event.get("session_new").is_some()).unwrap();
+    assert_eq!(new["session_new"]["cwd"], "/work");
+    let remoter = new["session_new"]["mcpServers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|server| server["name"] == "remoter")
+        .unwrap();
+    assert_eq!(remoter["args"], serde_json::json!(["--role", "dev-agent-question"]));
+    assert!(events.iter().any(|event| event["worktree_mutated"] == true));
+    assert_ne!(before, WorktreeSnapshot::capture(&dir).await.unwrap());
+
+    before.restore(&dir).await.unwrap();
+
+    assert_eq!(before, WorktreeSnapshot::capture(&dir).await.unwrap());
+    assert_eq!(std::fs::read(dir.join("tracked.txt")).unwrap(), b"before\n");
+    assert!(!dir.join("untracked.txt").exists());
+    assert!(!dir.join(".cache/question.tmp").exists());
+    assert!(!capture.exists());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
 async fn question_fork_inherits_context_and_followup_forks_the_fork() {
     let dir = test_dir("question-fork");
     let capture = dir.join("capture.jsonl");
