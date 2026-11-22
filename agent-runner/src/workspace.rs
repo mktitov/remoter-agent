@@ -158,15 +158,10 @@ pub async fn prepare_with_stack(
     let wt = worktree_dir(root, project_id, task_id);
     let branch = branch_name(task_id, title);
 
+    git(&repo, &["fetch", "origin"]).await?;
     let start_point = match base_branch {
-        Some(b) => {
-            git(&repo, &["fetch", "origin", b]).await?;
-            format!("origin/{b}")
-        }
-        None => {
-            git(&repo, &["fetch", "origin"]).await?;
-            "origin/HEAD".to_string()
-        }
+        Some(b) => format!("origin/{b}"),
+        None => "origin/HEAD".to_string(),
     };
 
     let branch = if wt.exists() {
@@ -1670,6 +1665,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tip, upstream);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn prepare_with_base_fetches_new_remote_branches() {
+        let base = scratch("fetch-new-branches");
+        let origin = make_bare_repo(&base, "origin");
+        let src = base.join("origin-src");
+        sh(&src, "git", &["checkout", "-b", "main"]);
+        sh(&src, "git", &["push", &origin.to_string_lossy(), "main"]);
+
+        let ws = base.join("ws");
+        prepare(&ws, 7, 41, "initial work", &origin.to_string_lossy(), Some("main"))
+            .await
+            .unwrap();
+
+        sh(&src, "git", &["checkout", "-b", "agent/feature-source"]);
+        std::fs::write(src.join("feature.txt"), "feature work\n").unwrap();
+        sh(&src, "git", &["add", "."]);
+        sh(
+            &src,
+            "git",
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "feature work",
+            ],
+        );
+        sh(
+            &src,
+            "git",
+            &["push", &origin.to_string_lossy(), "agent/feature-source"],
+        );
+        let feature_tip = git_output(&src, &["rev-parse", "HEAD"]).await.unwrap();
+
+        let prepared = prepare(&ws, 7, 42, "dependent work", &origin.to_string_lossy(), Some("main"))
+            .await
+            .unwrap();
+        let fetched_tip = git_output(&prepared.dir, &["rev-parse", "origin/agent/feature-source"])
+            .await
+            .unwrap();
+        assert_eq!(fetched_tip, feature_tip);
+        git(&prepared.dir, &["cat-file", "-e", &format!("{feature_tip}^{{commit}}")])
+            .await
+            .unwrap();
 
         let _ = std::fs::remove_dir_all(&base);
     }
