@@ -93,6 +93,43 @@ kind = "kimi-acp"    # dry-run = "stub"; real ACP agents = "kimi-acp" or "openco
 # sessions_dir = "~/.local/share/remoter-agent/agent-home/.kimi-code/sessions"
 #                                      # optional override; default is <agent_home>/.kimi-code/sessions
 
+# Agent Doctor is disabled by default. When enabled, all four daily budgets are
+# required (there are no numeric defaults); an explicit zero disables that stage.
+# The two model aliases must exist in driver.kimi_config. Token usage is input +
+# output, tracked independently for triage, analysis and remediation. Missing
+# usage telemetry charges the corresponding conservative per-call estimate.
+# [doctor]
+# enabled = false
+# source_dir = "/opt/remoter-agent/src"       # always read-only
+# triage_model = "kimi-code/kimi-for-coding"
+# triage_thinking = "on"
+# analysis_model = "kimi-code/k3"
+# analysis_thinking = "max"
+# triage_daily_token_budget = 500000
+# analysis_daily_token_budget = 2000000
+# remediation_daily_token_budget = 1000000
+# daily_write_round_budget = 10
+# triage_unknown_usage_tokens = 32768
+# analysis_unknown_usage_tokens = 131072
+# remediation_unknown_usage_tokens = 131072
+# max_remediation_rounds = 5
+# max_pending_report_problems = 100
+# max_pending_log_signatures = 100
+# analysis_failure_threshold = 3
+# analysis_failure_window_secs = 600
+# analysis_circuit_cooldown_secs = 1800
+# flood_event_threshold = 200
+# flood_window_secs = 60
+# flood_cooldown_secs = 300
+# write_enabled = false                     # host write is always forbidden
+# allowed_write_roots = [
+#   "/var/lib/remoter-agent/workspace",
+#   "/var/lib/remoter-agent/doctor-scratch",
+# ]
+# container_image = "remoter-agent-doctor:local" # container mode only; no sidecars
+# State, queues, UTC counters and circuits are atomically persisted in
+# <workspace_root>/doctor-state.json. Write runs only in bwrap/container mode.
+
 # Per-run ACP logs (spec §7.1): structured JSONL files written by the daemon.
 # The backend streams them to humans over WebSocket; nothing is shipped to Postgres.
 [logs]

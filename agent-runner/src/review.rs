@@ -496,6 +496,7 @@ async fn run_attempt(
         config_options: rc.config.driver.config_options_for(REVIEW_RUN_KIND),
         logger: logger.clone(),
         phase_tx: None,
+        doctor: None,
     };
     let timeout = Duration::from_secs(rc.config.run_timeout_minutes * 60);
     let result = tokio::select! {

@@ -111,22 +111,26 @@ impl AgentDriver for AcpDriver {
             "review" => RunKind::Review,
             _ => RunKind::Implement,
         };
-        let mcp_servers = mcp::merged_mcp_servers(
-            &spec.cwd,
-            &self.remoter_mcp_command,
-            // Container mode: remoter-mcp runs inside the container, so the
-            // loopback API URL is rewritten to host.docker.internal.
-            match &spec.exec {
-                workspace::ExecEnv::Container(c) => &c.api_url,
-                workspace::ExecEnv::Bwrap(c) => &c.api_url,
-                workspace::ExecEnv::Host { .. } => &self.api_url,
-            },
-            &self.token,
-            self.workspace_id,
-            kind,
-            spec.task_id,
-            &spec.exec,
-        );
+        let mcp_servers = if spec.doctor.is_some() {
+            Vec::new()
+        } else {
+            mcp::merged_mcp_servers(
+                &spec.cwd,
+                &self.remoter_mcp_command,
+                // Container mode: remoter-mcp runs inside the container, so the
+                // loopback API URL is rewritten to host.docker.internal.
+                match &spec.exec {
+                    workspace::ExecEnv::Container(c) => &c.api_url,
+                    workspace::ExecEnv::Bwrap(c) => &c.api_url,
+                    workspace::ExecEnv::Host { .. } => &self.api_url,
+                },
+                &self.token,
+                self.workspace_id,
+                kind,
+                spec.task_id,
+                &spec.exec,
+            )
+        };
         let transport = ByteStreams::new(stdin, stdout);
 
         let updates = capture.clone();
@@ -163,6 +167,7 @@ impl AgentDriver for AcpDriver {
         let activity_for_notify = activity.clone();
         let activity_for_permission = activity.clone();
         let activity_for_elicitation = activity.clone();
+        let doctor_read_only = spec.doctor.is_some_and(|options| options.read_only);
 
         // Log the outgoing prompt before any session setup can fail.
         spec.logger.log_prompt(&spec.prompt);
@@ -181,6 +186,9 @@ impl AgentDriver for AcpDriver {
             .on_receive_request(
                 async move |request: RequestPermissionRequest, responder, _cx| {
                     activity_for_permission.store(now_secs(), Ordering::Relaxed);
+                    if doctor_read_only {
+                        return responder.respond(RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled));
+                    }
                     // Auto-approve every permission request (spec §5.5) — but only
                     // via an allow option. An agent that offers none gets the
                     // request cancelled; blindly picking the first option could
@@ -428,7 +436,8 @@ impl AgentDriver for AcpDriver {
                 // A remoter-mcp startup failure leaves the agent with no
                 // mcp__remoter__* tools for the whole session; surface that in
                 // the run log instead of degrading silently.
-                if kimi_usage_enabled
+                if spec.doctor.is_none()
+                    && kimi_usage_enabled
                     && let Some(dir) = sessions_dir_after.as_deref()
                     && kimi_usage::session_has_remoter_tools(dir, &sid) == Some(false)
                 {
@@ -719,6 +728,17 @@ fn spawn_agent(
 > {
     let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
     let mut cmd = workspace::wrap_command(&spec.cwd, &spec.exec, program, &args_ref, &spec.env);
+    if spec.doctor.is_some() && !matches!(&spec.exec, workspace::ExecEnv::Container(_)) {
+        for key in [
+            "REMOTER_AGENT_TOKEN",
+            "REMOTER_TOKEN",
+            "REMOTER_API_URL",
+            "SSH_AUTH_SOCK",
+            "DOCKER_HOST",
+        ] {
+            cmd.env_remove(key);
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

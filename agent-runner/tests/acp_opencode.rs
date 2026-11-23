@@ -26,6 +26,7 @@ fn spec(dir: PathBuf) -> RunSpec {
         config_options: vec![],
         logger: remoter_agent::session_log::SessionLogger::noop(),
         phase_tx: None,
+        doctor: None,
     }
 }
 

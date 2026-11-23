@@ -896,6 +896,7 @@ pub struct ContainerExec {
     /// The worktree uses devenv — wrap as `devenv shell -- …` *inside* the
     /// container (the image has the shell warmed, see `image.rs`).
     pub devenv: bool,
+    pub doctor: bool,
     /// Host-side kimi sessions directory (`<agent_home>/.kimi-code/sessions`)
     /// — where the wire files appear, since the container mounts the agent
     /// home at `/root`. Used by the token-usage fallback.
@@ -918,6 +919,13 @@ pub struct BwrapExec {
     pub retained_commands: Vec<String>,
     pub sessions_dir: PathBuf,
     pub api_url: String,
+    pub doctor: Option<DoctorBwrap>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DoctorBwrap {
+    pub writable_paths: Vec<PathBuf>,
+    pub read_only_paths: Vec<PathBuf>,
 }
 
 impl ExecEnv {
@@ -963,6 +971,11 @@ pub fn wrap_command(
             // Keep the legacy human token out of the agent process even when
             // it was baked into or inherited by the run container.
             cmd.arg("env").arg("-u").arg("REMOTER_TOKEN");
+            if c.doctor {
+                for key in ["REMOTER_AGENT_TOKEN", "REMOTER_API_URL", "SSH_AUTH_SOCK", "DOCKER_HOST"] {
+                    cmd.arg("-u").arg(key);
+                }
+            }
             if c.devenv {
                 cmd.arg("devenv")
                     .arg("shell")
@@ -992,6 +1005,15 @@ pub fn wrap_command(
                 .arg(if c.devenv { "1" } else { "0" });
             for command in &c.retained_commands {
                 cmd.arg("--retain").arg(command);
+            }
+            if let Some(doctor) = &c.doctor {
+                cmd.arg("--doctor");
+                for path in &doctor.writable_paths {
+                    cmd.arg("--rw-mount").arg(path);
+                }
+                for path in &doctor.read_only_paths {
+                    cmd.arg("--ro-mount").arg(path);
+                }
             }
             if c.devenv {
                 cmd.arg("--env").arg("DEVENV_NO_AI_AGENT=1");
@@ -2556,6 +2578,7 @@ mod tests {
             container: "remoter-run-7".to_string(),
             work_dir: PathBuf::from("/work"),
             devenv: true,
+            doctor: false,
             sessions_dir: PathBuf::from("/agent-home/.kimi-code/sessions"),
             api_url: "http://host.docker.internal:8181".to_string(),
         });
@@ -2598,6 +2621,7 @@ mod tests {
             container: "remoter-run-9".to_string(),
             work_dir: PathBuf::from("/work"),
             devenv: false,
+            doctor: false,
             sessions_dir: PathBuf::from("/agent-home/.kimi-code/sessions"),
             api_url: "http://host.docker.internal:8181".to_string(),
         });
@@ -2626,6 +2650,33 @@ mod tests {
     }
 
     #[test]
+    fn wrap_command_doctor_container_scrubs_environment_inside_container() {
+        let exec = ExecEnv::Container(ContainerExec {
+            docker: "docker".to_string(),
+            container: "remoter-doctor-1".to_string(),
+            work_dir: PathBuf::from("/work"),
+            devenv: false,
+            doctor: true,
+            sessions_dir: PathBuf::from("/agent-home/.kimi-code/sessions"),
+            api_url: "http://host.docker.internal:8181".to_string(),
+        });
+        let cmd = wrap_command(Path::new("/host/wt"), &exec, "kimi", &["acp"], &[]);
+        let args: Vec<_> = cmd.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        for key in [
+            "REMOTER_TOKEN",
+            "REMOTER_AGENT_TOKEN",
+            "REMOTER_API_URL",
+            "SSH_AUTH_SOCK",
+            "DOCKER_HOST",
+        ] {
+            assert!(
+                args.windows(2).any(|pair| pair == ["-u", key]),
+                "missing env -u {key}: {args:?}"
+            );
+        }
+    }
+
+    #[test]
     fn wrap_command_container_env_is_argv_not_shell() {
         // Values with spaces or shell metacharacters travel as single `-e`
         // argv elements — there is no `sh -c` anywhere in the invocation, so
@@ -2635,6 +2686,7 @@ mod tests {
             container: "remoter-run-3".to_string(),
             work_dir: PathBuf::from("/work"),
             devenv: true,
+            doctor: false,
             sessions_dir: PathBuf::from("/agent-home/.kimi-code/sessions"),
             api_url: "http://host.docker.internal:8181".to_string(),
         });
@@ -2661,6 +2713,7 @@ mod tests {
             retained_commands: vec!["/nix/store/remoter-mcp/bin/remoter-mcp".to_string()],
             sessions_dir: PathBuf::from("/state/agent-home/.kimi-code/sessions"),
             api_url: "http://10.0.2.2:8181".to_string(),
+            doctor: None,
         });
         let env = vec![
             ("REMOTER_AGENT_TASK_ID".to_string(), "249".to_string()),

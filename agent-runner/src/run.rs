@@ -106,6 +106,7 @@ pub struct RunContext {
     pub cancel: CancellationToken,
     /// Persistent JSONL store for this run's ACP log (spec §7.1).
     pub log_store: LogStore,
+    pub doctor: crate::doctor::DoctorHandle,
 }
 
 /// Ensures the per-run broadcast channel is closed when the attempt finishes,
@@ -144,6 +145,7 @@ async fn cancel_after_attempt(rc: &RunContext, task_id: i32, run_id: i32) -> boo
         .await;
         tracing::info!(task_id, run_id, "run cancelled");
         rollback(rc).await;
+        collect_doctor_report(rc, run_id).await;
         true
     } else {
         false
@@ -243,6 +245,9 @@ async fn supervised_parent(rc: &RunContext) -> Option<(SupervisedParent, TaskDet
 /// upward — a failed ticket must not kill the poll loop.
 pub async fn execute(rc: RunContext) {
     let task_id = rc.task.id;
+    let Some(_doctor_run_guard) = rc.doctor.acquire_run(task_id, rc.cancel.clone()).await else {
+        return;
+    };
     // A ticket renamed between runs keeps the branch its worktree was created
     // with — recomputing from the current title would name a branch that
     // doesn't exist locally, and the push at finish time would fail.
@@ -614,6 +619,7 @@ pub async fn execute(rc: RunContext) {
                 }
 
                 finish_reporting(&rc.client, run.id, &body).await;
+                collect_doctor_report(&rc, run.id).await;
                 finalize_success(&rc, run.id, waiting).await;
                 return;
             }
@@ -679,6 +685,7 @@ pub async fn execute(rc: RunContext) {
             }
             Ok(Err(failure)) => {
                 tracing::warn!(task_id, run_id = run.id, attempt, error = %failure.source, "run failed permanently");
+                rc.doctor.ingest_acp_error(task_id, run.id, &failure.source.to_string());
                 finish_failed(
                     &rc.client,
                     task_id,
@@ -694,6 +701,7 @@ pub async fn execute(rc: RunContext) {
             Err(_elapsed) => {
                 let reason = format!("timeout after {} minutes", rc.config.run_timeout_minutes);
                 tracing::warn!(task_id, run_id = run.id, attempt, "run timed out");
+                rc.doctor.ingest_acp_error(task_id, run.id, &reason);
                 finish_failed(&rc.client, task_id, run.id, reason.clone(), None, None).await;
                 escalate(&rc, run.id, &reason, attempt).await;
                 return;
@@ -798,6 +806,7 @@ async fn attempt_run(
         config_options: rc.config.driver.config_options_for(rc.kind.as_str()),
         logger: logger.clone(),
         phase_tx,
+        doctor: None,
     };
     let result = run_with_dirty_nudges(rc, run_id, spec, branch, &prepared.dir, logger).await;
 
@@ -888,6 +897,7 @@ async fn ensure_clean_worktree(
             config_options: config_options.clone(),
             logger: logger.clone(),
             phase_tx: None,
+            doctor: None,
         };
         let nudge_outcome = rc.driver.run(nudge_spec).await?;
         merged.session_id = nudge_outcome.session_id.clone().or(merged.session_id);
@@ -1030,6 +1040,7 @@ async fn ensure_final_actions(
             config_options: config_options.clone(),
             logger: logger.clone(),
             phase_tx: None,
+            doctor: None,
         };
         let nudge_outcome = rc.driver.run(nudge_spec).await?;
         merged.session_id = nudge_outcome.session_id.clone().or(merged.session_id);
@@ -1117,12 +1128,14 @@ pub(crate) fn exec_env(config: &Config, run_id: i32, devenv: bool) -> ExecEnv {
                 .collect(),
             sessions_dir: sessions_dir(config),
             api_url: crate::bwrap::api_url(&config.api_url),
+            doctor: None,
         }),
         ExecutionMode::Container => ExecEnv::Container(workspace::ContainerExec {
             docker: config.execution.docker_binary.clone(),
             container: container::run_container_name(run_id),
             work_dir: std::path::PathBuf::from(container::WORK_DIR),
             devenv,
+            doctor: false,
             sessions_dir: sessions_dir(config),
             api_url: container::container_api_url(&config.api_url),
         }),
@@ -1429,6 +1442,23 @@ async fn escalate(rc: &RunContext, run_id: i32, reason: &str, attempt: u32) {
             tracing::info!(task_id, run_id, "escalation skipped: ticket moved by a human")
         }
         Err(e) => tracing::warn!(task_id, run_id, error = %e, "escalation status transition failed"),
+    }
+    collect_doctor_report(rc, run_id).await;
+}
+
+async fn collect_doctor_report(rc: &RunContext, run_id: i32) {
+    if rc.kind != RunKind::Implement || !rc.config.doctor.enabled {
+        return;
+    }
+    match rc.client.task_detail(rc.task.id).await {
+        Ok(detail) => {
+            if let Some(report) = detail.report {
+                rc.doctor.ingest_report(&report, rc.task.id, run_id);
+            }
+        }
+        Err(error) => {
+            tracing::warn!(task_id = rc.task.id, run_id, %error, "could not read canonical report for Agent Doctor")
+        }
     }
 }
 
@@ -2088,7 +2118,10 @@ fn render_prompt(
                  instead. If you hit tooling or environment problems during the run (missing tools, \
                  network/TLS failures, permission errors, broken project checks), end the report with a \
                  short \"Problems with tools\" bullet list describing each problem in one line; omit the \
-                 section entirely if there were none.\n",
+                 section entirely if there were none. If unresolved problems remain for Agent Doctor, end the \
+                 report with exactly this final section: `## Problems for Agent Doctor`, then one bullet per \
+                 problem in the form `- **Short title** — description and reproducible signs`. Do not include \
+                 resolved or merely informational items; omit the section when there are no such problems.\n",
             );
         }
         // Supervise/review runs never render through this prompt builder —
@@ -2473,6 +2506,7 @@ async fn rebase_nudge_loop(
             config_options: rc.config.driver.config_options_for(rc.kind.as_str()),
             logger: logger.clone(),
             phase_tx: None,
+            doctor: None,
         };
         let nudge_outcome = tokio::select! {
             biased;
@@ -3808,6 +3842,7 @@ kind = "stub"
             image_locks: crate::image::ImageLocks::default(),
             cancel: CancellationToken::new(),
             log_store,
+            doctor: crate::doctor::DoctorHandle::disabled(),
         }
     }
 

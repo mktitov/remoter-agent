@@ -315,6 +315,7 @@ mod tests {
             retained_commands: Vec::new(),
             sessions_dir: Path::new("/agent-home/.kimi-code/sessions").to_path_buf(),
             api_url: "http://10.0.2.2:8181".to_string(),
+            doctor: None,
         });
         let servers = merged_mcp_servers(
             &dir,

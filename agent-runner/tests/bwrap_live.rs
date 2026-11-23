@@ -65,6 +65,9 @@ impl TestDir {
             devenv,
             retain: Vec::new(),
             env: run_env(249),
+            doctor: false,
+            writable_paths: Vec::new(),
+            read_only_paths: Vec::new(),
         }
     }
 }
@@ -82,6 +85,9 @@ struct LaunchSpec {
     devenv: bool,
     retain: Vec<String>,
     env: Vec<(String, String)>,
+    doctor: bool,
+    writable_paths: Vec<PathBuf>,
+    read_only_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -722,6 +728,63 @@ fn project_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
 }
 
+#[test]
+#[ignore = "real NixOS Doctor sandbox integration — run manually"]
+fn doctor_sandbox_has_scoped_writes_and_no_credentials() {
+    let Some(tools) = prerequisites("doctor_sandbox_has_scoped_writes_and_no_credentials") else {
+        return;
+    };
+    let dir = TestDir::new("doctor-sandbox");
+    let mut spec = dir.launch_spec("run", false);
+    let approved = dir.path.join("approved");
+    fs::create_dir_all(&approved).unwrap();
+    let secret = dir.path.join("host-secret");
+    fs::write(&secret, "must not be visible").unwrap();
+    spec.doctor = true;
+    spec.writable_paths = vec![approved.clone()];
+    spec.env.extend([
+        ("REMOTER_AGENT_TOKEN".to_string(), "must-not-leak".to_string()),
+        ("SSH_AUTH_SOCK".to_string(), "/tmp/must-not-leak".to_string()),
+        ("DOCKER_HOST".to_string(), "unix:///var/run/docker.sock".to_string()),
+    ]);
+    let script = r#"
+set -eu
+worktree=$1
+approved=$2
+secret=$3
+printf 'approved-write\n' > "$approved/result"
+if printf 'forbidden\n' > "$worktree/forbidden" 2>/dev/null; then
+    echo 'Doctor source was writable' >&2
+    exit 1
+fi
+test ! -e "$secret"
+test ! -S /var/run/docker.sock
+test -z "${REMOTER_AGENT_TOKEN:-}${REMOTER_API_URL:-}${SSH_AUTH_SOCK:-}${DOCKER_HOST:-}"
+"#;
+    let output = run_launch(
+        &tools,
+        &spec,
+        "/bin/sh",
+        vec![
+            "-c".to_string(),
+            script.to_string(),
+            "doctor-test".to_string(),
+            spec.worktree.to_string_lossy().into_owned(),
+            approved.to_string_lossy().into_owned(),
+            secret.to_string_lossy().into_owned(),
+        ],
+        "doctor-sandbox",
+    )
+    .wait();
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        output.stdout,
+        output.stderr
+    );
+    assert_eq!(fs::read_to_string(approved.join("result")).unwrap(), "approved-write\n");
+}
+
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_string()).collect()
 }
@@ -744,6 +807,15 @@ fn launcher_command(tools: &Tools, spec: &LaunchSpec, program: &str, args: Vec<S
         .arg(if spec.devenv { "1" } else { "0" });
     for program in &spec.retain {
         command.arg("--retain").arg(program);
+    }
+    if spec.doctor {
+        command.arg("--doctor");
+        for path in &spec.writable_paths {
+            command.arg("--rw-mount").arg(path);
+        }
+        for path in &spec.read_only_paths {
+            command.arg("--ro-mount").arg(path);
+        }
     }
     for (key, value) in &spec.env {
         command.arg("--env").arg(format!("{key}={value}"));

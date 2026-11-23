@@ -87,6 +87,7 @@ fn spec(
         config_options,
         logger: remoter_agent::session_log::SessionLogger::noop(),
         phase_tx: None,
+        doctor: None,
     }
 }
 
@@ -765,5 +766,116 @@ async fn dropped_run_future_kills_the_agent_process() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn doctor_read_only_turn_has_no_mcp_or_token_and_denies_permissions() {
+    let dir = test_dir("doctor-read-only");
+    let capture = dir.join("capture.jsonl");
+    let mut spec = spec(
+        &dir,
+        "doctor",
+        None,
+        vec![("FAKE_AGENT_CAPTURE".to_string(), capture.to_string_lossy().into_owned())],
+        vec![],
+    );
+    spec.doctor = Some(remoter_agent::driver::DoctorRunOptions { read_only: true });
+    driver().run(spec).await.unwrap();
+    let events = read_capture(&capture);
+    let new = events.iter().find(|event| event.get("session_new").is_some()).unwrap();
+    assert!(new["session_new"]["mcpServers"].as_array().unwrap().is_empty());
+    let permission = events.iter().find(|event| event.get("permission").is_some()).unwrap();
+    assert!(
+        permission["permission"].to_string().contains("cancelled"),
+        "{permission}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn fake_acp_remediation_corrects_commands_then_requires_approval_and_verifies() {
+    let dir = test_dir("doctor-remediation");
+    let capture = dir.join("capture.jsonl");
+    let mut remediation = spec(
+        &dir,
+        "doctor",
+        None,
+        vec![
+            ("FAKE_AGENT_CAPTURE".to_string(), capture.to_string_lossy().into_owned()),
+            ("FAKE_AGENT_RESUME_ANY".to_string(), "1".to_string()),
+            (
+                "FAKE_AGENT_RESPONSE".to_string(),
+                "command exited 1; corrected the command; verification passed".to_string(),
+            ),
+        ],
+        vec![],
+    );
+    remediation.doctor = Some(remoter_agent::driver::DoctorRunOptions { read_only: false });
+    let first = driver().run(remediation).await.unwrap();
+    assert_eq!(first.session_id.as_deref(), Some("sess-1"));
+    assert!(first.text.contains("corrected the command"));
+
+    let next_action = serde_json::json!({
+        "outcome":"needsAction",
+        "actions":[{
+            "key":"second-round","kind":"daemonOperation","title":"Second round",
+            "objective":"finish","proposedCommands":["verify"],
+            "expectedOutcome":"done","verificationPlan":"run checks","risk":"low",
+            "writablePaths":[],"timeoutSecs":60
+        }]
+    });
+    let mut approval = spec(
+        &dir,
+        "doctor",
+        first.session_id.clone(),
+        vec![
+            ("FAKE_AGENT_CAPTURE".to_string(), capture.to_string_lossy().into_owned()),
+            ("FAKE_AGENT_RESUME_ANY".to_string(), "1".to_string()),
+            ("FAKE_AGENT_RESPONSE".to_string(), next_action.to_string()),
+            ("FAKE_AGENT_SKIP_CALLBACKS".to_string(), "1".to_string()),
+        ],
+        vec![],
+    );
+    approval.doctor = Some(remoter_agent::driver::DoctorRunOptions { read_only: true });
+    let second = driver().run(approval).await.unwrap();
+    let parsed = remoter_agent::doctor::model::parse_analysis(&second.text).unwrap();
+    assert_eq!(
+        parsed.outcome,
+        remoter_agent::doctor::model::AnalysisOutcome::NeedsAction
+    );
+    assert_eq!(parsed.actions.len(), 1);
+
+    let resolved = serde_json::json!({
+        "outcome":"resolved",
+        "verificationEvidence":{"checks":["corrected command passed"]}
+    });
+    let mut verification = spec(
+        &dir,
+        "doctor",
+        second.session_id.clone(),
+        vec![
+            ("FAKE_AGENT_CAPTURE".to_string(), capture.to_string_lossy().into_owned()),
+            ("FAKE_AGENT_RESUME_ANY".to_string(), "1".to_string()),
+            ("FAKE_AGENT_RESPONSE".to_string(), resolved.to_string()),
+            ("FAKE_AGENT_SKIP_CALLBACKS".to_string(), "1".to_string()),
+        ],
+        vec![],
+    );
+    verification.doctor = Some(remoter_agent::driver::DoctorRunOptions { read_only: true });
+    let third = driver().run(verification).await.unwrap();
+    assert_eq!(
+        remoter_agent::doctor::model::parse_analysis(&third.text)
+            .unwrap()
+            .outcome,
+        remoter_agent::doctor::model::AnalysisOutcome::Resolved
+    );
+    let events = read_capture(&capture);
+    assert!(events.iter().any(|event| event["session_resume"] == "sess-1"));
+    assert!(events.iter().any(|event| {
+        event["response"]
+            .as_str()
+            .is_some_and(|text| text.contains("command exited 1"))
+    }));
     std::fs::remove_dir_all(&dir).ok();
 }

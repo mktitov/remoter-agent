@@ -483,13 +483,18 @@ async fn provision_minio(cfg: &ExecutionConfig, run_name: &str) -> Result<(), Dr
 /// Startup sweep (spec §5.7): `docker rm -f` every container labeled
 /// `remoter.run_id` — leftovers of a crashed daemon — and every image-init
 /// container (`remoter.image_init`, `image.rs`) orphaned by a dropped build
-/// future or daemon restart (such an orphan can still be *running*; its work
-/// is useless — nobody will commit its result). Best-effort, never fails the
-/// caller.
+/// future or daemon restart, and orphaned Doctor containers (all can still be
+/// running; their work is useless or unsafe after restart). Best-effort, never
+/// fails the caller.
 pub async fn sweep(cfg: &ExecutionConfig) {
     let docker = &cfg.docker_binary;
     sweep_labeled(docker, RUN_ID_LABEL, "run").await;
     sweep_labeled(docker, IMAGE_INIT_LABEL, "image-init").await;
+    sweep_doctor(docker).await;
+}
+
+pub async fn sweep_doctor(docker: &str) {
+    sweep_labeled(docker, "remoter.doctor=true", "Doctor").await;
 }
 
 async fn sweep_labeled(docker: &str, label: &str, kind: &str) {
@@ -515,6 +520,87 @@ async fn sweep_labeled(docker: &str, label: &str, kind: &str) {
         tracing::info!(container = %id, "startup sweep: removing orphaned {kind} container");
         docker_fire_and_forget(docker, &["rm", "-f", id]).await;
     }
+}
+
+pub struct DoctorContainerSpec<'a> {
+    pub docker: &'a str,
+    pub attempt_id: i32,
+    pub image: &'a str,
+    pub source_dir: &'a Path,
+    pub agent_home: &'a Path,
+    pub writable_paths: &'a [PathBuf],
+    pub read_only_paths: &'a [PathBuf],
+}
+
+pub struct DoctorContainer {
+    docker: String,
+    name: String,
+}
+
+impl DoctorContainer {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub async fn teardown(mut self) {
+        if !self.name.is_empty() {
+            docker_fire_and_forget(&self.docker, &["rm", "-f", &self.name]).await;
+            self.name.clear();
+        }
+    }
+}
+
+impl Drop for DoctorContainer {
+    fn drop(&mut self) {
+        if !self.name.is_empty() {
+            let _ = std::process::Command::new(&self.docker)
+                .args(["rm", "-f", &self.name])
+                .output();
+        }
+    }
+}
+
+pub async fn start_doctor(spec: DoctorContainerSpec<'_>) -> Result<DoctorContainer, DriverError> {
+    let name = format!("remoter-doctor-attempt-{}", spec.attempt_id);
+    let mut args = vec![
+        "run".to_string(),
+        "-d".to_string(),
+        "--name".to_string(),
+        name.clone(),
+        "--label".to_string(),
+        "remoter.doctor=true".to_string(),
+        "--cap-drop".to_string(),
+        "ALL".to_string(),
+        "--security-opt".to_string(),
+        "no-new-privileges".to_string(),
+        "-v".to_string(),
+        format!("{}:{WORK_DIR}:ro", spec.source_dir.display()),
+        "-v".to_string(),
+        format!("{}:{}:ro", spec.source_dir.display(), spec.source_dir.display()),
+        "-v".to_string(),
+        format!("{}:/root", spec.agent_home.display()),
+        "-w".to_string(),
+        WORK_DIR.to_string(),
+        "-e".to_string(),
+        "CI=1".to_string(),
+        "-e".to_string(),
+        "REMOTER_CONTAINER=1".to_string(),
+    ];
+    for path in spec.writable_paths {
+        args.extend(["-v".to_string(), format!("{}:{}", path.display(), path.display())]);
+    }
+    for path in spec.read_only_paths {
+        args.extend(["-v".to_string(), format!("{}:{}:ro", path.display(), path.display())]);
+    }
+    args.push(spec.image.to_string());
+    args.extend(["sleep".to_string(), "infinity".to_string()]);
+    docker(spec.docker, &args)
+        .await
+        .map_err(|error| error.context("Doctor container start"))?;
+    Ok(DoctorContainer {
+        docker: spec.docker.to_string(),
+        name,
+    })
 }
 
 /// `<docker> <args>` to success; stderr becomes a transient driver error.
@@ -671,9 +757,10 @@ mod tests {
             log.contains(&format!("ps -aq --filter label={IMAGE_INIT_LABEL}")),
             "{log}"
         );
-        // Both ids from both passes are force-removed.
-        assert_eq!(log.matches("rm -f aaa").count(), 2, "{log}");
-        assert_eq!(log.matches("rm -f bbb").count(), 2, "{log}");
+        assert!(log.contains("ps -aq --filter label=remoter.doctor=true"), "{log}");
+        // Both ids from all three passes are force-removed.
+        assert_eq!(log.matches("rm -f aaa").count(), 3, "{log}");
+        assert_eq!(log.matches("rm -f bbb").count(), 3, "{log}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -701,5 +788,52 @@ mod tests {
         assert_eq!(PROVISION_DATABASES, ["remoter", "remoter-test", "remoter_e2e"]);
         // devenv.nix `services.minio.buckets` (docs/specs/attachments.md).
         assert_eq!(PROVISION_BUCKET, "remoter-attachments");
+    }
+
+    #[tokio::test]
+    async fn doctor_container_mounts_source_ro_and_only_approved_paths_rw() {
+        let dir = std::env::temp_dir().join(format!("remoter-doctor-container-{}", std::process::id()));
+        let source = dir.join("source");
+        let home = dir.join("home");
+        let approved = dir.join("approved");
+        for path in [&source, &home, &approved] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let docker = dir.join("docker.sh");
+        crate::testutil::write_executable_script(
+            &docker,
+            &format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\nexit 0\n",
+                dir.join("docker.log").display()
+            ),
+        );
+        let container = start_doctor(DoctorContainerSpec {
+            docker: docker.to_str().unwrap(),
+            attempt_id: 17,
+            image: "doctor:test",
+            source_dir: &source,
+            agent_home: &home,
+            writable_paths: std::slice::from_ref(&approved),
+            read_only_paths: &[],
+        })
+        .await
+        .unwrap();
+        container.teardown().await;
+        let log = std::fs::read_to_string(dir.join("docker.log")).unwrap();
+        assert!(log.contains(&format!("{}:/work:ro", source.display())), "{log}");
+        assert!(
+            log.contains(&format!("{}:{}:ro", source.display(), source.display())),
+            "{log}"
+        );
+        assert!(
+            log.contains(&format!("{}:{}", approved.display(), approved.display())),
+            "{log}"
+        );
+        assert!(log.contains("--cap-drop ALL"), "{log}");
+        assert!(!log.contains("docker.sock"), "{log}");
+        assert!(!log.contains("REMOTER_AGENT_TOKEN"), "{log}");
+        assert!(!log.contains("SSH_AUTH_SOCK"), "{log}");
+        assert!(log.contains("rm -f remoter-doctor-attempt-17"), "{log}");
+        std::fs::remove_dir_all(dir).ok();
     }
 }

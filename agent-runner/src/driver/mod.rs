@@ -22,6 +22,11 @@ use async_trait::async_trait;
 use crate::config::DriverConfig;
 use crate::session_log::SessionLogger;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DoctorRunOptions {
+    pub read_only: bool,
+}
+
 /// Everything a driver needs for one attempt.
 #[derive(Debug, Clone)]
 pub struct RunSpec {
@@ -59,6 +64,9 @@ pub struct RunSpec {
     /// while it happens instead of after the attempt. `None` for nudge turns
     /// and drivers without live reporting.
     pub phase_tx: Option<tokio::sync::mpsc::UnboundedSender<DriverPhase>>,
+    /// Doctor sessions never receive repository MCP configuration or the daemon
+    /// token; read-only turns also deny every ACP permission request.
+    pub doctor: Option<DoctorRunOptions>,
 }
 
 /// Live phase signals from the driver to the run loop (#154).

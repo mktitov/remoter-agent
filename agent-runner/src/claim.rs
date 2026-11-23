@@ -59,6 +59,7 @@ pub struct Daemon {
     reviewer: Reviewer,
     /// Long-lived staging environments are independent from per-run containers.
     staging: crate::staging::StagingHandle,
+    doctor: crate::doctor::DoctorHandle,
 }
 
 impl Daemon {
@@ -75,7 +76,13 @@ impl Daemon {
             staging: crate::staging::StagingManager::handle(config.clone(), image_locks),
             supervisor: Supervisor::new(),
             reviewer: Reviewer::new(),
+            doctor: crate::doctor::DoctorHandle::disabled(),
         }
+    }
+
+    pub fn with_doctor(mut self, doctor: crate::doctor::DoctorHandle) -> Self {
+        self.doctor = doctor;
+        self
     }
 
     /// Startup token validation (spec §5.1): the token must belong to an agent
@@ -627,6 +634,7 @@ impl Daemon {
                 image_locks: self.image_locks.clone(),
                 cancel: cancel.clone(),
                 log_store: self.log_store.clone(),
+                doctor: self.doctor.clone(),
             };
             let task_id = rc.task.id;
             let project_id = rc.project.project_id;
