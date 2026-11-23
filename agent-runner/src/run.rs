@@ -1503,9 +1503,10 @@ const PLAN_INSTRUCTIONS: &str = "## Instructions\nYou are in PLAN-ONLY mode: exp
      ever run between sibling tickets.\n\n\
      If the ticket cannot proceed without a step only a human can perform (external permissions, \
      credentials, manual changes outside the worktree), call the `request_human_action` MCP tool with \
-     a precise, actionable description of that step and end your turn — the ticket waits in the \
-     `waiting` status until the human confirms, then the daemon resumes the work. Never pretend the \
-     human-only step is done.\n";
+     a precise, actionable `description` of that step. The `description` must be readable Markdown: for \
+     larger requests, include a short introduction and, when useful, headings, numbered steps, lists, \
+     and fenced code blocks for commands. End your turn — the ticket waits in the `waiting` status until \
+     the human confirms, then the daemon resumes the work. Never pretend the human-only step is done.\n";
 
 /// Cap for error text stored on the run row and posted to the thread — the
 /// full output stays in the daemon logs (spec §5.6).
@@ -2045,9 +2046,11 @@ fn render_prompt(
                  before your final message. End with a summary of changes.\n\n\
                  If the next step is one only a human can perform (external permissions, credentials, a \
                  manual environment change), call the `request_human_action` MCP tool with a precise, \
-                 actionable description of the required action and end your turn: the ticket moves to the \
-                 `waiting` status and the daemon resumes the work once the human confirms. Do NOT simulate \
-                 or skip the human-only step, and do NOT finish the run as if the work were complete.\n\n\
+                 actionable `description` of the required action. The `description` must be readable Markdown: \
+                 for larger requests, include a short introduction and, when useful, headings, numbered steps, \
+                 lists, and fenced code blocks for commands. End your turn: the ticket moves to the `waiting` \
+                 status and the daemon resumes the work once the human confirms. Do NOT simulate or skip the \
+                 human-only step, and do NOT finish the run as if the work were complete.\n\n\
                  Action choreography: use `start_action` when you begin work on an action, \
                  `complete_action` when it is done, and `reject_action` with a reason for any step that \
                  is no longer needed or incorrect. Only one action per task may be active at a time. By the \
@@ -2774,6 +2777,16 @@ mod tests {
             assert!(p.contains("`request_human_action`"), "{kind:?}: {p}");
             assert!(p.contains("only a human"), "{kind:?}: {p}");
             assert!(p.contains("`waiting`"), "{kind:?}: {p}");
+            assert!(p.contains("`description` must be readable Markdown"), "{kind:?}: {p}");
+            for expected in [
+                "short introduction",
+                "headings",
+                "numbered steps",
+                "lists",
+                "fenced code blocks for commands",
+            ] {
+                assert!(p.contains(expected), "{kind:?} missing `{expected}`: {p}");
+            }
         }
         let p = render_prompt(
             RunKind::Implement,
