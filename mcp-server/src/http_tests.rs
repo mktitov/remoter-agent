@@ -1067,6 +1067,7 @@ fn advertised_tool_schemas_document_markdown_and_plain_text_fields() {
         ("add_task_question", "body"),
         ("set_task_report", "report"),
         ("set_task_review", "markdown"),
+        ("request_human_action", "description"),
     ] {
         let desc = prop_desc(tool, prop);
         assert!(
@@ -1085,11 +1086,24 @@ fn advertised_tool_schemas_document_markdown_and_plain_text_fields() {
             "{tool}.{prop} must advertise plain-text-only, got: {desc}"
         );
     }
-    for name in ["create_task", "update_task"] {
+    for name in ["create_task", "update_task", "request_human_action"] {
         let desc = find_tool(name).description.as_deref().unwrap_or("");
         assert!(
             desc.to_lowercase().contains("markdown"),
             "{name} tool description must mention Markdown, got: {desc}"
+        );
+    }
+    let desc = find_tool("request_human_action").description.as_deref().unwrap_or("");
+    for expected in [
+        "short introduction",
+        "headings",
+        "numbered steps",
+        "lists",
+        "fenced code blocks for commands",
+    ] {
+        assert!(
+            desc.contains(expected),
+            "request_human_action tool description must mention `{expected}`, got: {desc}"
         );
     }
 }
@@ -1156,11 +1170,12 @@ async fn get_project_setup_guide_works_in_all_roles_without_backend() {
 }
 
 #[tokio::test]
-async fn request_human_action_posts_wait_with_reason() {
+async fn request_human_action_posts_multiline_markdown_to_wait_unchanged() {
+    let reason = "Create the public repository so CI can publish releases.\n\n## Steps\n\n1. Create the repository.\n2. Enable Actions.\n3. Verify the setup:\n\n```sh\ngit status\n```\n\n- Keep the default branch protected.";
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/v1/tasks/7/wait"))
-        .and(body_json(serde_json::json!({"reason": "Create the public repository"})))
+        .and(body_json(serde_json::json!({"reason": reason})))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": 7, "taskStatus": "waiting",
         })))
@@ -1170,8 +1185,7 @@ async fn request_human_action_posts_wait_with_reason() {
 
     let mcp = test_mcp(server.uri(), Role::DevAgentImplement, Some(70));
     let p: crate::tools::RequestHumanActionParams =
-        serde_json::from_value(serde_json::json!({"taskId": 7, "description": "Create the public repository"}))
-            .unwrap();
+        serde_json::from_value(serde_json::json!({"taskId": 7, "description": reason})).unwrap();
     let result = mcp.request_human_action(Parameters(p)).await.unwrap();
     assert!(result_text(result).contains("\"waiting\""));
 }

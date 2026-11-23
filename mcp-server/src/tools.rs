@@ -670,7 +670,7 @@ pub struct RequestHumanActionParams {
     pub task_id: Option<i32>,
     /// What the human must do to unblock the work — a concrete, actionable
     /// description of the manual step (becomes the ticket's waitingReason,
-    /// shown in the UI). Plain text, max 2000 characters.
+    /// shown in the UI). Markdown, max 2000 characters.
     pub description: String,
 }
 
@@ -1067,7 +1067,7 @@ impl RemoterMcp {
 
     #[tool(
         name = "request_human_action",
-        description = "Pause the ticket until a human performs a step only they can do (external permissions, credentials, manual environment changes): the task moves to the `waiting` status with your description shown to the human, and your current run ends. The daemon resumes the work automatically once the human confirms the action is done. taskId defaults to the current ticket in daemon mode. Do NOT use this for questions answerable in text (use add_task_question) or to delegate work to another agent."
+        description = "Pause the ticket until a human performs a step only they can do (external permissions, credentials, manual environment changes): the task moves to the `waiting` status with your description shown to the human, and your current run ends. The daemon resumes the work automatically once the human confirms the action is done. taskId defaults to the current ticket in daemon mode. Write description as readable Markdown: larger requests must start with a short introduction and, when useful, use headings, numbered steps, lists, and fenced code blocks for commands. Do NOT use this for questions answerable in text (use add_task_question) or to delegate work to another agent."
     )]
     async fn request_human_action(
         &self,
