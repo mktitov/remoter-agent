@@ -18,6 +18,8 @@ mod claim_waiting_tests;
 pub mod client;
 pub mod config;
 pub mod container;
+pub mod doctor;
+pub mod doctor_config;
 pub mod driver;
 pub mod events;
 pub mod forge;

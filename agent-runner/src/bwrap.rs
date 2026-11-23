@@ -53,6 +53,9 @@ struct LaunchOptions {
     state_root: PathBuf,
     worktree: PathBuf,
     devenv: bool,
+    doctor: bool,
+    rw_mounts: Vec<PathBuf>,
+    ro_mounts: Vec<PathBuf>,
     retain: Vec<String>,
     env: Vec<(String, String)>,
     command: Vec<String>,
@@ -436,6 +439,9 @@ fn parse_args(args: &[String]) -> anyhow::Result<LaunchOptions> {
     let mut state_root = None;
     let mut worktree = None;
     let mut devenv = None;
+    let mut doctor = false;
+    let mut rw_mounts = Vec::new();
+    let mut ro_mounts = Vec::new();
     let mut retain = Vec::new();
     let mut environment = Vec::new();
     let mut index = 0;
@@ -448,6 +454,22 @@ fn parse_args(args: &[String]) -> anyhow::Result<LaunchOptions> {
             break &args[index..];
         }
         let option = argument.as_str();
+        if option == "--doctor" {
+            doctor = true;
+            index += 1;
+            continue;
+        }
+        if matches!(option, "--rw-mount" | "--ro-mount") {
+            let path = PathBuf::from(option_value(args, index, option)?);
+            require_absolute(&path, "Doctor mount")?;
+            if option == "--rw-mount" {
+                rw_mounts.push(path);
+            } else {
+                ro_mounts.push(path);
+            }
+            index += 2;
+            continue;
+        }
         if option == "--retain" {
             retain.push(option_value(args, index, option)?.to_string());
             index += 2;
@@ -505,6 +527,9 @@ fn parse_args(args: &[String]) -> anyhow::Result<LaunchOptions> {
         state_root,
         worktree,
         devenv,
+        doctor,
+        rw_mounts,
+        ro_mounts,
         retain,
         env: environment,
         command: command.to_vec(),
@@ -520,6 +545,8 @@ fn option_value<'a>(args: &'a [String], index: usize, option: &str) -> anyhow::R
             | "--state-root"
             | "--worktree"
             | "--devenv"
+            | "--rw-mount"
+            | "--ro-mount"
             | "--retain"
             | "--env"
     ) {
@@ -557,6 +584,11 @@ fn prepare_launch_paths(options: &mut LaunchOptions) -> anyhow::Result<()> {
         .with_context(|| format!("create agent home {}", options.agent_home.display()))?;
     fs::create_dir_all(&options.state_root)
         .with_context(|| format!("create state root {}", options.state_root.display()))?;
+    for path in options.rw_mounts.iter().chain(&options.ro_mounts) {
+        if !path.exists() {
+            bail!("Doctor mount {} does not exist", path.display());
+        }
+    }
     Ok(())
 }
 
@@ -614,7 +646,14 @@ fn merge_supplied_env(base: Vec<(String, String)>, supplied: &[(String, String)]
 fn forbidden_env(key: &str) -> bool {
     matches!(
         key,
-        "REMOTER_TOKEN" | "REMOTER_CONTAINER" | "REMOTER_AGENT_PORT_BASE" | "DATABASE_URL"
+        "REMOTER_TOKEN"
+            | "REMOTER_AGENT_TOKEN"
+            | "REMOTER_API_URL"
+            | "SSH_AUTH_SOCK"
+            | "DOCKER_HOST"
+            | "REMOTER_CONTAINER"
+            | "REMOTER_AGENT_PORT_BASE"
+            | "DATABASE_URL"
     ) || key.ends_with("_DATABASE_URL")
 }
 
@@ -811,7 +850,7 @@ fn bwrap_arguments(
         Path::new(NIX_DAEMON_SOCKET),
         true,
     );
-    mounts.bind(&mut args, &options.worktree, &options.worktree, true);
+    mounts.bind(&mut args, &options.worktree, &options.worktree, !options.doctor);
     args.extend([
         "--symlink".to_string(),
         options.worktree.to_string_lossy().into_owned(),
@@ -836,7 +875,15 @@ fn bwrap_arguments(
     ] {
         mounts.bind(&mut args, &run_dir.join(name), Path::new(destination), false);
     }
-    add_git_mounts(options, &mut args, &mut mounts)?;
+    for path in &options.rw_mounts {
+        mounts.bind(&mut args, path, path, true);
+    }
+    for path in &options.ro_mounts {
+        mounts.bind(&mut args, path, path, false);
+    }
+    if !options.doctor {
+        add_git_mounts(options, &mut args, &mut mounts)?;
+    }
     append_path_mounts(
         &mut args,
         &mut mounts,

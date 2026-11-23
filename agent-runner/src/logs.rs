@@ -122,7 +122,15 @@ impl FieldVisitor {
 
 /// Batching consumer: POSTs accumulated lines to the backend. Runs until the
 /// queue closes (daemon shutdown), flushing the remainder.
-pub async fn run_shipper(mut rx: mpsc::Receiver<LogLine>, client: RemoterClient) {
+pub async fn run_shipper(rx: mpsc::Receiver<LogLine>, client: RemoterClient) {
+    run_shipper_with_doctor(rx, client, None).await;
+}
+
+pub async fn run_shipper_with_doctor(
+    mut rx: mpsc::Receiver<LogLine>,
+    client: RemoterClient,
+    doctor: Option<crate::doctor::DoctorHandle>,
+) {
     let mut buf: Vec<LogLine> = Vec::new();
     let mut tick = tokio::time::interval(FLUSH_INTERVAL);
     loop {
@@ -130,6 +138,9 @@ pub async fn run_shipper(mut rx: mpsc::Receiver<LogLine>, client: RemoterClient)
             line = rx.recv() => {
                 match line {
                     Some(l) => {
+                        if let Some(doctor) = &doctor {
+                            doctor.ingest_daemon_log(l.level, &l.message);
+                        }
                         buf.push(l);
                         if buf.len() >= FLUSH_BATCH {
                             flush(&client, &mut buf).await;

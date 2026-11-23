@@ -460,6 +460,170 @@ impl FinishRunBody {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticFinding {
+    #[serde(default)]
+    pub id: Option<i32>,
+    #[serde(default)]
+    pub fingerprint: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub resolution: Option<String>,
+    #[serde(default)]
+    pub source_excerpt: Option<String>,
+    #[serde(default)]
+    pub source_task_id: Option<i32>,
+    #[serde(default)]
+    pub source_run_id: Option<i32>,
+    #[serde(default)]
+    pub evidence: serde_json::Value,
+    #[serde(default)]
+    pub occurrences: u64,
+    #[serde(default)]
+    pub remediation_round: u32,
+    #[serde(default)]
+    pub analysis_pending: bool,
+    #[serde(default)]
+    pub analysis_error: Option<String>,
+    #[serde(default)]
+    pub actions: Vec<DiagnosticAction>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticAction {
+    #[serde(default)]
+    pub id: i32,
+    #[serde(default)]
+    pub finding_id: Option<i32>,
+    #[serde(default)]
+    pub action_key: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub round: u32,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+    #[serde(default, alias = "approvedWritablePaths")]
+    pub writable_paths: Vec<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub blocked_reason: Option<String>,
+    #[serde(default)]
+    pub current_attempt_id: Option<i32>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticAttempt {
+    #[serde(default)]
+    pub id: i32,
+    #[serde(default)]
+    pub action_id: i32,
+    #[serde(default)]
+    pub attempt: u32,
+    #[serde(default)]
+    pub claim_token: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimedDiagnosticAction {
+    pub action: DiagnosticAction,
+    pub attempt: DiagnosticAttempt,
+    #[serde(default)]
+    pub finding: Option<DiagnosticFinding>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DoctorControls {
+    #[serde(default)]
+    pub analysis_reset_generation: u64,
+    #[serde(default)]
+    pub write_reset_generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DoctorStatusUpdate {
+    pub day: chrono::NaiveDate,
+    pub triage_tokens_used: u64,
+    pub triage_daily_token_budget: u64,
+    pub analysis_tokens_used: u64,
+    pub analysis_daily_token_budget: u64,
+    pub remediation_tokens_used: u64,
+    pub remediation_daily_token_budget: u64,
+    pub write_rounds_used: u64,
+    pub daily_write_round_budget: u64,
+    pub pending_report_problems: usize,
+    pub pending_log_signatures: usize,
+    pub analysis_circuit: String,
+    pub write_circuit: String,
+    pub blocked_reason: Option<String>,
+    pub last_error: Option<String>,
+    pub cooldown_until: Option<chrono::DateTime<chrono::Utc>>,
+    pub analysis_reset_generation: u64,
+    pub write_reset_generation: u64,
+    pub heartbeat_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticAttemptProgress {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub transcript: Vec<serde_json::Value>,
+    pub truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticAttemptFinish {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub transcript: Vec<serde_json::Value>,
+    pub truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_evidence: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_error: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct RemoterClient {
     http: reqwest::Client,
@@ -691,6 +855,143 @@ impl RemoterClient {
     /// `GET /tasks/{id}/agent-runs` — run history, newest first.
     pub async fn list_runs(&self, task_id: i32) -> Result<Vec<AgentRunDto>, ClientError> {
         self.get(&format!("{}/api/v1/tasks/{task_id}/agent-runs", self.base_url))
+            .await
+    }
+
+    pub async fn create_diagnostic_task(&self, action: &DiagnosticAction) -> Result<i32, ClientError> {
+        let feature_id = action
+            .payload
+            .get("featureId")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| ClientError {
+                status: None,
+                message: "createTask payload has no featureId".to_string(),
+            })?;
+        let source_task_id = action
+            .payload
+            .get("sourceTaskId")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| ClientError {
+                status: None,
+                message: "createTask payload has no sourceTaskId".to_string(),
+            })?;
+        let resp = self
+            .auth_request(self.http.post(format!("{}/api/v1/tasks", self.base_url)))
+            .json(&serde_json::json!({
+                "featureId": feature_id,
+                "title": action.payload.get("title").and_then(serde_json::Value::as_str).unwrap_or("Agent Doctor bug"),
+                "description": action.payload.get("description").and_then(serde_json::Value::as_str).unwrap_or(""),
+                "taskKind": "bug"
+            }))
+            .send()
+            .await
+            .map_err(ClientError::transport)?;
+        let task: TaskDetail = Self::decode(resp).await?;
+        let resp = self
+            .auth_request(
+                self.http
+                    .post(format!("{}/api/v1/tasks/{source_task_id}/links", self.base_url)),
+            )
+            .json(&serde_json::json!({"otherTaskId": task.id, "relation": "relates"}))
+            .send()
+            .await
+            .map_err(ClientError::transport)?;
+        Self::decode_unit(resp).await?;
+        Ok(task.id)
+    }
+
+    pub async fn put_diagnostic_finding(
+        &self,
+        fingerprint: &str,
+        body: &serde_json::Value,
+    ) -> Result<DiagnosticFinding, ClientError> {
+        let resp = self
+            .auth_request(self.http.put(format!(
+                "{}/api/v1/agent/diagnostic-findings/{fingerprint}",
+                self.base_url
+            )))
+            .json(body)
+            .send()
+            .await
+            .map_err(ClientError::transport)?;
+        Self::decode(resp).await
+    }
+
+    pub async fn diagnostic_finding(&self, fingerprint: &str) -> Result<DiagnosticFinding, ClientError> {
+        self.get(&format!(
+            "{}/api/v1/agent/diagnostic-findings/{fingerprint}",
+            self.base_url
+        ))
+        .await
+    }
+
+    pub async fn pending_diagnostic_findings(&self) -> Result<Vec<DiagnosticFinding>, ClientError> {
+        self.get(&format!(
+            "{}/api/v1/agent/diagnostic-findings?analysisPending=true",
+            self.base_url
+        ))
+        .await
+    }
+
+    pub async fn claim_diagnostic_action(&self) -> Result<Option<ClaimedDiagnosticAction>, ClientError> {
+        let resp = self
+            .auth_request(
+                self.http
+                    .post(format!("{}/api/v1/agent/diagnostic-actions/claim-next", self.base_url)),
+            )
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(ClientError::transport)?;
+        Self::decode(resp).await
+    }
+
+    pub async fn diagnostic_attempt_progress(
+        &self,
+        attempt_id: i32,
+        body: &DiagnosticAttemptProgress,
+    ) -> Result<(), ClientError> {
+        let resp = self
+            .auth_request(self.http.post(format!(
+                "{}/api/v1/agent/diagnostic-attempts/{attempt_id}/progress",
+                self.base_url
+            )))
+            .json(body)
+            .send()
+            .await
+            .map_err(ClientError::transport)?;
+        Self::decode_unit(resp).await
+    }
+
+    pub async fn diagnostic_attempt_finish(
+        &self,
+        attempt_id: i32,
+        body: &DiagnosticAttemptFinish,
+    ) -> Result<(), ClientError> {
+        let resp = self
+            .auth_request(self.http.post(format!(
+                "{}/api/v1/agent/diagnostic-attempts/{attempt_id}/finish",
+                self.base_url
+            )))
+            .json(body)
+            .send()
+            .await
+            .map_err(ClientError::transport)?;
+        Self::decode_unit(resp).await
+    }
+
+    pub async fn put_doctor_status(&self, body: &DoctorStatusUpdate) -> Result<(), ClientError> {
+        let resp = self
+            .auth_request(self.http.put(format!("{}/api/v1/agent/doctor-status", self.base_url)))
+            .json(body)
+            .send()
+            .await
+            .map_err(ClientError::transport)?;
+        Self::decode_unit(resp).await
+    }
+
+    pub async fn doctor_controls(&self) -> Result<DoctorControls, ClientError> {
+        self.get(&format!("{}/api/v1/agent/doctor-controls", self.base_url))
             .await
     }
 

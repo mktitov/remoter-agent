@@ -54,6 +54,9 @@ quota = os.environ.get("FAKE_AGENT_QUOTA") == "1"
 exit_on_prompt = os.environ.get("FAKE_AGENT_EXIT_ON_PROMPT") == "1"
 empty = os.environ.get("FAKE_AGENT_EMPTY") == "1"
 no_allow = os.environ.get("FAKE_AGENT_NO_ALLOW") == "1"
+response_text = os.environ.get("FAKE_AGENT_RESPONSE")
+skip_callbacks = os.environ.get("FAKE_AGENT_SKIP_CALLBACKS") == "1"
+resume_any = os.environ.get("FAKE_AGENT_RESUME_ANY") == "1"
 fail_prompt_on_session = [
     s for s in os.environ.get("FAKE_AGENT_FAIL_PROMPT_ON_SESSION", "").split(",") if s
 ]
@@ -128,8 +131,10 @@ def chunk(session_id, text):
 
 def finish_turn(prompt_msg):
     sid = prompt_msg["params"]["sessionId"]
+    if response_text is not None:
+        record({"response": response_text})
     if not empty:
-        chunk(sid, "world")
+        chunk(sid, response_text if response_text is not None else "world")
     send({
         "jsonrpc": "2.0",
         "id": prompt_msg["id"],
@@ -192,7 +197,7 @@ for line in sys.stdin:
         }})
     elif method == "session/resume":
         record({"session_resume": msg["params"].get("sessionId")})
-        if msg["params"].get("sessionId") == "known-session":
+        if msg["params"].get("sessionId") == "known-session" or resume_any:
             send({"jsonrpc": "2.0", "id": msg["id"], "result": {
                 "configOptions": config_options(),
             }})
@@ -244,6 +249,9 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "id": msg["id"],
                   "error": {"code": -32603,
                             "message": "400 total message size exceeds limit"}})
+            continue
+        if skip_callbacks:
+            finish_turn(msg)
             continue
         if not empty:
             chunk(sid, "Hello, ")

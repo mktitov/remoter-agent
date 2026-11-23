@@ -133,6 +133,39 @@ The daemon talks to the backend over HTTP only. Which projects it works on is
 backend-owned metadata (`projects.repo_url` / `base_branch`, edited from the
 Flutter UI) — there is deliberately no project list in the TOML.
 
+## Agent Doctor
+
+Agent Doctor is an optional second ACP control loop for terminal implement-report
+problems, daemon `ERROR` events and terminal ACP errors. It is disabled by default.
+See the commented `[doctor]` section in `remoter-agent.toml` for the complete
+configuration. Enabling it requires all four daily budgets explicitly; there are
+no hidden budget defaults, and zero disables the corresponding stage. Triage and
+analysis model aliases must exist in `driver.kimi_config`.
+
+Report problems receive an `analyzing` placeholder before any model call and skip
+triage. Log events are normalized, deduplicated by fingerprint and triaged with
+the fast model. Deep analysis and remediation use the strong model and resume a
+per-finding ACP session. Every call checks its token bucket first; actual input +
+output usage is charged afterwards, while missing usage charges the configured
+conservative estimate. Queues, counters, sessions and circuits are atomically
+persisted in `<workspace_root>/doctor-state.json`. UTC rollover resets only daily
+counters.
+
+Doctor write is independently disabled by default. Approved remediation runs for
+one round, in a continuing session, with transcript/progress reporting and a
+read-only verification analysis afterwards. Only `bwrap` and `container` modes
+are supported: source/config/reference data stay read-only and approved paths
+must canonicalize under `allowed_write_roots`. Host write never falls back to an
+unsandboxed process. Container mode uses `doctor.container_image` and a dedicated
+container without project sidecars. Doctor sessions receive neither repository
+MCP configuration nor the daemon token, Docker socket or SSH agent.
+
+An unknown write result, timeout or restart during write opens the write circuit
+immediately and is never retried automatically. Closing it requires the human
+reset generation after transcript review. Analysis circuit cooldown permits one
+read-only half-open probe. Flood guard and blocked stages preserve queued and
+approved work and create deduplicated system findings for human action.
+
 ## The port contract (spec §5.8)
 
 A ticket worktree that uses devenv gets its services via

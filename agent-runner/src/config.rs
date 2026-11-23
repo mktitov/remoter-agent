@@ -206,6 +206,7 @@ pub struct Config {
     pub logs: LogsConfig,
     pub driver: DriverConfig,
     pub execution: ExecutionConfig,
+    pub doctor: crate::doctor_config::DoctorConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -349,6 +350,8 @@ struct FileConfig {
     driver: DriverConfig,
     #[serde(default)]
     execution: ExecutionConfig,
+    #[serde(default)]
+    doctor: crate::doctor_config::DoctorConfig,
 }
 
 fn default_poll_interval() -> u64 {
@@ -502,6 +505,9 @@ impl Config {
             .as_deref()
             .map(expand_tilde_path)
             .unwrap_or_else(|| workspace_root.join("logs"));
+        let mut doctor = file.doctor;
+        crate::doctor_config::expand_paths(&mut doctor, expand_tilde_path);
+        doctor.validate(&driver)?;
         Ok(Self {
             api_url: api_url.trim_end_matches('/').to_string(),
             token,
@@ -524,6 +530,7 @@ impl Config {
             },
             driver,
             execution,
+            doctor,
         })
     }
 
@@ -1222,5 +1229,47 @@ kimi_config = "{}"
         let c = config_candidates(None, Some(PathBuf::from("/home")));
         assert_eq!(c[1], PathBuf::from("/home/.config/remoter-agent.toml"));
         assert_eq!(config_candidates(None, None).len(), 1);
+    }
+
+    #[test]
+    fn enabled_doctor_rejects_missing_daily_budgets() {
+        unsafe { std::env::remove_var(API_URL_ENV) };
+        let toml = TOML.replace("[driver]", "[doctor]\nenabled = true\n\n[driver]");
+        let error = Config::from_toml_str(&toml, Some("tok".to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("triage_daily_token_budget"), "{error}");
+        assert!(error.contains("analysis_daily_token_budget"), "{error}");
+        assert!(error.contains("remediation_daily_token_budget"), "{error}");
+        assert!(error.contains("daily_write_round_budget"), "{error}");
+        assert!(error.contains("zero explicitly disables"), "{error}");
+    }
+
+    #[test]
+    fn doctor_validates_model_aliases_and_accepts_explicit_zero_budgets() {
+        unsafe { std::env::remove_var(API_URL_ENV) };
+        let dir = std::env::temp_dir().join(format!("remoter-doctor-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let kimi = dir.join("kimi.toml");
+        std::fs::write(
+            &kimi,
+            "default_model = \"kimi-code/k3\"\nother_model = \"kimi-code/kimi-for-coding\"\n",
+        )
+        .unwrap();
+        let toml = TOML.replace(
+            "[driver]\nkind = \"stub\"",
+            &format!(
+                "[doctor]\nenabled = true\ntriage_daily_token_budget = 0\nanalysis_daily_token_budget = 0\nremediation_daily_token_budget = 0\ndaily_write_round_budget = 0\n\n[driver]\nkind = \"kimi-acp\"\nremoter_mcp_command = \"/opt/remoter-mcp\"\nkimi_config = \"{}\"",
+                kimi.display()
+            ),
+        );
+        let config = Config::from_toml_str(&toml, Some("tok".to_string())).unwrap();
+        assert_eq!(config.doctor.triage_daily_token_budget, Some(0));
+        let invalid = toml.replace(
+            "triage_daily_token_budget = 0",
+            "analysis_model = \"kimi-code/missing\"\ntriage_daily_token_budget = 0",
+        );
+        assert!(Config::from_toml_str(&invalid, Some("tok".to_string())).is_err());
+        std::fs::remove_dir_all(dir).ok();
     }
 }

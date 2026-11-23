@@ -7,7 +7,7 @@ use remoter_agent::{
     claim::Daemon,
     client::RemoterClient,
     config::Config,
-    driver, events, logs,
+    doctor, driver, events, logs,
     logstore::LogStore,
     sync::{PrFeedbackSync, PrMergeableSync},
 };
@@ -80,12 +80,14 @@ async fn main() -> anyhow::Result<()> {
         config.stall_idle_secs,
         config.stall_grace_secs,
     )?;
-    let mut daemon = Daemon::new(config.clone(), client, driver, log_store.clone());
+    let doctor = doctor::DoctorHandle::start(config.clone(), client.clone(), driver.clone(), log_store.clone())?;
+    let mut daemon = Daemon::new(config.clone(), client, driver, log_store.clone()).with_doctor(doctor.clone());
 
     // Best-effort log shipper: batches the queue to `POST /agent-logs`.
-    tokio::spawn(logs::run_shipper(
+    tokio::spawn(logs::run_shipper_with_doctor(
         log_rx,
         RemoterClient::new(&config.api_url, &config.token, config.workspace_id),
+        Some(doctor.clone()),
     ));
 
     // Retries transient backend outages forever; fatal on a human token or a
@@ -143,5 +145,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     daemon.shutdown().await;
+    doctor.shutdown().await;
     Ok(())
 }
