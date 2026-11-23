@@ -49,6 +49,10 @@ pub struct QueuedProblem {
     pub log_id: i32,
     pub remediation_round: u32,
     #[serde(default)]
+    pub pending_verification: bool,
+    #[serde(default)]
+    pub placeholder_created: bool,
+    #[serde(default)]
     pub next_attempt_at: i64,
 }
 
@@ -77,6 +81,8 @@ impl QueuedProblem {
             session_id: None,
             log_id,
             remediation_round: 0,
+            pending_verification: false,
+            placeholder_created: false,
             next_attempt_at: 0,
         }
     }
@@ -100,6 +106,7 @@ pub enum WriteCircuit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureClass {
     Infrastructure,
+    ProcessLost,
     AuthOrQuota,
     Timeout,
     Command,
@@ -118,7 +125,18 @@ pub struct ActiveWrite {
     pub attempt_id: i32,
     pub action_id: i32,
     pub fingerprint: String,
+    #[serde(default)]
+    pub source_task_id: Option<i32>,
     pub started_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveCall {
+    pub problem: QueuedProblem,
+    pub bucket: TokenBucket,
+    pub estimate: u64,
+    pub half_open_probe: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +159,8 @@ pub struct DoctorState {
     pub write_circuit: WriteCircuit,
     pub consecutive_abnormal_writes: u32,
     pub active_write: Option<ActiveWrite>,
+    #[serde(default)]
+    pub active_call: Option<ActiveCall>,
     pub applied_analysis_reset_generation: u64,
     pub applied_write_reset_generation: u64,
     pub flood_events: VecDeque<(i64, String)>,
@@ -170,6 +190,7 @@ impl Default for DoctorState {
             write_circuit: WriteCircuit::Closed,
             consecutive_abnormal_writes: 0,
             active_write: None,
+            active_call: None,
             applied_analysis_reset_generation: 0,
             applied_write_reset_generation: 0,
             flood_events: VecDeque::new(),
@@ -209,6 +230,15 @@ impl DoctorState {
         if state.active_write.take().is_some() {
             state.write_circuit = WriteCircuit::Open;
             state.last_error = Some("daemon restarted during a write round; result is unknown".to_string());
+        }
+        if let Some(active) = state.active_call.take() {
+            state.charge(active.bucket, None, None, active.estimate);
+            if active.half_open_probe {
+                state.analysis_circuit = AnalysisCircuit::Open;
+                state.analysis_opened_at = Some(now.timestamp());
+                state.analysis_half_open_probe = false;
+            }
+            state.requeue(active.problem);
         }
         state.rollover(now);
         Ok(state)
@@ -409,6 +439,46 @@ impl DoctorState {
         }
     }
 
+    pub fn arm_call(&mut self, problem: &mut QueuedProblem, bucket: TokenBucket, estimate: u64) {
+        self.merge_active(problem);
+        let half_open_probe = self.analysis_half_open_probe && bucket == TokenBucket::Analysis;
+        self.active_call = Some(ActiveCall {
+            problem: problem.clone(),
+            bucket,
+            estimate,
+            half_open_probe,
+        });
+    }
+
+    fn merge_active(&self, problem: &mut QueuedProblem) {
+        let Some(active) = self
+            .active_call
+            .as_ref()
+            .filter(|active| active.problem.fingerprint == problem.fingerprint)
+        else {
+            return;
+        };
+        problem.occurrences = problem.occurrences.max(active.problem.occurrences);
+        problem.last_seen_at = problem.last_seen_at.max(active.problem.last_seen_at);
+        problem.excerpt = active.problem.excerpt.clone();
+        problem.evidence = active.problem.evidence.clone();
+        problem.pending_verification |= active.problem.pending_verification;
+        problem.placeholder_created |= active.problem.placeholder_created;
+        if problem.session_id.is_none() {
+            problem.session_id = active.problem.session_id.clone();
+        }
+    }
+
+    pub fn requeue(&mut self, mut problem: QueuedProblem) {
+        self.merge_active(&mut problem);
+        self.active_call = None;
+        if problem.source == ProblemSource::Report {
+            self.report_queue.push_front(problem);
+        } else {
+            self.log_queue.push_front(problem);
+        }
+    }
+
     pub fn enqueue(&mut self, mut problem: QueuedProblem, config: &DoctorConfig, now: DateTime<Utc>) {
         let now_ts = now.timestamp();
         self.flood_events.push_back((now_ts, problem.fingerprint.clone()));
@@ -436,6 +506,17 @@ impl DoctorState {
         while self.flood_events.len() > history_limit {
             self.flood_events.pop_front();
         }
+        if let Some(active) = self
+            .active_call
+            .as_mut()
+            .filter(|active| active.problem.fingerprint == problem.fingerprint)
+        {
+            active.problem.occurrences = active.problem.occurrences.saturating_add(1);
+            active.problem.last_seen_at = now;
+            active.problem.excerpt = problem.excerpt;
+            push_sample(&mut active.problem.evidence, &active.problem.excerpt);
+            return;
+        }
 
         let queue = if problem.source == ProblemSource::Report {
             &mut self.report_queue
@@ -457,6 +538,8 @@ impl DoctorState {
             problem.session_id = recent.session_id.clone();
             problem.log_id = recent.log_id;
             problem.remediation_round = recent.remediation_round;
+            problem.pending_verification = recent.pending_verification;
+            problem.placeholder_created = recent.placeholder_created;
             if problem.source.is_log() {
                 problem.next_attempt_at = now_ts + config.flood_window_secs as i64;
             }
@@ -489,7 +572,10 @@ impl DoctorState {
     }
 
     pub fn complete_problem(&mut self, problem: &QueuedProblem) {
-        self.recent.insert(problem.fingerprint.clone(), problem.clone());
+        let mut problem = problem.clone();
+        self.merge_active(&mut problem);
+        self.active_call = None;
+        self.recent.insert(problem.fingerprint.clone(), problem);
         if self.recent.len() > 1024 {
             let oldest = self
                 .recent
@@ -605,6 +691,7 @@ mod tests {
             attempt_id: 1,
             action_id: 2,
             fingerprint: "finding".to_string(),
+            source_task_id: None,
             started_at: now(),
         }
     }
@@ -698,6 +785,33 @@ mod tests {
         assert_eq!(restored.analysis_tokens_used, 77);
         assert_eq!(restored.report_queue.len(), 1);
         assert!(!dir.join("doctor-state.json.tmp").exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn restart_restores_active_analysis_and_charges_unknown_usage() {
+        let dir = std::env::temp_dir().join(format!("remoter-doctor-active-call-{}", std::process::id()));
+        let path = dir.join("doctor-state.json");
+        let mut state = DoctorState::default();
+        let mut problem = QueuedProblem::new(
+            ProblemSource::DaemonLog,
+            "title".to_string(),
+            "excerpt".to_string(),
+            Some(1),
+            Some(2),
+            now(),
+            -1,
+        );
+        problem.pending_verification = true;
+        state.arm_call(&mut problem, TokenBucket::Analysis, 90);
+        state.enqueue(problem, &config(), now());
+        state.save(&path).unwrap();
+        let restored = DoctorState::load(&path, now()).unwrap();
+        assert_eq!(restored.analysis_tokens_used, 90);
+        assert!(restored.active_call.is_none());
+        assert_eq!(restored.log_queue.len(), 1);
+        assert_eq!(restored.log_queue[0].occurrences, 2);
+        assert!(restored.log_queue[0].pending_verification);
         std::fs::remove_dir_all(dir).ok();
     }
 

@@ -147,9 +147,10 @@ triage. Log events are normalized, deduplicated by fingerprint and triaged with
 the fast model. Deep analysis and remediation use the strong model and resume a
 per-finding ACP session. Every call checks its token bucket first; actual input +
 output usage is charged afterwards, while missing usage charges the configured
-conservative estimate. Queues, counters, sessions and circuits are atomically
-persisted in `<workspace_root>/doctor-state.json`. UTC rollover resets only daily
-counters.
+conservative estimate. Queues, counters, sessions, in-flight calls and circuits
+are atomically persisted in `<workspace_root>/doctor-state.json`. A restart
+requeues interrupted analysis, charges its conservative estimate and resumes
+post-remediation verification read-only. UTC rollover resets only daily counters.
 
 Doctor write is independently disabled by default. Approved remediation runs for
 one round, in a continuing session, with transcript/progress reporting and a

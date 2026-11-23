@@ -728,7 +728,7 @@ fn spawn_agent(
 > {
     let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
     let mut cmd = workspace::wrap_command(&spec.cwd, &spec.exec, program, &args_ref, &spec.env);
-    if spec.doctor.is_some() {
+    if spec.doctor.is_some() && !matches!(&spec.exec, workspace::ExecEnv::Container(_)) {
         for key in [
             "REMOTER_AGENT_TOKEN",
             "REMOTER_TOKEN",

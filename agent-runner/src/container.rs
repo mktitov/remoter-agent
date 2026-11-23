@@ -483,13 +483,18 @@ async fn provision_minio(cfg: &ExecutionConfig, run_name: &str) -> Result<(), Dr
 /// Startup sweep (spec §5.7): `docker rm -f` every container labeled
 /// `remoter.run_id` — leftovers of a crashed daemon — and every image-init
 /// container (`remoter.image_init`, `image.rs`) orphaned by a dropped build
-/// future or daemon restart (such an orphan can still be *running*; its work
-/// is useless — nobody will commit its result). Best-effort, never fails the
-/// caller.
+/// future or daemon restart, and orphaned Doctor containers (all can still be
+/// running; their work is useless or unsafe after restart). Best-effort, never
+/// fails the caller.
 pub async fn sweep(cfg: &ExecutionConfig) {
     let docker = &cfg.docker_binary;
     sweep_labeled(docker, RUN_ID_LABEL, "run").await;
     sweep_labeled(docker, IMAGE_INIT_LABEL, "image-init").await;
+    sweep_doctor(docker).await;
+}
+
+pub async fn sweep_doctor(docker: &str) {
+    sweep_labeled(docker, "remoter.doctor=true", "Doctor").await;
 }
 
 async fn sweep_labeled(docker: &str, label: &str, kind: &str) {
@@ -752,9 +757,10 @@ mod tests {
             log.contains(&format!("ps -aq --filter label={IMAGE_INIT_LABEL}")),
             "{log}"
         );
-        // Both ids from both passes are force-removed.
-        assert_eq!(log.matches("rm -f aaa").count(), 2, "{log}");
-        assert_eq!(log.matches("rm -f bbb").count(), 2, "{log}");
+        assert!(log.contains("ps -aq --filter label=remoter.doctor=true"), "{log}");
+        // Both ids from all three passes are force-removed.
+        assert_eq!(log.matches("rm -f aaa").count(), 3, "{log}");
+        assert_eq!(log.matches("rm -f bbb").count(), 3, "{log}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

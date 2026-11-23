@@ -48,6 +48,9 @@ pub(crate) async fn run(
         path,
         cancel,
     };
+    if worker.config.execution.mode == crate::config::ExecutionMode::Container {
+        crate::container::sweep_doctor(&worker.config.execution.docker_binary).await;
+    }
     worker.restore_pending().await;
     let mut tick = tokio::time::interval(Duration::from_secs(2));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -123,6 +126,7 @@ impl Worker {
             problem.fingerprint = finding.fingerprint;
             problem.occurrences = finding.occurrences.max(1);
             problem.remediation_round = finding.remediation_round;
+            problem.placeholder_created = true;
             problem.evidence = finding.evidence;
             state.enqueue(problem, &self.config.doctor, Utc::now());
         }
@@ -153,12 +157,26 @@ impl Worker {
             .expect("Doctor state poisoned")
             .report_queue
             .iter()
+            .filter(|problem| !problem.placeholder_created)
             .cloned()
             .collect::<Vec<_>>();
         for problem in reports {
             let body = model::placeholder_body(&problem, None);
-            if let Err(error) = self.client.put_diagnostic_finding(&problem.fingerprint, &body).await {
-                tracing::warn!(target: "remoter_agent::doctor", fingerprint = %problem.fingerprint, %error, "could not create analyzing Doctor placeholder");
+            match self.client.put_diagnostic_finding(&problem.fingerprint, &body).await {
+                Ok(_) => {
+                    let mut state = self.state.lock().expect("Doctor state poisoned");
+                    if let Some(problem) = state
+                        .report_queue
+                        .iter_mut()
+                        .find(|queued| queued.fingerprint == problem.fingerprint)
+                    {
+                        problem.placeholder_created = true;
+                    }
+                    let _ = self.persist(&state);
+                }
+                Err(error) => {
+                    tracing::warn!(target: "remoter_agent::doctor", fingerprint = %problem.fingerprint, %error, "could not create analyzing Doctor placeholder");
+                }
             }
         }
     }
@@ -167,28 +185,28 @@ impl Worker {
         let now = Utc::now();
         let (mut problem, mut bucket, allowed) = {
             let mut state = self.state.lock().expect("Doctor state poisoned");
-            let Some(problem) = state.pop_next() else {
+            let Some(mut problem) = state.pop_next() else {
                 return;
             };
-            let bucket = if problem.source == ProblemSource::Report {
+            let mut bucket = if problem.source == ProblemSource::Report || problem.pending_verification {
                 TokenBucket::Analysis
             } else {
                 TokenBucket::Triage
             };
             let allowed = state.begin_call(bucket, &self.config.doctor, now);
             if matches!(allowed, BeginCall::Blocked(_)) {
-                if problem.source == ProblemSource::Report {
-                    state.report_queue.push_front(problem.clone());
-                } else {
-                    state.log_queue.push_front(problem.clone());
-                }
+                state.requeue(problem.clone());
+            }
+            if let BeginCall::Allowed { half_open_probe: true } = allowed {
+                bucket = TokenBucket::Analysis;
+            }
+            if matches!(allowed, BeginCall::Allowed { .. }) {
+                state.arm_call(&mut problem, bucket, self.config.doctor.unknown_usage(bucket));
             }
             if let Err(error) = self.persist(&state) {
                 state.last_error = Some(format!("Doctor state persistence failed: {error}"));
-                if problem.source == ProblemSource::Report {
-                    state.report_queue.push_front(problem.clone());
-                } else {
-                    state.log_queue.push_front(problem.clone());
+                if matches!(allowed, BeginCall::Allowed { .. }) {
+                    state.requeue(problem.clone());
                 }
                 return;
             }
@@ -202,18 +220,44 @@ impl Worker {
             self.blocked_finding(&reason).await;
             if problem.source == ProblemSource::Report {
                 let body = model::placeholder_body(&problem, Some(&reason));
-                let _ = self.client.put_diagnostic_finding(&problem.fingerprint, &body).await;
+                if self
+                    .client
+                    .put_diagnostic_finding(&problem.fingerprint, &body)
+                    .await
+                    .is_ok()
+                {
+                    let mut state = self.state.lock().expect("Doctor state poisoned");
+                    if let Some(problem) = state
+                        .report_queue
+                        .iter_mut()
+                        .find(|queued| queued.fingerprint == problem.fingerprint)
+                    {
+                        problem.placeholder_created = true;
+                    }
+                    let _ = self.persist(&state);
+                }
             }
             return;
         };
         if half_open_probe {
             bucket = TokenBucket::Analysis;
         }
+        if problem.source == ProblemSource::Report && !problem.placeholder_created {
+            let body = model::placeholder_body(&problem, None);
+            match self.client.put_diagnostic_finding(&problem.fingerprint, &body).await {
+                Ok(_) => problem.placeholder_created = true,
+                Err(error) => {
+                    tracing::warn!(target: "remoter_agent::doctor", fingerprint = %problem.fingerprint, %error, "delaying report analysis until its placeholder is stored");
+                    self.requeue(problem);
+                    return;
+                }
+            }
+        }
 
         let prompt = if bucket == TokenBucket::Triage {
             model::triage_prompt(&problem)
         } else {
-            model::analysis_prompt(&problem, false)
+            model::analysis_prompt(&problem, problem.pending_verification)
         };
         let result = self
             .invoke_model(
@@ -267,9 +311,21 @@ impl Worker {
             let mut state = self.state.lock().expect("Doctor state poisoned");
             let allowed = state.begin_call(TokenBucket::Analysis, &self.config.doctor, Utc::now());
             if matches!(allowed, BeginCall::Blocked(_)) {
-                state.log_queue.push_front(problem.clone());
+                state.requeue(problem.clone());
+            } else {
+                state.arm_call(
+                    &mut problem,
+                    TokenBucket::Analysis,
+                    self.config.doctor.unknown_usage(TokenBucket::Analysis),
+                );
             }
-            let _ = self.persist(&state);
+            if let Err(error) = self.persist(&state) {
+                tracing::warn!(target: "remoter_agent::doctor", %error, "could not persist analysis launch");
+                if matches!(allowed, BeginCall::Allowed { .. }) {
+                    state.requeue(problem.clone());
+                }
+                return;
+            }
             allowed
         };
         let BeginCall::Allowed { .. } = allowed else {
@@ -311,6 +367,7 @@ impl Worker {
     }
 
     async fn finish_analysis(&mut self, mut problem: QueuedProblem, response: AnalysisResponse) {
+        problem.pending_verification = false;
         let outcome = match response.outcome {
             AnalysisOutcome::NotImportant if problem.source.is_log() => {
                 self.complete(problem);
@@ -339,8 +396,8 @@ impl Worker {
             return;
         };
         let text = format!(
-            "Agent Doctor completed analysis: {}. See /diagnostics/{finding_id}.",
-            problem.title
+            "Agent Doctor завершил анализ: {}. Подробнее: /diagnostics/{finding_id}.",
+            model::sanitize(&problem.title)
         );
         if let Err(error) = self.client.add_comment(task_id, &text).await {
             tracing::warn!(target: "remoter_agent::doctor", task_id, %error, "could not link Doctor finding on source ticket");
@@ -351,12 +408,8 @@ impl Worker {
         {
             let mut state = self.state.lock().expect("Doctor state poisoned");
             state.analysis_failure(failure.class, &self.config.doctor, Utc::now());
-            state.last_error = Some(failure.message.clone());
-            if problem.source == ProblemSource::Report {
-                state.report_queue.push_front(problem.clone());
-            } else {
-                state.log_queue.push_front(problem.clone());
-            }
+            state.last_error = Some(model::sanitize(&failure.message));
+            state.requeue(problem.clone());
             let _ = self.persist(&state);
         }
         let reason = if failure.class == FailureClass::AuthOrQuota {
@@ -405,11 +458,7 @@ impl Worker {
 
     fn requeue(&self, problem: QueuedProblem) {
         let mut state = self.state.lock().expect("Doctor state poisoned");
-        if problem.source == ProblemSource::Report {
-            state.report_queue.push_front(problem);
-        } else {
-            state.log_queue.push_front(problem);
-        }
+        state.requeue(problem);
         let _ = self.persist(&state);
     }
 
@@ -465,7 +514,9 @@ impl Worker {
         if !self.config.doctor.write_enabled {
             return Some("write_disabled");
         }
-        let state = self.state.lock().expect("Doctor state poisoned");
+        let now = Utc::now();
+        let mut state = self.state.lock().expect("Doctor state poisoned");
+        state.rollover(now);
         if state.write_circuit == WriteCircuit::Open {
             Some("write_circuit_open")
         } else if state.analysis_circuit != AnalysisCircuit::Closed {
@@ -489,15 +540,6 @@ impl Worker {
     async fn remediate(&mut self, claimed: ClaimedDiagnosticAction) {
         let attempt_id = claimed.attempt.id;
         if let Some(reason) = self.write_blocked_reason() {
-            self.finish_attempt(
-                attempt_id,
-                DiagnosticAttemptFinish {
-                    status: "cancelled".to_string(),
-                    result_error: Some(reason.to_string()),
-                    ..Default::default()
-                },
-            )
-            .await;
             self.blocked_finding(reason).await;
             return;
         }
@@ -517,7 +559,7 @@ impl Worker {
             .await;
             return;
         };
-        if claimed.action.round > self.config.doctor.max_remediation_rounds {
+        if claimed.action.round == 0 || claimed.action.round > self.config.doctor.max_remediation_rounds {
             self.finish_attempt(
                 attempt_id,
                 DiagnosticAttemptFinish {
@@ -535,15 +577,7 @@ impl Worker {
                 .expect("active runs poisoned")
                 .contains(&task_id)
         }) {
-            self.finish_attempt(
-                attempt_id,
-                DiagnosticAttemptFinish {
-                    status: "cancelled".to_string(),
-                    result_error: Some("conflicting_run".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await;
+            self.blocked_finding("conflicting_run").await;
             return;
         }
         let scope = match WriteScope::validate(&self.config, &claimed.action) {
@@ -561,39 +595,52 @@ impl Worker {
                 return;
             }
         };
+        problem.remediation_round = claimed.action.round;
+        problem.pending_verification = true;
         let begin = {
+            let active_runs = self.active_runs.lock().expect("Doctor active runs poisoned");
+            let conflicting = problem
+                .source_task_id
+                .is_some_and(|task_id| active_runs.contains(&task_id));
             let mut state = self.state.lock().expect("Doctor state poisoned");
-            let begin = state.begin_write(
-                ActiveWrite {
-                    attempt_id,
-                    action_id: claimed.action.id,
-                    fingerprint: problem.fingerprint.clone(),
-                    started_at: Utc::now(),
-                },
-                &self.config.doctor,
-                Utc::now(),
-            );
+            let begin = if conflicting {
+                BeginWrite::Blocked("conflicting_run".to_string())
+            } else {
+                state.begin_write(
+                    ActiveWrite {
+                        attempt_id,
+                        action_id: claimed.action.id,
+                        fingerprint: problem.fingerprint.clone(),
+                        source_task_id: problem.source_task_id,
+                        started_at: Utc::now(),
+                    },
+                    &self.config.doctor,
+                    Utc::now(),
+                )
+            };
+            if matches!(begin, BeginWrite::Allowed) {
+                state.arm_call(
+                    &mut problem,
+                    TokenBucket::Remediation,
+                    self.config.doctor.unknown_usage(TokenBucket::Remediation),
+                );
+            }
             if let Err(error) = self.persist(&state) {
+                if matches!(begin, BeginWrite::Allowed) {
+                    state.write_rounds_used = state.write_rounds_used.saturating_sub(1);
+                }
                 state.active_write = None;
+                state.active_call = None;
+                state.last_error = Some(format!("could not persist write launch: {error}"));
                 tracing::warn!(target: "remoter_agent::doctor", %error, "could not persist write launch");
                 return;
             }
             begin
         };
         if let BeginWrite::Blocked(reason) = begin {
-            self.finish_attempt(
-                attempt_id,
-                DiagnosticAttemptFinish {
-                    status: "cancelled".to_string(),
-                    result_error: Some(reason.clone()),
-                    ..Default::default()
-                },
-            )
-            .await;
             self.blocked_finding(&reason).await;
             return;
         }
-        problem.remediation_round = claimed.action.round;
         let timeout = Duration::from_secs(
             claimed
                 .action
@@ -648,8 +695,10 @@ impl Worker {
                             session_id: problem.session_id.clone(),
                             transcript,
                             truncated,
-                            agent_summary: Some(outcome.text.clone()),
-                            verification_evidence: Some(serde_json::json!({"roundOutput": outcome.text})),
+                            agent_summary: Some(model::sanitize(&outcome.text)),
+                            verification_evidence: Some(model::sanitize_value(
+                                serde_json::json!({"roundOutput": outcome.text}),
+                            )),
                             input_tokens: outcome.input_tokens,
                             output_tokens: outcome.output_tokens,
                             model: Some(self.config.doctor.analysis_model.clone()),
@@ -671,26 +720,33 @@ impl Worker {
             }
             Err(failure) => {
                 problem.session_id = failure.session_id.clone().or(problem.session_id);
-                let unknown = failure.class == FailureClass::Timeout || self.cancel.is_cancelled();
-                self.end_write(if unknown { WriteEnd::Unknown } else { WriteEnd::Abnormal });
+                let mut unknown = matches!(failure.class, FailureClass::Timeout | FailureClass::ProcessLost)
+                    || self.cancel.is_cancelled();
                 let (transcript, truncated) = self.transcript(problem.log_id);
-                self.finish_attempt(
-                    attempt_id,
-                    DiagnosticAttemptFinish {
-                        status: "failed".to_string(),
-                        session_id: problem.session_id.clone(),
-                        transcript,
-                        truncated,
-                        agent_summary: None,
-                        verification_evidence: None,
-                        input_tokens: failure.input_tokens,
-                        output_tokens: failure.output_tokens,
-                        model: Some(self.config.doctor.analysis_model.clone()),
-                        thinking: Some(self.config.doctor.analysis_thinking.clone()),
-                        result_error: Some(failure.message.clone()),
-                    },
-                )
-                .await;
+                let finished = self
+                    .client
+                    .diagnostic_attempt_finish(
+                        attempt_id,
+                        &DiagnosticAttemptFinish {
+                            status: "failed".to_string(),
+                            session_id: problem.session_id.clone(),
+                            transcript,
+                            truncated,
+                            agent_summary: None,
+                            verification_evidence: None,
+                            input_tokens: failure.input_tokens,
+                            output_tokens: failure.output_tokens,
+                            model: Some(self.config.doctor.analysis_model.clone()),
+                            thinking: Some(self.config.doctor.analysis_thinking.clone()),
+                            result_error: Some(model::sanitize(&failure.message)),
+                        },
+                    )
+                    .await;
+                if let Err(error) = finished {
+                    unknown = true;
+                    tracing::warn!(target: "remoter_agent::doctor", attempt_id, %error, "Doctor write failure was not acknowledged; result is unknown");
+                }
+                self.end_write(if unknown { WriteEnd::Unknown } else { WriteEnd::Abnormal });
                 self.model_failure(&problem, TokenBucket::Remediation, failure).await;
                 self.complete(problem);
                 if unknown {
@@ -700,11 +756,24 @@ impl Worker {
         }
     }
 
-    async fn verify_remediation(&mut self, problem: QueuedProblem) {
+    async fn verify_remediation(&mut self, mut problem: QueuedProblem) {
         let allowed = {
             let mut state = self.state.lock().expect("Doctor state poisoned");
             let allowed = state.begin_call(TokenBucket::Analysis, &self.config.doctor, Utc::now());
-            let _ = self.persist(&state);
+            if matches!(allowed, BeginCall::Allowed { .. }) {
+                state.arm_call(
+                    &mut problem,
+                    TokenBucket::Analysis,
+                    self.config.doctor.unknown_usage(TokenBucket::Analysis),
+                );
+            }
+            if let Err(error) = self.persist(&state) {
+                tracing::warn!(target: "remoter_agent::doctor", %error, "could not persist verification launch");
+                if matches!(allowed, BeginCall::Allowed { .. }) {
+                    state.requeue(problem.clone());
+                }
+                return;
+            }
             allowed
         };
         let BeginCall::Allowed { .. } = allowed else {
@@ -775,7 +844,10 @@ impl Worker {
     }
 
     async fn create_task(&self, claimed: ClaimedDiagnosticAction) {
-        let result = self.client.create_diagnostic_task(&claimed.action).await;
+        let result = self
+            .client
+            .create_diagnostic_task(&claimed.action, claimed.finding.as_ref())
+            .await;
         self.finish_attempt(
             claimed.attempt.id,
             DiagnosticAttemptFinish {
@@ -807,20 +879,26 @@ impl Worker {
         write: Option<(i32, Option<&WriteScope>)>,
     ) -> Result<RunOutcome, CallFailure> {
         let attempt_id = write.as_ref().map(|(id, _)| *id).unwrap_or(log_id);
-        let runtime = sandbox::start(
+        let runtime = match sandbox::start(
             &self.config,
             attempt_id,
             read_only,
             write.as_ref().and_then(|(_, scope)| *scope),
         )
         .await
-        .map_err(|error| CallFailure {
-            message: error.to_string(),
-            class: FailureClass::Infrastructure,
-            session_id: resume_session.clone(),
-            input_tokens: None,
-            output_tokens: None,
-        })?;
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                self.charge(bucket, None, None);
+                return Err(CallFailure {
+                    message: error.to_string(),
+                    class: FailureClass::Infrastructure,
+                    session_id: resume_session.clone(),
+                    input_tokens: None,
+                    output_tokens: None,
+                });
+            }
+        };
         let (logger, _guard) = match self.log_store.open_run(0, log_id) {
             Ok(logger) => (
                 SessionLogger::new(logger),
@@ -935,19 +1013,7 @@ impl Worker {
     }
 
     fn transcript(&self, log_id: i32) -> (Vec<serde_json::Value>, bool) {
-        let Ok((entries, total)) = self.log_store.read(0, log_id, None, Some(1000), Some(1000)) else {
-            return (Vec::new(), false);
-        };
-        let truncated = total > entries.len() as i64;
-        let entries = entries
-            .into_iter()
-            .map(|entry| {
-                serde_json::to_value(entry)
-                    .map(model::sanitize_value)
-                    .unwrap_or(serde_json::Value::Null)
-            })
-            .collect();
-        (entries, truncated)
+        read_transcript(&self.log_store, log_id)
     }
 
     async fn heartbeat(&self) {
@@ -983,7 +1049,7 @@ impl Worker {
                 }
                 .to_string(),
                 blocked_reason: blocked_reason(&state, &self.config, now),
-                last_error: state.last_error.clone(),
+                last_error: state.last_error.as_deref().map(model::sanitize),
                 cooldown_until: cooldown(&state, &self.config.doctor),
                 analysis_reset_generation: state.applied_analysis_reset_generation,
                 write_reset_generation: state.applied_write_reset_generation,
@@ -993,10 +1059,38 @@ impl Worker {
         if let Err(error) = self.client.put_doctor_status(&update).await {
             tracing::debug!(target: "remoter_agent::doctor", %error, "could not publish Doctor heartbeat");
         }
+        if let Some(reason) = update.blocked_reason.as_deref()
+            && !matches!(reason, "write_disabled" | "conflicting_run" | "state_error")
+        {
+            self.blocked_finding(reason).await;
+        }
     }
 }
 
+fn read_transcript(log_store: &LogStore, log_id: i32) -> (Vec<serde_json::Value>, bool) {
+    let Ok(total) = log_store.count_entries(0, log_id) else {
+        return (Vec::new(), false);
+    };
+    let from_seq = (total - 1000).max(0);
+    let Ok((entries, _)) = log_store.read(0, log_id, Some(from_seq), None, Some(1000)) else {
+        return (Vec::new(), false);
+    };
+    let truncated = total > entries.len() as i64;
+    let entries = entries
+        .into_iter()
+        .map(|entry| {
+            serde_json::to_value(entry)
+                .map(model::sanitize_value)
+                .unwrap_or(serde_json::Value::Null)
+        })
+        .collect();
+    (entries, truncated)
+}
+
 fn cooldown(state: &DoctorState, config: &crate::doctor_config::DoctorConfig) -> Option<DateTime<Utc>> {
+    if state.analysis_human_reset_required {
+        return None;
+    }
     let timestamp = match state.analysis_circuit {
         AnalysisCircuit::Open => state
             .analysis_opened_at?
@@ -1013,6 +1107,9 @@ fn blocked_reason(state: &DoctorState, config: &Config, now: DateTime<Utc>) -> O
     if state.analysis_circuit != AnalysisCircuit::Closed {
         return Some("analysis_circuit_open".to_string());
     }
+    if state.active_write.is_some() {
+        return Some("conflicting_run".to_string());
+    }
     if state.flood_cooldown_until.is_some_and(|until| until > now.timestamp()) {
         return Some("flood_guard".to_string());
     }
@@ -1023,6 +1120,9 @@ fn blocked_reason(state: &DoctorState, config: &Config, now: DateTime<Utc>) -> O
     }
     if state.write_rounds_used >= config.doctor.daily_write_round_budget.unwrap_or(0) {
         return Some("budget_exhausted".to_string());
+    }
+    if !config.doctor.write_enabled {
+        return Some("write_disabled".to_string());
     }
     state.last_error.as_ref().map(|_| "state_error".to_string())
 }
@@ -1041,6 +1141,44 @@ fn failure_class(error: &DriverError) -> FailureClass {
         {
             FailureClass::AuthOrQuota
         }
-        DriverError::Permanent(_) | DriverError::Transient(_) => FailureClass::Infrastructure,
+        DriverError::Permanent(_) => FailureClass::Infrastructure,
+        DriverError::Transient(_) => FailureClass::ProcessLost,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcript_returns_the_actual_tail_and_truncation_flag() {
+        let dir = std::env::temp_dir().join(format!("remoter-doctor-transcript-{}", std::process::id()));
+        let store = LogStore::new(&crate::config::LogsConfig {
+            dir: Some(dir.clone()),
+            retention_days: 7,
+        })
+        .unwrap();
+        let logger = store.open_run(0, -1).unwrap();
+        for index in 0..1005 {
+            logger.log(crate::logstore::NewLogEntry::message(format!("message {index}")));
+        }
+        let (entries, truncated) = read_transcript(&store, -1);
+        assert!(truncated);
+        assert_eq!(entries.len(), 1000);
+        assert_eq!(entries.first().unwrap()["text"], "message 5");
+        assert_eq!(entries.last().unwrap()["text"], "message 1004");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn transient_process_loss_is_distinct_from_command_failures() {
+        assert_eq!(
+            failure_class(&DriverError::Transient("agent process exited".to_string())),
+            FailureClass::ProcessLost
+        );
+        assert_eq!(
+            failure_class(&DriverError::Stalled("timeout".to_string())),
+            FailureClass::Timeout
+        );
     }
 }

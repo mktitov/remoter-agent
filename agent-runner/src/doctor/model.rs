@@ -147,7 +147,7 @@ pub fn analysis_prompt(problem: &QueuedProblem, remediation: bool) -> String {
         "Perform a deep read-only diagnosis. Do not modify files or execute mutating commands. The remoter-agent source is always read-only."
     };
     format!(
-        "You are Agent Doctor's deep analysis model in a persistent per-finding ACP session. {phase}\nReturn exactly one JSON object with outcome notImportant, needsAction, or resolved. resolved requires non-empty verificationEvidence containing concrete checks. needsAction may include typed actions createTask, daemonOperation, humanAction. daemonOperation fields: key, kind, title, objective, proposedCommands (informational strings only), expectedOutcome, verificationPlan, risk, writablePaths, timeoutSecs. Never emit commandId or a command allowlist. createTask describes an ordinary bug related to the source ticket. notImportant requires resolution explaining why. Use only sanitized evidence and read-only inspection.\n\nSource: {}\nTitle: {}\nOccurrences: {}\nRemediation round: {}\nSource task: {:?}\nSource run: {:?}\nEvidence:\n{}\nExcerpt:\n{}",
+        "You are Agent Doctor's deep analysis model in a persistent per-finding ACP session. {phase}\nReturn exactly one JSON object with outcome notImportant, needsAction, or resolved. resolved requires non-empty verificationEvidence containing concrete checks. needsAction may include typed actions createTask, daemonOperation, humanAction. daemonOperation fields: key, kind, title, objective, proposedCommands (informational strings only), expectedOutcome, verificationPlan, risk, writablePaths, timeoutSecs. Never emit commandId or a command allowlist. createTask fields: key, kind, title, description; sourceTaskId and featureId are filled from finding context when omitted. It creates an ordinary bug related to the source ticket. notImportant requires resolution explaining why. Use only sanitized evidence and read-only inspection.\n\nSource: {}\nTitle: {}\nOccurrences: {}\nRemediation round: {}\nSource task: {:?}\nSource run: {:?}\nEvidence:\n{}\nExcerpt:\n{}",
         problem.source.as_str(),
         problem.title,
         problem.occurrences,
@@ -167,18 +167,31 @@ pub fn remediation_prompt(action: &crate::client::DiagnosticAction) -> String {
 }
 
 pub fn finding_body(problem: &QueuedProblem, outcome: &str, response: Option<&AnalysisResponse>) -> serde_json::Value {
+    let title = sanitize(
+        response
+            .and_then(|response| response.title.as_deref())
+            .unwrap_or(&problem.title),
+    );
+    let severity = sanitize(
+        response
+            .and_then(|response| response.severity.as_deref())
+            .unwrap_or("warning"),
+    );
+    let actions = response
+        .map(|response| sanitize_value(serde_json::Value::Array(response.actions.clone())))
+        .unwrap_or_else(|| serde_json::json!([]));
     let mut body = serde_json::json!({
         "outcome": outcome,
         "source": problem.source.as_str(),
-        "severity": response.and_then(|response| response.severity.as_deref()).unwrap_or("warning"),
-        "title": response.and_then(|response| response.title.as_deref()).unwrap_or(&problem.title),
+        "severity": severity,
+        "title": title,
         "sourceExcerpt": sanitize(&problem.excerpt),
         "sourceTaskId": problem.source_task_id,
         "sourceRunId": problem.source_run_id,
         "occurrences": problem.occurrences,
         "lastSeenAt": problem.last_seen_at,
         "evidence": sanitize_value(problem.evidence.clone()),
-        "actions": response.map(|response| response.actions.clone()).unwrap_or_default(),
+        "actions": actions,
     });
     if let Some(response) = response {
         if let Some(text) = &response.body {

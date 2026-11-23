@@ -245,7 +245,9 @@ async fn supervised_parent(rc: &RunContext) -> Option<(SupervisedParent, TaskDet
 /// upward — a failed ticket must not kill the poll loop.
 pub async fn execute(rc: RunContext) {
     let task_id = rc.task.id;
-    let _doctor_run_guard = rc.doctor.run_guard(task_id);
+    let Some(_doctor_run_guard) = rc.doctor.acquire_run(task_id, rc.cancel.clone()).await else {
+        return;
+    };
     // A ticket renamed between runs keeps the branch its worktree was created
     // with — recomputing from the current title would name a branch that
     // doesn't exist locally, and the push at finish time would fail.
@@ -1133,6 +1135,7 @@ pub(crate) fn exec_env(config: &Config, run_id: i32, devenv: bool) -> ExecEnv {
             container: container::run_container_name(run_id),
             work_dir: std::path::PathBuf::from(container::WORK_DIR),
             devenv,
+            doctor: false,
             sessions_dir: sessions_dir(config),
             api_url: container::container_api_url(&config.api_url),
         }),

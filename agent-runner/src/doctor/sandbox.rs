@@ -157,6 +157,7 @@ pub async fn start(
                     container: container.name().to_string(),
                     work_dir: PathBuf::from(container::WORK_DIR),
                     devenv: false,
+                    doctor: true,
                     sessions_dir: config
                         .driver
                         .sessions_dir

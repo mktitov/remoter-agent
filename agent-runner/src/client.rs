@@ -858,23 +858,24 @@ impl RemoterClient {
             .await
     }
 
-    pub async fn create_diagnostic_task(&self, action: &DiagnosticAction) -> Result<i32, ClientError> {
-        let feature_id = action
-            .payload
-            .get("featureId")
-            .and_then(serde_json::Value::as_i64)
-            .ok_or_else(|| ClientError {
-                status: None,
-                message: "createTask payload has no featureId".to_string(),
-            })?;
+    pub async fn create_diagnostic_task(
+        &self,
+        action: &DiagnosticAction,
+        finding: Option<&DiagnosticFinding>,
+    ) -> Result<i32, ClientError> {
         let source_task_id = action
             .payload
             .get("sourceTaskId")
             .and_then(serde_json::Value::as_i64)
+            .or_else(|| finding.and_then(|finding| finding.source_task_id.map(i64::from)))
             .ok_or_else(|| ClientError {
                 status: None,
-                message: "createTask payload has no sourceTaskId".to_string(),
+                message: "createTask has no source task context".to_string(),
             })?;
+        let feature_id = match action.payload.get("featureId").and_then(serde_json::Value::as_i64) {
+            Some(feature_id) => feature_id,
+            None => i64::from(self.task_detail(source_task_id as i32).await?.feature_id),
+        };
         let resp = self
             .auth_request(self.http.post(format!("{}/api/v1/tasks", self.base_url)))
             .json(&serde_json::json!({

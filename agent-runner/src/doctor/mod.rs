@@ -143,16 +143,41 @@ impl DoctorHandle {
         let _ = self.wake.try_send(());
     }
 
-    pub fn run_guard(&self, task_id: i32) -> DoctorRunGuard {
-        if self.enabled {
-            self.active_runs
-                .lock()
-                .expect("Doctor active runs poisoned")
-                .insert(task_id);
-        }
-        DoctorRunGuard {
-            handle: self.clone(),
-            task_id,
+    pub async fn acquire_run(&self, task_id: i32, cancel: CancellationToken) -> Option<DoctorRunGuard> {
+        loop {
+            if self.enabled {
+                let mut active_runs = self.active_runs.lock().expect("Doctor active runs poisoned");
+                let state = self
+                    .state
+                    .as_ref()
+                    .map(|state| state.lock().expect("Doctor state poisoned"));
+                let conflicting = state.as_ref().is_some_and(|state| {
+                    state
+                        .active_write
+                        .as_ref()
+                        .is_some_and(|write| write.source_task_id == Some(task_id))
+                });
+                if !conflicting {
+                    active_runs.insert(task_id);
+                    drop(state);
+                    drop(active_runs);
+                    return Some(DoctorRunGuard {
+                        handle: self.clone(),
+                        task_id,
+                    });
+                }
+                drop(state);
+                drop(active_runs);
+            } else {
+                return Some(DoctorRunGuard {
+                    handle: self.clone(),
+                    task_id,
+                });
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                _ = cancel.cancelled() => return None,
+            }
         }
     }
 
