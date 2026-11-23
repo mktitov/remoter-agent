@@ -162,8 +162,26 @@ pub fn analysis_prompt(problem: &QueuedProblem, remediation: bool) -> String {
 pub fn remediation_prompt(action: &crate::client::DiagnosticAction) -> String {
     format!(
         "Continue this finding's ACP session for exactly one approved remediation round. Form, execute, diagnose, correct, and verify the necessary commands yourself within this round. An ordinary non-zero command exit is evidence to fix, not a reason to stop. Do not change objective and do not begin another mutating round. The source/config/refs are read-only; only approved writablePaths may be modified. Docker socket, SSH agent and daemon token are unavailable; do not try to obtain them. Finish with a concise summary and concrete verification evidence.\nApproved action:\n{}",
-        sanitized_json(&action.payload)
+        sanitized_json(&approved_payload(action))
     )
+}
+
+fn approved_payload(action: &crate::client::DiagnosticAction) -> serde_json::Value {
+    let mut payload = action.payload.clone();
+    if !payload.is_object() {
+        payload = serde_json::json!({});
+    }
+    payload["writablePaths"] = serde_json::json!(action.writable_paths);
+    if let Some(timeout) = action.timeout_secs {
+        payload["timeoutSecs"] = serde_json::json!(timeout);
+    }
+    if let Some(objective) = &action.approved_objective {
+        payload["objective"] = serde_json::Value::String(objective.clone());
+    }
+    if let Some(risk) = &action.approved_risk {
+        payload["risk"] = serde_json::Value::String(risk.clone());
+    }
+    payload
 }
 
 pub fn finding_body(problem: &QueuedProblem, outcome: &str, response: Option<&AnalysisResponse>) -> serde_json::Value {
@@ -201,7 +219,11 @@ pub fn finding_body(problem: &QueuedProblem, outcome: &str, response: Option<&An
             body["resolution"] = serde_json::Value::String(sanitize(text));
         }
         if let Some(evidence) = &response.verification_evidence {
-            body["verificationEvidence"] = sanitize_value(evidence.clone());
+            let text = match evidence {
+                serde_json::Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            body["verificationEvidence"] = serde_json::Value::String(sanitize(&text));
         }
     }
     body
@@ -373,6 +395,28 @@ mod tests {
         assert_eq!(body["sourceRunId"], 1665);
         assert_eq!(body["analysisError"], "budget_exhausted");
         assert!(body["actions"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn remediation_uses_the_approved_snapshot() {
+        let action = crate::client::DiagnosticAction {
+            payload: serde_json::json!({
+                "objective": "proposed",
+                "risk": "proposed-risk",
+                "writablePaths": ["/proposed"],
+                "timeoutSecs": 900
+            }),
+            approved_objective: Some("approved".to_string()),
+            approved_risk: Some("approved-risk".to_string()),
+            timeout_secs: Some(60),
+            writable_paths: Vec::new(),
+            ..Default::default()
+        };
+        let payload = approved_payload(&action);
+        assert_eq!(payload["objective"], "approved");
+        assert_eq!(payload["risk"], "approved-risk");
+        assert_eq!(payload["timeoutSecs"], 60);
+        assert_eq!(payload["writablePaths"], serde_json::json!([]));
     }
 
     #[test]

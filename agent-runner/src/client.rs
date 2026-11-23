@@ -516,8 +516,12 @@ pub struct DiagnosticAction {
     pub payload: serde_json::Value,
     #[serde(default, alias = "approvedWritablePaths")]
     pub writable_paths: Vec<String>,
-    #[serde(default)]
+    #[serde(default, alias = "approvedTimeoutSecs")]
     pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub approved_objective: Option<String>,
+    #[serde(default)]
+    pub approved_risk: Option<String>,
     #[serde(default)]
     pub blocked_reason: Option<String>,
     #[serde(default)]
@@ -541,13 +545,15 @@ pub struct DiagnosticAttempt {
     pub status: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaimedDiagnosticAction {
-    pub action: DiagnosticAction,
-    pub attempt: DiagnosticAttempt,
+    pub action: Option<DiagnosticAction>,
+    pub attempt: Option<DiagnosticAttempt>,
     #[serde(default)]
-    pub finding: Option<DiagnosticFinding>,
+    pub claim_token: String,
+    #[serde(default)]
+    pub blocked_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -562,30 +568,34 @@ pub struct DoctorControls {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DoctorStatusUpdate {
-    pub day: chrono::NaiveDate,
+    pub budget_day: chrono::NaiveDate,
     pub triage_tokens_used: u64,
-    pub triage_daily_token_budget: u64,
+    pub triage_token_limit: u64,
     pub analysis_tokens_used: u64,
-    pub analysis_daily_token_budget: u64,
+    pub analysis_token_limit: u64,
     pub remediation_tokens_used: u64,
-    pub remediation_daily_token_budget: u64,
+    pub remediation_token_limit: u64,
     pub write_rounds_used: u64,
-    pub daily_write_round_budget: u64,
-    pub pending_report_problems: usize,
-    pub pending_log_signatures: usize,
+    pub write_round_limit: u64,
+    pub pending_analysis: usize,
+    pub pending_writes: usize,
     pub analysis_circuit: String,
     pub write_circuit: String,
     pub blocked_reason: Option<String>,
     pub last_error: Option<String>,
     pub cooldown_until: Option<chrono::DateTime<chrono::Utc>>,
-    pub analysis_reset_generation: u64,
-    pub write_reset_generation: u64,
-    pub heartbeat_at: chrono::DateTime<chrono::Utc>,
+    pub analysis_reset_applied: u64,
+    pub write_reset_applied: u64,
+}
+
+pub fn doctor_budget_usage(used: u64, limit: u64) -> (u64, u64) {
+    if limit == 0 { (1, 1) } else { (used, limit) }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiagnosticAttemptProgress {
+    pub claim_token: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     pub transcript: Vec<serde_json::Value>,
@@ -603,6 +613,7 @@ pub struct DiagnosticAttemptProgress {
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiagnosticAttemptFinish {
+    pub claim_token: String,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -611,7 +622,7 @@ pub struct DiagnosticAttemptFinish {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub verification_evidence: Option<serde_json::Value>,
+    pub verification_evidence: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -926,6 +937,10 @@ impl RemoterClient {
         .await
     }
 
+    pub async fn diagnostic_finding_by_id(&self, finding_id: i32) -> Result<DiagnosticFinding, ClientError> {
+        self.diagnostic_finding(&finding_id.to_string()).await
+    }
+
     pub async fn pending_diagnostic_findings(&self) -> Result<Vec<DiagnosticFinding>, ClientError> {
         self.get(&format!(
             "{}/api/v1/agent/diagnostic-findings?analysisPending=true",
@@ -934,7 +949,7 @@ impl RemoterClient {
         .await
     }
 
-    pub async fn claim_diagnostic_action(&self) -> Result<Option<ClaimedDiagnosticAction>, ClientError> {
+    pub async fn claim_diagnostic_action(&self) -> Result<ClaimedDiagnosticAction, ClientError> {
         let resp = self
             .auth_request(
                 self.http
@@ -1240,5 +1255,287 @@ mod tests {
         with_goal["goalId"] = serde_json::json!(9);
         let detail: TaskDetail = serde_json::from_value(with_goal).expect("TaskDetail decodes");
         assert_eq!(detail.goal_id, Some(9));
+    }
+
+    #[test]
+    fn zero_doctor_budget_is_published_as_exhausted_not_enabled() {
+        assert_eq!(doctor_budget_usage(0, 0), (1, 1));
+        assert_eq!(doctor_budget_usage(17, 100), (17, 100));
+    }
+
+    #[tokio::test]
+    async fn doctor_status_uses_backend_field_names() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_json, method, path},
+        };
+
+        let server = MockServer::start().await;
+        let expected = serde_json::json!({
+            "budgetDay": "2026-11-23",
+            "triageTokensUsed": 1,
+            "triageTokenLimit": 1,
+            "analysisTokensUsed": 20,
+            "analysisTokenLimit": 100,
+            "remediationTokensUsed": 30,
+            "remediationTokenLimit": 200,
+            "writeRoundsUsed": 1,
+            "writeRoundLimit": 1,
+            "pendingAnalysis": 4,
+            "pendingWrites": 0,
+            "analysisCircuit": "closed",
+            "writeCircuit": "open",
+            "blockedReason": "budget_exhausted",
+            "lastError": null,
+            "cooldownUntil": null,
+            "analysisResetApplied": 3,
+            "writeResetApplied": 4
+        });
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/agent/doctor-status"))
+            .and(body_json(expected))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::Value::Null))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = RemoterClient::new(&server.uri(), "token", None);
+        client
+            .put_doctor_status(&DoctorStatusUpdate {
+                budget_day: chrono::NaiveDate::from_ymd_opt(2026, 11, 23).unwrap(),
+                triage_tokens_used: 1,
+                triage_token_limit: 1,
+                analysis_tokens_used: 20,
+                analysis_token_limit: 100,
+                remediation_tokens_used: 30,
+                remediation_token_limit: 200,
+                write_rounds_used: 1,
+                write_round_limit: 1,
+                pending_analysis: 4,
+                pending_writes: 0,
+                analysis_circuit: "closed".to_string(),
+                write_circuit: "open".to_string(),
+                blocked_reason: Some("budget_exhausted".to_string()),
+                last_error: None,
+                cooldown_until: None,
+                analysis_reset_applied: 3,
+                write_reset_applied: 4,
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn finding_placeholders_and_resolved_evidence_match_http_contract() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_json, method, path},
+        };
+
+        let server = MockServer::start().await;
+        let client = RemoterClient::new(&server.uri(), "token", None);
+        let problem = crate::doctor::state::QueuedProblem::new(
+            crate::doctor::state::ProblemSource::Report,
+            "Build fails".to_string(),
+            "exit 1".to_string(),
+            Some(280),
+            Some(1665),
+            chrono::Utc::now(),
+            -1,
+        );
+        let analyzing = crate::doctor::model::placeholder_body(&problem, None);
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/agent/diagnostic-findings/analyzing-fp"))
+            .and(body_json(analyzing.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 1,
+                "fingerprint": "analyzing-fp",
+                "status": "analyzing",
+                "source": "report"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let finding = client.put_diagnostic_finding("analyzing-fp", &analyzing).await.unwrap();
+        assert_eq!(finding.status, "analyzing");
+        assert_eq!(finding.id, Some(1));
+
+        let response = crate::doctor::model::AnalysisResponse {
+            outcome: crate::doctor::model::AnalysisOutcome::Resolved,
+            title: None,
+            body: None,
+            resolution: Some("fixed".to_string()),
+            severity: None,
+            actions: Vec::new(),
+            verification_evidence: Some(serde_json::json!({"check": "cargo test passed"})),
+        };
+        let resolved = crate::doctor::model::finding_body(&problem, "resolved", Some(&response));
+        assert!(resolved["verificationEvidence"].is_string());
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/agent/diagnostic-findings/resolved-fp"))
+            .and(body_json(resolved.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 2,
+                "fingerprint": "resolved-fp",
+                "status": "resolved",
+                "verificationEvidence": "{\"check\":\"cargo test passed\"}"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let finding = client.put_diagnostic_finding("resolved-fp", &resolved).await.unwrap();
+        assert_eq!(finding.status, "resolved");
+    }
+
+    #[tokio::test]
+    async fn claim_progress_and_finish_use_top_level_claim_token() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_json, method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agent/diagnostic-actions/claim-next"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "action": {
+                    "id": 31,
+                    "findingId": 41,
+                    "kind": "daemonOperation",
+                    "round": 1,
+                    "payload": {"objective": "proposed", "risk": "proposed-risk"},
+                    "approvedObjective": "approved objective",
+                    "approvedRisk": "approved risk",
+                    "approvedTimeoutSecs": 60,
+                    "approvedWritablePaths": ["/scratch"]
+                },
+                "attempt": {"id": 51, "actionId": 31, "attempt": 1, "status": "running"},
+                "claimToken": "lease-token",
+                "blockedReason": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = RemoterClient::new(&server.uri(), "token", None);
+        let claimed = client.claim_diagnostic_action().await.unwrap();
+        assert_eq!(claimed.claim_token, "lease-token");
+        let action = claimed.action.unwrap();
+        assert_eq!(action.approved_objective.as_deref(), Some("approved objective"));
+        assert_eq!(action.approved_risk.as_deref(), Some("approved risk"));
+        assert_eq!(action.timeout_secs, Some(60));
+        assert_eq!(action.writable_paths, vec!["/scratch"]);
+        assert_eq!(claimed.attempt.unwrap().id, 51);
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/agent/diagnostic-findings/41"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 41,
+                "fingerprint": "finding-fp",
+                "source": "report",
+                "status": "open"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let finding = client.diagnostic_finding_by_id(41).await.unwrap();
+        assert_eq!(finding.fingerprint, "finding-fp");
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agent/diagnostic-attempts/51/progress"))
+            .and(body_json(serde_json::json!({
+                "claimToken": "lease-token",
+                "sessionId": "session-1",
+                "transcript": [{"seq": 0}],
+                "truncated": false,
+                "inputTokens": 10,
+                "outputTokens": 20,
+                "model": "kimi-code/k3",
+                "thinking": "max"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::Value::Null))
+            .expect(1)
+            .mount(&server)
+            .await;
+        client
+            .diagnostic_attempt_progress(
+                51,
+                &DiagnosticAttemptProgress {
+                    claim_token: claimed.claim_token.clone(),
+                    session_id: Some("session-1".to_string()),
+                    transcript: vec![serde_json::json!({"seq": 0})],
+                    truncated: false,
+                    input_tokens: Some(10),
+                    output_tokens: Some(20),
+                    model: Some("kimi-code/k3".to_string()),
+                    thinking: Some("max".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agent/diagnostic-attempts/51/finish"))
+            .and(body_json(serde_json::json!({
+                "claimToken": "lease-token",
+                "status": "succeeded",
+                "sessionId": "session-1",
+                "transcript": [],
+                "truncated": false,
+                "agentSummary": "fixed",
+                "verificationEvidence": "cargo test passed",
+                "inputTokens": 10,
+                "outputTokens": 20,
+                "model": "kimi-code/k3",
+                "thinking": "max"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::Value::Null))
+            .expect(1)
+            .mount(&server)
+            .await;
+        client
+            .diagnostic_attempt_finish(
+                51,
+                &DiagnosticAttemptFinish {
+                    claim_token: claimed.claim_token,
+                    status: "succeeded".to_string(),
+                    session_id: Some("session-1".to_string()),
+                    transcript: Vec::new(),
+                    truncated: false,
+                    agent_summary: Some("fixed".to_string()),
+                    verification_evidence: Some("cargo test passed".to_string()),
+                    input_tokens: Some(10),
+                    output_tokens: Some(20),
+                    model: Some("kimi-code/k3".to_string()),
+                    thinking: Some("max".to_string()),
+                    result_error: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_claim_decodes_without_an_action() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agent/diagnostic-actions/claim-next"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "action": null,
+                "attempt": null,
+                "claimToken": "",
+                "blockedReason": "budget_exhausted"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = RemoterClient::new(&server.uri(), "token", None);
+        let claimed = client.claim_diagnostic_action().await.unwrap();
+        assert!(claimed.action.is_none());
+        assert!(claimed.attempt.is_none());
+        assert_eq!(claimed.blocked_reason.as_deref(), Some("budget_exhausted"));
     }
 }

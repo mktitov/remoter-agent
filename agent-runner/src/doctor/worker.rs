@@ -15,8 +15,8 @@ use super::state::{
     WriteCircuit, WriteEnd,
 };
 use crate::client::{
-    ClaimedDiagnosticAction, DiagnosticAttemptFinish, DiagnosticAttemptProgress, DiagnosticFinding, DoctorStatusUpdate,
-    RemoterClient,
+    DiagnosticAction, DiagnosticAttempt, DiagnosticAttemptFinish, DiagnosticAttemptProgress, DiagnosticFinding,
+    DoctorStatusUpdate, RemoterClient, doctor_budget_usage,
 };
 use crate::config::Config;
 use crate::doctor_config::TokenBucket;
@@ -483,6 +483,11 @@ impl Worker {
     }
 
     async fn process_next_write(&mut self) {
+        if let Some(reason) = self.write_blocked_reason() {
+            self.blocked_finding(reason).await;
+            self.heartbeat().await;
+            return;
+        }
         let claimed = match self.client.claim_diagnostic_action().await {
             Ok(claimed) => claimed,
             Err(error) => {
@@ -490,15 +495,45 @@ impl Worker {
                 return;
             }
         };
-        let Some(claimed) = claimed else {
+        if let Some(reason) = claimed.blocked_reason.as_deref() {
+            self.blocked_finding(reason).await;
+            self.heartbeat().await;
+            return;
+        }
+        let (Some(action), Some(attempt)) = (claimed.action, claimed.attempt) else {
             return;
         };
-        match claimed.action.kind.as_str() {
-            "daemonOperation" => self.remediate(claimed).await,
-            "createTask" => self.create_task(claimed).await,
+        if claimed.claim_token.is_empty() {
+            tracing::warn!(target: "remoter_agent::doctor", "claim-next returned an action without claimToken");
+            return;
+        }
+        let Some(finding_id) = action.finding_id else {
+            self.finish_attempt(
+                attempt.id,
+                &claimed.claim_token,
+                DiagnosticAttemptFinish {
+                    status: "failed".to_string(),
+                    result_error: Some("claimed action has no findingId".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+            return;
+        };
+        let finding = match self.client.diagnostic_finding_by_id(finding_id).await {
+            Ok(finding) => finding,
+            Err(error) => {
+                tracing::warn!(target: "remoter_agent::doctor", finding_id, %error, "could not load claimed Doctor finding");
+                return;
+            }
+        };
+        match action.kind.as_str() {
+            "daemonOperation" => self.remediate(action, attempt, claimed.claim_token, finding).await,
+            "createTask" => self.create_task(action, attempt, claimed.claim_token, finding).await,
             _ => {
                 self.finish_attempt(
-                    claimed.attempt.id,
+                    attempt.id,
+                    &claimed.claim_token,
                     DiagnosticAttemptFinish {
                         status: "failed".to_string(),
                         result_error: Some("action is not executable by the daemon".to_string()),
@@ -513,6 +548,9 @@ impl Worker {
     fn write_blocked_reason(&self) -> Option<&'static str> {
         if !self.config.doctor.write_enabled {
             return Some("write_disabled");
+        }
+        if !self.active_runs.lock().expect("Doctor active runs poisoned").is_empty() {
+            return Some("conflicting_run");
         }
         let now = Utc::now();
         let mut state = self.state.lock().expect("Doctor state poisoned");
@@ -537,31 +575,23 @@ impl Worker {
         }
     }
 
-    async fn remediate(&mut self, claimed: ClaimedDiagnosticAction) {
-        let attempt_id = claimed.attempt.id;
+    async fn remediate(
+        &mut self,
+        action: DiagnosticAction,
+        attempt: DiagnosticAttempt,
+        claim_token: String,
+        finding: DiagnosticFinding,
+    ) {
+        let attempt_id = attempt.id;
         if let Some(reason) = self.write_blocked_reason() {
             self.blocked_finding(reason).await;
             return;
         }
-        let Some(mut problem) = claimed
-            .finding
-            .as_ref()
-            .map(|finding| self.problem_from_finding(finding))
-        else {
+        let mut problem = self.problem_from_finding(&finding);
+        if action.round == 0 || action.round > self.config.doctor.max_remediation_rounds {
             self.finish_attempt(
                 attempt_id,
-                DiagnosticAttemptFinish {
-                    status: "failed".to_string(),
-                    result_error: Some("claim-next did not include the finding context".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await;
-            return;
-        };
-        if claimed.action.round == 0 || claimed.action.round > self.config.doctor.max_remediation_rounds {
-            self.finish_attempt(
-                attempt_id,
+                &claim_token,
                 DiagnosticAttemptFinish {
                     status: "failed".to_string(),
                     result_error: Some("maximum remediation rounds exceeded".to_string()),
@@ -580,11 +610,12 @@ impl Worker {
             self.blocked_finding("conflicting_run").await;
             return;
         }
-        let scope = match WriteScope::validate(&self.config, &claimed.action) {
+        let scope = match WriteScope::validate(&self.config, &action) {
             Ok(scope) => scope,
             Err(error) => {
                 self.finish_attempt(
                     attempt_id,
+                    &claim_token,
                     DiagnosticAttemptFinish {
                         status: "failed".to_string(),
                         result_error: Some(error.to_string()),
@@ -595,7 +626,7 @@ impl Worker {
                 return;
             }
         };
-        problem.remediation_round = claimed.action.round;
+        problem.remediation_round = action.round;
         problem.pending_verification = true;
         let begin = {
             let active_runs = self.active_runs.lock().expect("Doctor active runs poisoned");
@@ -609,7 +640,7 @@ impl Worker {
                 state.begin_write(
                     ActiveWrite {
                         attempt_id,
-                        action_id: claimed.action.id,
+                        action_id: action.id,
                         fingerprint: problem.fingerprint.clone(),
                         source_task_id: problem.source_task_id,
                         started_at: Utc::now(),
@@ -642,16 +673,9 @@ impl Worker {
             return;
         }
         let timeout = Duration::from_secs(
-            claimed
-                .action
+            action
                 .timeout_secs
-                .or_else(|| {
-                    claimed
-                        .action
-                        .payload
-                        .get("timeoutSecs")
-                        .and_then(|value| value.as_u64())
-                })
+                .or_else(|| action.payload.get("timeoutSecs").and_then(|value| value.as_u64()))
                 .unwrap_or(900)
                 .max(1),
         );
@@ -659,6 +683,7 @@ impl Worker {
             .diagnostic_attempt_progress(
                 attempt_id,
                 &DiagnosticAttemptProgress {
+                    claim_token: claim_token.clone(),
                     session_id: problem.session_id.clone(),
                     transcript: self.transcript(problem.log_id).0,
                     truncated: false,
@@ -674,12 +699,12 @@ impl Worker {
             .invoke_model(
                 &problem,
                 TokenBucket::Remediation,
-                model::remediation_prompt(&claimed.action),
+                model::remediation_prompt(&action),
                 problem.session_id.clone(),
                 false,
                 timeout,
                 problem.log_id,
-                Some((attempt_id, Some(&scope))),
+                Some((attempt_id, claim_token.clone(), Some(&scope))),
             )
             .await;
         match result {
@@ -691,14 +716,13 @@ impl Worker {
                     .diagnostic_attempt_finish(
                         attempt_id,
                         &DiagnosticAttemptFinish {
+                            claim_token: claim_token.clone(),
                             status: "succeeded".to_string(),
                             session_id: problem.session_id.clone(),
                             transcript,
                             truncated,
                             agent_summary: Some(model::sanitize(&outcome.text)),
-                            verification_evidence: Some(model::sanitize_value(
-                                serde_json::json!({"roundOutput": outcome.text}),
-                            )),
+                            verification_evidence: Some(model::sanitize(&outcome.text)),
                             input_tokens: outcome.input_tokens,
                             output_tokens: outcome.output_tokens,
                             model: Some(self.config.doctor.analysis_model.clone()),
@@ -728,6 +752,7 @@ impl Worker {
                     .diagnostic_attempt_finish(
                         attempt_id,
                         &DiagnosticAttemptFinish {
+                            claim_token: claim_token.clone(),
                             status: "failed".to_string(),
                             session_id: problem.session_id.clone(),
                             transcript,
@@ -843,13 +868,17 @@ impl Worker {
         problem
     }
 
-    async fn create_task(&self, claimed: ClaimedDiagnosticAction) {
-        let result = self
-            .client
-            .create_diagnostic_task(&claimed.action, claimed.finding.as_ref())
-            .await;
+    async fn create_task(
+        &self,
+        action: DiagnosticAction,
+        attempt: DiagnosticAttempt,
+        claim_token: String,
+        finding: DiagnosticFinding,
+    ) {
+        let result = self.client.create_diagnostic_task(&action, Some(&finding)).await;
         self.finish_attempt(
-            claimed.attempt.id,
+            attempt.id,
+            &claim_token,
             DiagnosticAttemptFinish {
                 status: if result.is_ok() { "succeeded" } else { "failed" }.to_string(),
                 agent_summary: result.as_ref().ok().map(|id| format!("Created related bug #{id}")),
@@ -860,7 +889,8 @@ impl Worker {
         .await;
     }
 
-    async fn finish_attempt(&self, attempt_id: i32, body: DiagnosticAttemptFinish) {
+    async fn finish_attempt(&self, attempt_id: i32, claim_token: &str, mut body: DiagnosticAttemptFinish) {
+        body.claim_token = claim_token.to_string();
         if let Err(error) = self.client.diagnostic_attempt_finish(attempt_id, &body).await {
             tracing::warn!(target: "remoter_agent::doctor", attempt_id, %error, "could not finish Doctor attempt");
         }
@@ -876,14 +906,14 @@ impl Worker {
         read_only: bool,
         timeout: Duration,
         log_id: i32,
-        write: Option<(i32, Option<&WriteScope>)>,
+        write: Option<(i32, String, Option<&WriteScope>)>,
     ) -> Result<RunOutcome, CallFailure> {
-        let attempt_id = write.as_ref().map(|(id, _)| *id).unwrap_or(log_id);
+        let attempt_id = write.as_ref().map(|(id, _, _)| *id).unwrap_or(log_id);
         let runtime = match sandbox::start(
             &self.config,
             attempt_id,
             read_only,
-            write.as_ref().and_then(|(_, scope)| *scope),
+            write.as_ref().and_then(|(_, _, scope)| *scope),
         )
         .await
         {
@@ -946,9 +976,10 @@ impl Worker {
                         break Err(RunFailure::new(DriverError::Stalled("Doctor run cancelled".to_string()), None));
                     }
                     _ = progress.tick(), if write.is_some() => {
-                        if let Some((attempt_id, _)) = write {
+                        if let Some((attempt_id, claim_token, _)) = &write {
                             let (transcript, truncated) = self.transcript(log_id);
-                            let progress_result = self.client.diagnostic_attempt_progress(attempt_id, &DiagnosticAttemptProgress {
+                            let progress_result = self.client.diagnostic_attempt_progress(*attempt_id, &DiagnosticAttemptProgress {
+                                claim_token: claim_token.clone(),
                                 session_id: None,
                                 transcript,
                                 truncated,
@@ -1019,24 +1050,40 @@ impl Worker {
     async fn heartbeat(&self) {
         let now = Utc::now();
         let update = {
+            let active_runs = self.active_runs.lock().expect("Doctor active runs poisoned");
+            let has_active_run = !active_runs.is_empty();
             let mut state = self.state.lock().expect("Doctor state poisoned");
             let previous_day = state.utc_day;
             state.rollover(now);
             if state.utc_day != previous_day {
                 let _ = self.persist(&state);
             }
+            let (triage_tokens_used, triage_token_limit) =
+                doctor_budget_usage(state.triage_tokens_used, self.config.doctor.budget(TokenBucket::Triage));
+            let (analysis_tokens_used, analysis_token_limit) = doctor_budget_usage(
+                state.analysis_tokens_used,
+                self.config.doctor.budget(TokenBucket::Analysis),
+            );
+            let (remediation_tokens_used, remediation_token_limit) = doctor_budget_usage(
+                state.remediation_tokens_used,
+                self.config.doctor.budget(TokenBucket::Remediation),
+            );
+            let (write_rounds_used, write_round_limit) = doctor_budget_usage(
+                state.write_rounds_used,
+                self.config.doctor.daily_write_round_budget.unwrap_or(0),
+            );
             DoctorStatusUpdate {
-                day: state.utc_day,
-                triage_tokens_used: state.triage_tokens_used,
-                triage_daily_token_budget: self.config.doctor.budget(TokenBucket::Triage),
-                analysis_tokens_used: state.analysis_tokens_used,
-                analysis_daily_token_budget: self.config.doctor.budget(TokenBucket::Analysis),
-                remediation_tokens_used: state.remediation_tokens_used,
-                remediation_daily_token_budget: self.config.doctor.budget(TokenBucket::Remediation),
-                write_rounds_used: state.write_rounds_used,
-                daily_write_round_budget: self.config.doctor.daily_write_round_budget.unwrap_or(0),
-                pending_report_problems: state.report_queue.len(),
-                pending_log_signatures: state.log_queue.len(),
+                budget_day: state.utc_day,
+                triage_tokens_used,
+                triage_token_limit,
+                analysis_tokens_used,
+                analysis_token_limit,
+                remediation_tokens_used,
+                remediation_token_limit,
+                write_rounds_used,
+                write_round_limit,
+                pending_analysis: state.report_queue.len() + state.log_queue.len(),
+                pending_writes: usize::from(state.active_write.is_some()),
                 analysis_circuit: match state.analysis_circuit {
                     AnalysisCircuit::Closed => "closed",
                     AnalysisCircuit::Open => "open",
@@ -1048,12 +1095,17 @@ impl Worker {
                     WriteCircuit::Open => "open",
                 }
                 .to_string(),
-                blocked_reason: blocked_reason(&state, &self.config, now),
+                blocked_reason: if !self.config.doctor.write_enabled {
+                    Some("write_disabled".to_string())
+                } else if has_active_run {
+                    Some("conflicting_run".to_string())
+                } else {
+                    blocked_reason(&state, &self.config, now)
+                },
                 last_error: state.last_error.as_deref().map(model::sanitize),
                 cooldown_until: cooldown(&state, &self.config.doctor),
-                analysis_reset_generation: state.applied_analysis_reset_generation,
-                write_reset_generation: state.applied_write_reset_generation,
-                heartbeat_at: now,
+                analysis_reset_applied: state.applied_analysis_reset_generation,
+                write_reset_applied: state.applied_write_reset_generation,
             }
         };
         if let Err(error) = self.client.put_doctor_status(&update).await {
@@ -1149,6 +1201,91 @@ fn failure_class(error: &DriverError) -> FailureClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    fn blocked_worker(
+        dir: &Path,
+        server_url: &str,
+        write_enabled: bool,
+    ) -> (Worker, SharedState, Arc<Mutex<HashSet<i32>>>) {
+        let toml = format!(
+            "api_url = \"{server_url}\"\nworkspace_root = \"{}\"\n\n[doctor]\nwrite_enabled = {write_enabled}\nremediation_daily_token_budget = 100\ndaily_write_round_budget = 1\n\n[driver]\nkind = \"stub\"",
+            dir.display()
+        );
+        let config = Arc::new(Config::from_toml_str(&toml, Some("token".to_string())).unwrap());
+        let log_store = LogStore::new(&crate::config::LogsConfig {
+            dir: Some(dir.join("logs")),
+            retention_days: 7,
+        })
+        .unwrap();
+        let state = Arc::new(Mutex::new(DoctorState::default()));
+        let active_runs = Arc::new(Mutex::new(HashSet::new()));
+        let worker = Worker {
+            config,
+            client: RemoterClient::new(server_url, "token", None),
+            driver: Arc::new(crate::driver::stub::StubDriver::new(0, false)),
+            log_store,
+            state: state.clone(),
+            active_runs: active_runs.clone(),
+            path: dir.join("doctor-state.json"),
+            cancel: CancellationToken::new(),
+        };
+        (worker, state, active_runs)
+    }
+
+    #[tokio::test]
+    async fn blocked_write_never_claims_an_action() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+        #[derive(Clone, Copy)]
+        enum Case {
+            Disabled,
+            Budget,
+            Circuit,
+            ConflictingRun,
+        }
+        for (name, case) in [
+            ("disabled", Case::Disabled),
+            ("budget", Case::Budget),
+            ("circuit", Case::Circuit),
+            ("conflict", Case::ConflictingRun),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("PUT"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "fingerprint": "blocked"
+                })))
+                .mount(&server)
+                .await;
+            let dir = std::env::temp_dir().join(format!("remoter-doctor-preflight-{name}-{}", std::process::id()));
+            let write_enabled = !matches!(case, Case::Disabled);
+            let (mut worker, state, active_runs) = blocked_worker(&dir, &server.uri(), write_enabled);
+            match case {
+                Case::Disabled => {}
+                Case::Budget => state.lock().unwrap().remediation_tokens_used = 100,
+                Case::Circuit => state.lock().unwrap().write_circuit = WriteCircuit::Open,
+                Case::ConflictingRun => {
+                    active_runs.lock().unwrap().insert(280);
+                }
+            }
+            worker.process_next_write().await;
+            let requests = server.received_requests().await.unwrap();
+            assert!(
+                requests
+                    .iter()
+                    .any(|request| request.url.path() == "/api/v1/agent/doctor-status"),
+                "{name}: blockedReason was not published"
+            );
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.url.path() != "/api/v1/agent/diagnostic-actions/claim-next"),
+                "{name}: claim-next was called while blocked"
+            );
+            drop(worker);
+            std::fs::remove_dir_all(dir).ok();
+        }
+    }
 
     #[test]
     fn transcript_returns_the_actual_tail_and_truncation_flag() {
